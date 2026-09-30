@@ -1,0 +1,9 @@
+# Secrets: release keystore lives outside git; passwords live in local.properties
+local.properties
+*.keystore
+*.jks
+*.keystore.*
+# Android / Gradle generated
+.gradle/
+build/
+app/build/

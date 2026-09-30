@@ -1,0 +1,3144 @@
+/* SweepVR Player — GPL-3.0-only.
+ * See LICENSE in the repository root.
+ */
+package net.sweepvr.player
+
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.net.Uri
+import android.graphics.drawable.ColorDrawable
+import android.view.View
+import android.view.ViewGroup
+import android.widget.RelativeLayout
+import com.google.vr.sdk.base.GvrView
+import android.os.Bundle
+import android.util.Log
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.WindowManager
+import android.graphics.Bitmap
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.TextView
+import android.widget.Toast
+import kotlin.math.roundToInt
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.Tracks
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.source.LoadEventInfo
+import androidx.media3.exoplayer.source.MediaLoadData
+import java.io.IOException
+import org.json.JSONObject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+
+/**
+ * VR player + in-headset browser.
+ * Root level lists every SMB connection plus "This device".
+ * A ⚙ Settings page exposes projection/stereo/FOV/IPD/zoom/dwell
+ * without leaving VR. SMB files stream via the localhost Range proxy
+ * (no download); local files play direct.
+ */
+class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
+    companion object {
+        const val EXTRA_URL = "url"          // http proxy URL (SMB) or file:// URI (local)
+        const val EXTRA_NAME = "name"
+        const val EXTRA_PROJ = "proj"
+        const val EXTRA_STEREO = "stereo"
+        const val EXTRA_CONN_ID = "conn_id"  // smb:<id> | local:<abs path> | "" = root
+        const val EXTRA_PATH = "path"
+        const val EXTRA_QUEUE_PATHS = "queue_paths"  // sibling files for prev/next
+        const val EXTRA_QUEUE_INDEX = "queue_index"
+        /** Start straight in web mode (the 2D screen's "Enter Web"). */
+        const val EXTRA_WEB = "web"
+        /** Optional page to open with it. */
+        const val EXTRA_WEB_URL = "web_url"
+        private const val TAG = "SweepVR"
+        /** Tag on the top twin of the phone-alignment marker. */
+        private const val ALIGN_TWIN_TAG = "align-marker-twin"
+        /** Baseline fired already in this process (fresh-process detection).
+         *  Rotation recreates the activity in-process and must keep live tuning. */
+        private var baselineFiredProcess = false
+    }
+
+    private lateinit var glView: GvrView
+    private var gvrSurface: android.view.SurfaceView? = null
+
+    /** Web mode needs GVR's surface above the window so the WebView is never
+     *  seen directly; the other modes need the window's close button visible. */
+    private fun applyGvrZOrder(onTop: Boolean) {
+        runCatching { gvrSurface?.setZOrderOnTop(onTop) }
+    }
+    private lateinit var renderer: VrRenderer
+    private lateinit var txtStatus: TextView
+    private var player: ExoPlayer? = null
+    private lateinit var settings: SettingsStore
+    private var connections: List<SmbConnection> = emptyList()
+
+    // browser state
+    private sealed interface Loc {
+        data object Root : Loc
+        data class Smb(val connId: String, val path: String) : Loc
+        data class Local(val dir: File) : Loc
+        data class Saf(val treeUri: String, val relPath: String, val label: String) : Loc
+        data object SettingsPage : Loc
+        data object ShapingPage : Loc
+        data object Sensors : Loc
+    }
+    private var loc: Loc = Loc.Root
+        // The VR browser is the other face of the process-wide current
+        // directory: publishing every folder it opens means the 2D list
+        // lands there on return (SessionMemory, never persisted).
+        set(v) {
+            field = v
+            when (v) {
+                is Loc.Root -> {
+                    SessionMemory.lastConnectionId = ""
+                    SessionMemory.lastPath = ""
+                }
+                is Loc.Local -> {
+                    SessionMemory.lastConnectionId = "local:${v.dir.absolutePath}"
+                    SessionMemory.lastPath = ""
+                }
+                is Loc.Smb -> {
+                    SessionMemory.lastConnectionId = "smb:${v.connId}"
+                    SessionMemory.lastPath = v.path
+                }
+                is Loc.Saf -> {
+                    SessionMemory.lastConnectionId = "saf:${v.treeUri}"
+                    SessionMemory.lastPath = v.relPath
+                }
+                // settings / shaping / sensors pages are not directories
+                else -> {}
+            }
+        }
+    // True when the settings page was opened from the in-video play menu:
+    // backing out resumes the video instead of leaving to the servers.
+    private var settingsFromVideo = false
+    private var rows: List<Row> = emptyList()
+    private data class Row(
+        val label: String, val meta: String, val kind: Int,
+        val smb: SmbEntry? = null, val local: File? = null,
+        val action: String? = null, // for settings rows
+        val slideKey: String? = null, // gaze slider id (settings rows)
+        val slideMin: Float = 0f, val slideMax: Float = 1f, val slideVal: Float = 0f,
+        val slideFmt: VrRenderer.SlideFormat? = null,
+        val segLabels: List<String> = emptyList(), // segmented button row labels
+        val segActions: List<String> = emptyList(), // one action per segment
+        val segSelected: Int = -1, // currently active segment
+        val previewMags: FloatArray? = null, // shaping preview: per-point magnitude 0..1
+        val previewHull: IntArray? = null, // shaping preview: convex-hull point indices
+        val previewN: Int = 9, // shaping preview grid size (n x n)
+        val previewPos: FloatArray? = null, // shaping preview: absolute [x,y] per point, [0,1], y down
+        val dead: Boolean = false, // rest zone: gaze may park here, nothing fires
+        val saf: SafFiles.SafEntry? = null, // SAF (SD card) entries
+        val safTree: String = "",
+        val safRel: String = ""
+    )
+
+    /** Absolute preview positions from offsets: nominal + offset, y down. */
+    private fun previewPos(ox: FloatArray, oy: FloatArray, n: Int): FloatArray {
+        val pos = FloatArray(ox.size * 2)
+        for (j in ox.indices) {
+            pos[j * 2] = (j % n).toFloat() / (n - 1) + ox[j]
+            pos[j * 2 + 1] = (j / n).toFloat() / (n - 1) + oy[j]
+        }
+        return pos
+    }
+
+    /** Authored warp shape from shaping/shapes.json: 9x9 absolute (u,v) grid,
+     *  row-major, row 0 = top, v top->bottom. Converted to offsets at load
+     *  (offset = point - nominal) in half-frame normalized units. */
+    private data class UiShape(
+        val id: String,
+        val label: String,
+        val n: Int,
+        val ox: FloatArray, // x offsets, +right
+        val oy: FloatArray, // y offsets, +down (grid space)
+        val mags: FloatArray, // per-point magnitude normalized 0..1 by file max
+        val maxMag: Float,
+        val hull: IntArray // convex-hull indices over moved points
+    )
+    private var shapingShapes: List<UiShape> = emptyList()
+    private var lastShapingKey = "\u0000"
+
+    private fun slugShapeId(name: String): String {
+        val s = name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')
+        return s.ifEmpty { "shape" }
+    }
+
+    /** Load shaping grids from APK assets (copied from misc/shapes.json at build).
+     *  Bad files/points are skipped with a log; never throws. */
+    private fun loadShapingShapes() {
+        try {
+            val raw = assets.open("shaping/shapes.json").bufferedReader().use { it.readText() }
+            val arr = JSONObject(raw).getJSONArray("shapes")
+            val out = mutableListOf<UiShape>()
+            val used = mutableSetOf<String>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val name = o.optString("name", "shape ${i + 1}")
+                var id = slugShapeId(name)
+                var k = 2
+                while (id in used) { id = "${slugShapeId(name)}-$k"; k++ }
+                used += id
+                val g = o.getJSONArray("grid")
+                val count = g.length()
+                val n = kotlin.math.sqrt(count.toDouble()).toInt()
+                if (n < 2 || n * n != count) { Log.w(TAG, "shaping: $name bad grid size $count"); continue }
+                val ox = FloatArray(count); val oy = FloatArray(count)
+                var ok = true
+                for (j in 0 until count) {
+                    val pt = g.getJSONArray(j)
+                    val x = pt.optDouble(0, Double.NaN); val y = pt.optDouble(1, Double.NaN)
+                    if (x.isNaN() || y.isNaN()) { ok = false; break }
+                    ox[j] = (x - (j % n).toDouble() / (n - 1)).toFloat().coerceIn(-1f, 1f)
+                    oy[j] = (y - (j / n).toDouble() / (n - 1)).toFloat().coerceIn(-1f, 1f)
+                }
+                if (!ok) { Log.w(TAG, "shaping: $name bad point"); continue }
+                var maxMag = 0f
+                val mags = FloatArray(count)
+                for (j in 0 until count) {
+                    val m = kotlin.math.hypot(ox[j], oy[j])
+                    mags[j] = m; if (m > maxMag) maxMag = m
+                }
+                val norm = if (maxMag > 1e-9f) FloatArray(count) { mags[it] / maxMag } else FloatArray(count)
+                out += UiShape(id, name, n, ox, oy, norm, maxMag, convexHull(ox, oy, mags, n))
+            }
+            shapingShapes = out
+            Log.i(TAG, "shaping: loaded ${out.size} shapes")
+        } catch (t: Throwable) {
+            Log.e(TAG, "shaping load failed", t)
+            shapingShapes = emptyList()
+        }
+    }
+
+    /** Minimum convex polygon (Andrew monotone chain) over moved points,
+     *  in nominal grid coords + offset (display positions). Returns grid indices. */
+    private fun convexHull(ox: FloatArray, oy: FloatArray, mags: FloatArray, n: Int): IntArray {
+        data class P(val x: Double, val y: Double, val idx: Int)
+        val pts = mutableListOf<P>()
+        for (j in ox.indices) {
+            if (mags[j] <= 1e-6f) continue
+            pts += P((j % n).toDouble() / (n - 1) + ox[j], (j / n).toDouble() / (n - 1) + oy[j], j)
+        }
+        if (pts.size < 3) return pts.map { it.idx }.toIntArray()
+        val s = pts.sortedWith(compareBy({ it.x }, { it.y }))
+        fun cross(o: P, a: P, b: P) = (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+        val lower = mutableListOf<P>()
+        for (p in s) { while (lower.size >= 2 && cross(lower[lower.size - 2], lower.last(), p) <= 0) lower.removeLast(); lower += p }
+        val upper = mutableListOf<P>()
+        for (p in s.reversed()) { while (upper.size >= 2 && cross(upper[upper.size - 2], upper.last(), p) <= 0) upper.removeLast(); upper += p }
+        lower.removeLast(); upper.removeLast()
+        return (lower + upper).map { it.idx }.toIntArray()
+    }
+
+    /** Normalized weighted average of enabled shapes (null = identity).
+     *  Averages offsets in grid space; weights are 0..1. */
+    private fun averagedShapeOffsets(): Triple<FloatArray, FloatArray, Int>? {
+        val active = shapingShapes.filter { settings.shapeEnabled(it.id) }
+        if (active.isEmpty()) return null
+        val n = active[0].n
+        val same = active.filter { it.n == n }
+        var wsum = 0f
+        for (s in same) wsum += settings.shapeWeight(s.id) / 100f
+        if (wsum <= 0f) return null
+        val ex = FloatArray(n * n); val ey = FloatArray(n * n)
+        for (s in same) {
+            // absolute strength (mean), matching bakeShaping: a lone shape
+            // at 50% previews at half displacement, not full
+            val w = settings.shapeWeight(s.id) / 100f / same.size
+            for (j in ex.indices) { ex[j] += w * s.ox[j]; ey[j] += w * s.oy[j] }
+        }
+        return Triple(ex, ey, n)
+    }
+
+    private var connId: String = ""
+    private var playUrl: String? = null
+    private var playIsProxy = false
+    // SAF (SD card) folder picker state: volume awaiting a grant.
+    private var pendingSafVolume: String? = null
+    private val safPicker = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            SafFiles.takeGrant(this, uri)
+            val cur = settings.safTrees.toMutableSet()
+            cur += uri.toString()
+            settings.safTrees = cur
+            val label = SafFiles.removableVolumes(this).find { it.uuid == pendingSafVolume }?.desc ?: "SD card"
+            pendingSafVolume = null
+            loc = Loc.Saf(uri.toString(), "", label)
+        } else pendingSafVolume = null
+        refresh()
+    }
+
+    private lateinit var sensors: SensorManager
+    private var rotSensor: Sensor? = null
+    private var useGameRv = false
+    private var cmpSensor: Sensor? = null // A/B: second source for comparison
+    private var oriLogCountdown = 0
+    // Raw environment sensors for the debug overlay (snapshots, sensor thread).
+    private var gyroSensor: Sensor? = null
+    private var accelSensor: Sensor? = null
+    private var magSensor: Sensor? = null
+    @Volatile private var lastGyro = FloatArray(3)
+    @Volatile private var lastAccel = FloatArray(3)
+    @Volatile private var lastMag = FloatArray(3)
+    @Volatile private var lastTrackM: FloatArray? = null
+    private val sensorTick = android.os.Handler(android.os.Looper.getMainLooper())
+    private var sensorTicking = false
+    // Yaw-direction baseline captured on first debug-page refresh.
+    private var yawBaseG: Int? = null
+    private var yawBaseR: Int? = null
+    private var yawBaseC: Int? = null
+    // TURNDET baselines (page-open): gyro-integrated yaw + rendered yaw.
+    private var turnBaseG: Double? = null
+    private var turnBaseR: Double? = null
+    // Flight recorder: raw sensor matrix + rendered forward per event.
+    // File: getFilesDir()/trace-<ts>.csv. Open VR, turn head left-right once,
+    // nod once, exit — then pull the file for analysis.
+    private var traceQueue: java.util.concurrent.LinkedBlockingQueue<String>? = null
+    private var traceThread: Thread? = null
+    private var traceCount = 0
+    private var traceFullLogged = false
+    private val TRACE_MAX_LINES = 12000
+
+    private fun startTrace() {
+        try {
+            val f = java.io.File(filesDir, "trace-${System.currentTimeMillis()}.csv")
+            val q: java.util.concurrent.LinkedBlockingQueue<String> =
+                java.util.concurrent.LinkedBlockingQueue()
+            traceQueue = q
+            traceCount = 0
+            traceFullLogged = false
+            q.put("t_ns," + (0..15).joinToString(",") { "r$it" } + ",fwdx,fwdy,fwdz," + (0..15).joinToString(",") { "c$it" } + ",gx,gy,gz,ax,ay,az\n")
+            traceThread = kotlin.concurrent.thread(name = "sweepvr-trace", isDaemon = true) {
+                try {
+                    f.bufferedWriter().use { w ->
+                        while (true) {
+                            val line = q.take()
+                            if (line == "EOF") break
+                            w.write(line)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "trace: ${e.message}")
+                }
+            }
+            Log.i(TAG, "trace recording to ${f.absolutePath}")
+        } catch (e: Exception) {
+            Log.w(TAG, "trace start failed: ${e.message}")
+        }
+    }
+
+    private fun traceEvent(tNs: Long, raw: FloatArray) {
+        val q = traceQueue ?: return
+        if (traceCount >= TRACE_MAX_LINES) {
+            if (!traceFullLogged) {
+                traceFullLogged = true
+                Log.w(TAG, "trace full ($TRACE_MAX_LINES lines), stopping")
+            }
+            return
+        }
+        traceCount++
+        val fwd = renderer.lastEffFwd
+        val cmp = cmpListener.lastRaw
+        val g = lastGyro
+        val ac = lastAccel
+        val sb = StringBuilder(480)
+        sb.append(tNs)
+        for (v in raw) sb.append(',').append(v)
+        sb.append(',').append(fwd[0]).append(',').append(fwd[1]).append(',').append(fwd[2])
+        if (cmp != null) { for (v in cmp) sb.append(',').append(v) }
+        else { for (i in 0..15) sb.append(",NaN") }
+        sb.append(',').append(g[0]).append(',').append(g[1]).append(',').append(g[2])
+        sb.append(',').append(ac[0]).append(',').append(ac[1]).append(',').append(ac[2])
+        sb.append('\n')
+        q.offer(sb.toString())
+    }
+
+    private fun stopTrace() {
+        traceQueue?.offer("EOF")
+        traceQueue = null
+        traceThread = null
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        FileLog.init(this)
+        FileLog.i(TAG, "SweepVR ${BuildConfig.VERSION_NAME} VrPlayerActivity start")
+        val volProof = runCatching {
+            val f = VrRenderer::class.java.getDeclaredField("frameAvailable")
+            java.lang.reflect.Modifier.isVolatile(f.modifiers)
+        }.getOrDefault(false)
+        FileLog.i(TAG, "volatileProof frameAvailable=$volProof")
+        android.util.Log.i(TAG, "volatileProof frameAvailable=$volProof")
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // There is no keyboard in a headset: never let the IME come up.
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+        hideSystemBars()
+        setContentView(R.layout.activity_vr)
+        settings = SettingsStore(this)
+        // Startup baseline (§10) fires ONCE, on a genuinely fresh install.
+        //
+        // It used to fire on every fresh PROCESS, which meant every cold
+        // start (and so every new build) reset the calibration table AND the
+        // comfort settings the user had dialled in - screen size went back to
+        // 1x, curve to 0. Screen size and curve are a per-user comfort
+        // choice, not a calibration result, so they must survive a restart.
+        // The in-process guard still stops a rotation re-firing it.
+        if (!baselineFiredProcess) {
+            baselineFiredProcess = true
+            if (!settings.baselineEver) {
+                settings.fireBaseline(System.currentTimeMillis())
+                FileLog.i(TAG, "startup baseline fired (fresh install)")
+                Log.i(TAG, "startup baseline fired (fresh install)")
+            } else {
+                FileLog.i(TAG, "startup baseline skipped (already configured)")
+            }
+        }
+        connections = ConnectionStore(this).load()
+        loadShapingShapes()
+
+        glView = findViewById(R.id.glView)
+        txtStatus = findViewById(R.id.txtStatus)
+        glView.setEGLContextClientVersion(2)
+        renderer = VrRenderer(
+            onBrowserActivate = { idx, frac -> runOnUiThread { activateRow(idx, frac) } },
+            onMenuEvent = { e -> runOnUiThread { handleMenuEvent(e) } },
+            onWebEvent = { e -> runOnUiThread { handleWebEvent(e) } }
+        )
+        applyOptics()
+        renderer.projection = runCatching { Projection.valueOf(intent.getStringExtra(EXTRA_PROJ) ?: settings.projection.name) }.getOrDefault(settings.projection)
+        renderer.stereo = runCatching { Stereo.valueOf(intent.getStringExtra(EXTRA_STEREO) ?: settings.stereo.name) }.getOrDefault(settings.stereo)
+        syncGvr() // projection decides the neck model; IPD/lens too
+        // GVR's SurfaceView above the window content, but ONLY in web mode:
+        // that is what lets the WebView sit in the window (composited, and
+        // capturable by PixelCopy) without ever being seen. Set for every
+        // mode it also buried the window's own red X close button, which is
+        // drawn as ordinary window content and is wanted on the video screen.
+        gvrSurface = findGvrSurface(glView)
+        applyGvrZOrder(false)
+        glView.setRenderer(renderer)
+        // StereoRenderer drives both eyes; the SDK handles lens warp.
+        glView.setStereoModeEnabled(true)
+        renderer.gvrView = glView
+        tuneAlignmentMarker() // halve GVR's bottom marker, mirror one at the top
+        glView.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            renderer.lastWidth = v.width.coerceAtLeast(1)
+            renderer.lastHeight = v.height.coerceAtLeast(1)
+        }
+
+        setupWeb()
+
+        sensors = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        // Prefer GAME rotation vector: gyro+accel only, no compass, so viewer
+        // magnets / indoor metal can't corrupt yaw (GVR-style fusion behaves
+        // the same way). Yaw has no absolute reference and drifts slowly — tap to
+        // recenter. Fall back to the full rotation vector if absent.
+        rotSensor = sensors.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+            ?: sensors.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        useGameRv = rotSensor?.type == Sensor.TYPE_GAME_ROTATION_VECTOR
+        // A/B comparison: always listen to the OTHER source too (diagnostics only)
+        cmpSensor = if (useGameRv) sensors.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+            else sensors.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+        gyroSensor = sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        accelSensor = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        magSensor = sensors.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+
+        findViewById<android.view.View>(R.id.btnClose).setOnClickListener { finish() }
+
+        connId = intent.getStringExtra(EXTRA_CONN_ID) ?: SessionMemory.lastConnectionId
+        val url = intent.getStringExtra(EXTRA_URL)
+        if (intent.getBooleanExtra(EXTRA_WEB, false)) {
+            // "Enter Web": no video, straight into the browser.
+            enterWeb(intent.getStringExtra(EXTRA_WEB_URL))
+        } else if (url != null) {
+            playIsProxy = url.startsWith("http://127.0.0.1")
+            // Direct launch (2D Watch play button): rebuild the prev/next
+            // queue + remembered folder from the extras, exactly like the
+            // in-VR play path does from its listing.
+            val qPaths = intent.getStringArrayListExtra(EXTRA_QUEUE_PATHS) ?: arrayListOf()
+            val qIndex = intent.getIntExtra(EXTRA_QUEUE_INDEX, -1)
+            if (connId.startsWith("local:")) {
+                val dir = connId.removePrefix("local:")
+                SessionMemory.lastConnectionId = connId
+                SessionMemory.lastPath = ""
+                playQueue = qPaths.map { PlayItem.Local(File(it)) }
+                playIndex = qIndex
+                if (playIndex !in playQueue.indices) {
+                    playIndex = playQueue.indexOfFirst {
+                        (it as PlayItem.Local).f.absolutePath == File(dir, intent.getStringExtra(EXTRA_NAME) ?: "").absolutePath
+                    }
+                }
+            } else if (connId.startsWith("saf:")) {
+                val treeUri = connId.removePrefix("saf:")
+                val relPath = intent.getStringExtra(EXTRA_PATH) ?: ""
+                SessionMemory.lastConnectionId = connId
+                SessionMemory.lastPath = relPath
+                playQueue = qPaths.map {
+                    PlayItem.Saf(it, android.net.Uri.parse(it).lastPathSegment ?: "video", treeUri, relPath)
+                }
+                playIndex = qIndex
+                if (playIndex !in playQueue.indices) {
+                    playIndex = playQueue.indexOfFirst { (it as? PlayItem.Saf)?.uri == url }
+                }
+            } else if (connId.isNotEmpty()) {
+                val cleanId = connId.removePrefix("smb:")
+                val dirPath = intent.getStringExtra(EXTRA_PATH) ?: SessionMemory.lastPath
+                SessionMemory.lastConnectionId = "smb:$cleanId"
+                SessionMemory.lastPath = dirPath
+                playQueue = qPaths.map {
+                    PlayItem.Smb(SmbEntry(it.substringAfterLast('\\'), it, false, -1), cleanId)
+                }
+                playIndex = qIndex
+            }
+            Log.i(TAG, "launch dir=$connId queue=${playQueue.size} idx=$playIndex")
+            startPlayback(url, intent.getStringExtra(EXTRA_NAME) ?: "video")
+        } else {
+            loc = when {
+                connId.startsWith("local:") -> Loc.Local(File(connId.removePrefix("local:")))
+                connId.startsWith("smb:") -> Loc.Smb(connId.removePrefix("smb:"), intent.getStringExtra(EXTRA_PATH) ?: SessionMemory.lastPath)
+                connId.isNotEmpty() -> Loc.Smb(connId, intent.getStringExtra(EXTRA_PATH) ?: SessionMemory.lastPath)
+                else -> Loc.Root
+            }
+            enterBrowser()
+        }
+    }
+
+    /** GvrView is a FrameLayout; its GLSurfaceView/SurfaceView child is the
+     *  one that needs the z-order. Null if GVR ever stops using one. */
+    private fun findGvrSurface(v: android.view.ViewGroup): android.view.SurfaceView? {
+        for (i in 0 until v.childCount) {
+            val c = v.getChildAt(i)
+            if (c is android.view.SurfaceView) return c
+            if (c is android.view.ViewGroup) findGvrSurface(c)?.let { return it }
+        }
+        return null
+    }
+
+    /** Every tap in this window recentres. Handled here rather than on the
+     *  GL view because the web page now sits in the same window (PixelCopy
+     *  needs it composited) and would otherwise swallow taps over it. */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_UP && !renderer.cancelAim()) {
+            // Recentre = "reorient and start from the page": if the gaze is
+            // resting on the web panel it would keep the gaze there and the
+            // page looks dead until you look away from it.
+            if (renderer.mode == VrRenderer.Mode.WEB) closeWebPanel()
+            renderer.recenter("tap")
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun applyOptics() {
+        renderer.swapEyes = settings.swapEyes
+        renderer.zoom = settings.videoZoom
+        renderer.panelDistM = settings.panelDistM
+        renderer.dwellMs = settings.dwellMs
+        renderer.pinVideo = settings.pinVideo
+        renderer.skipSecs = settings.skipSecs
+        // Optics: FOV scale + screen size feed the per-eye projection and
+        // the flat model matrix; IPD/lens coefficients go to the SDK.
+        renderer.fovScale = settings.fovScale
+        renderer.screenSize = settings.screenSize
+        renderer.screenCurve = settings.screenCurve
+        renderer.panoQuality = settings.panoQuality
+        renderer.disableDist = settings.disableDist
+        renderer.enableTooltip = settings.enableTooltip
+        renderer.ipdM = settings.ipdMm / 1000f
+        renderer.convTrimNdc = settings.convTrim
+
+        // Shaping grids: feed active set only when content changed (mesh rebuild is keyed).
+        val skey = shapingShapes.filter { settings.shapeEnabled(it.id) }
+            .joinToString(";") { "${it.id}:${settings.shapeWeight(it.id)}" }
+        if (skey != lastShapingKey) {
+            lastShapingKey = skey
+            renderer.shapingActive = shapingShapes.filter { settings.shapeEnabled(it.id) }.map {
+                VrRenderer.ActiveShape(it.ox, it.oy, settings.shapeWeight(it.id) / 100f, it.n)
+            }
+            renderer.shapingRevision++
+        }
+        renderer.testSweep = settings.testSweep
+        renderer.lensK1 = settings.lensK1
+        renderer.lensK2 = settings.lensK2
+        renderer.lensStrength = settings.lensStrength
+        renderer.fisheyeRadiusScale = settings.fisheyeRadius
+        renderer.fisheyeMirrorR = settings.fisheyeMirrorR
+        renderer.menuAngleUp = settings.menuAngleUp
+        renderer.menuAngleDown = settings.menuAngleDown
+        renderer.menuSideUp = settings.menuTop
+        renderer.circleGestureEnabled = settings.circleRecenter
+        // Fisheye circle calibration needs the decoded frame's aspect.
+        try {
+            player?.videoFormat?.let { vf ->
+                if (vf.width > 0 && vf.height > 0)
+                    renderer.videoAspect = vf.width.toFloat() / vf.height.toFloat()
+            }
+        } catch (_: Exception) {}
+        syncGvr()
+    }
+
+    /** GVR-side optics (§6/§10): viewer IPD, lens distortion coefficients
+     *  (k1/k2 × strength), the distortion-correction toggle and the neck
+     *  model — flat holds the screen fixed in view space, panoramas stay
+     *  tracked. Runs from applyOptics so the 2-D settings page is live. */
+    private fun syncGvr() {
+        val g = renderer.gvrView ?: return
+        runCatching {
+            g.setNeckModelEnabled(renderer.projection == Projection.FLAT)
+            g.setDistortionCorrectionEnabled(!settings.disableDist)
+            val vp = g.gvrViewerParams
+            vp.interLensDistance = renderer.ipdM
+            vp.distortion.setCoefficients(floatArrayOf(
+                settings.lensK1 * settings.lensStrength,
+                settings.lensK2 * settings.lensStrength
+            ))
+            g.updateGvrViewerParams(vp)
+            FileLog.i(TAG, "syncGvr ipd=${renderer.ipdM} dist=${!settings.disableDist} " +
+                "k=(${settings.lensK1 * settings.lensStrength},${settings.lensK2 * settings.lensStrength}) " +
+                "neck=${renderer.projection == Projection.FLAT}")
+        }.onFailure { FileLog.i(TAG, "syncGvr failed: $it") }
+    }
+
+    /** GVR's phone-alignment marker is a 24 mm line pinned to the bottom
+     *  centre of the screen (cardboard ui_layer.xml: id ui_alignment_marker,
+     *  #b4b4b4, 2 dp thick). Request: half that length, plus an equal twin
+     *  pinned to the top so both edges mark the phone centre. Runs after
+     *  layout; the original length is captured once so repeat calls (and a
+     *  UiLayer re-inflate) stay idempotent, and the twin carries a tag. */
+    private var alignMarkerFullH = 0
+    private fun tuneAlignmentMarker() {
+        glView.post {
+            val id = com.google.vr.cardboard.R.id.ui_alignment_marker
+            val marker = glView.findViewById<View>(id) ?: window.decorView.findViewById<View>(id)
+            if (marker == null) { Log.w(TAG, "alignment marker not found"); return@post }
+            val lp = marker.layoutParams as? RelativeLayout.LayoutParams ?: return@post
+            if (lp.height <= 0 || lp.height < lp.width) return@post // portrait variant: a bar
+            if (alignMarkerFullH == 0) alignMarkerFullH = lp.height
+            lp.height = alignMarkerFullH / 2
+            marker.layoutParams = lp
+            val parent = marker.parent as? ViewGroup ?: return@post
+            if (parent.findViewWithTag<View>(ALIGN_TWIN_TAG) != null) return@post
+            val color = (marker.background as? ColorDrawable)?.color ?: 0xFFB4B4B4.toInt()
+            parent.addView(View(glView.context).apply {
+                tag = ALIGN_TWIN_TAG
+                setBackgroundColor(color)
+                layoutParams = RelativeLayout.LayoutParams(lp.width, alignMarkerFullH / 2).apply {
+                    addRule(RelativeLayout.CENTER_HORIZONTAL)
+                    addRule(RelativeLayout.ALIGN_PARENT_TOP)
+                }
+            })
+            FileLog.i(TAG, "alignment marker ${alignMarkerFullH}px -> ${alignMarkerFullH / 2}px + top twin")
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        hideSystemBars()
+        applyOptics()
+        renderer.resetBasis("entry") // next sensor reading centers the view
+        connections = ConnectionStore(this).load()
+        // re-check the All-files toggle on return from Settings
+        // (web mode owns the panel rows, so leave them alone there)
+        if (renderer.mode != VrRenderer.Mode.WEB) {
+            try { refresh() } catch (_: Exception) {}
+        }
+        mainHandler.removeCallbacks(webPump)
+        mainHandler.postDelayed(webPump, 400L)
+        webView?.onResume()
+        glView.onResume()
+        tuneAlignmentMarker() // idempotent: covers a UiLayer (re)inflate
+        rotSensor?.let {
+            sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            Log.i(TAG, "tracking via ${if (useGameRv) "GAME_ROTATION_VECTOR (no compass)" else "ROTATION_VECTOR"}")
+        }
+        cmpSensor?.let {
+            sensors.registerListener(cmpListener, it, SensorManager.SENSOR_DELAY_GAME)
+            Log.i(TAG, "A/B comparison via type=${it.type}")
+        }
+        gyroSensor?.let { sensors.registerListener(envListener, it, SensorManager.SENSOR_DELAY_GAME) }
+        accelSensor?.let { sensors.registerListener(envListener, it, SensorManager.SENSOR_DELAY_GAME) }
+        magSensor?.let { sensors.registerListener(envListener, it, SensorManager.SENSOR_DELAY_GAME) }
+        startTrace()
+        startSensorTick()
+        startWatchTick()
+    }
+
+    /** 2Hz live refresh + 1Hz logcat mirror while the sensor page is open. */
+    private val sensorTickTask = object : Runnable {
+        var n = 0
+        override fun run() {
+            if (!sensorTicking) return
+            if (loc == Loc.Sensors && renderer.mode == VrRenderer.Mode.BROWSER) {
+                updatePeaks()
+                showSensors()
+                if (n++ % 2 == 0) logSensors()
+            }
+            sensorTick.postDelayed(this, 500)
+        }
+    }
+
+    // Peak-hold telemetry: latch max gyro per axis + max gaze deflection from
+    // page-open baseline, so motion can be read AFTER stopping (gyro shows
+    // rate = zero when still; Euler rows are gimbal-unreliable in-viewer).
+    private var peakGyro = FloatArray(3)
+    private var peakBaseFwd: FloatArray? = null
+    private var peakGazeDeg = 0.0
+    private var peakGazeDir = ""
+
+    private fun resetPeaks() {
+        peakGyro = FloatArray(3)
+        peakBaseFwd = null
+        peakGazeDeg = 0.0
+        peakGazeDir = ""
+    }
+
+    private fun updatePeaks() {
+        val g = lastGyro
+        for (i in 0..2) {
+            val m = kotlin.math.abs(g[i])
+            if (m > peakGyro[i]) peakGyro[i] = m
+        }
+        val e = renderer.effCopy()
+        val f = floatArrayOf(-e[2], -e[6], -e[10])
+        val base = peakBaseFwd
+        if (base == null) {
+            peakBaseFwd = f
+            return
+        }
+        val dot = ((f[0]*base[0] + f[1]*base[1] + f[2]*base[2]) /
+            (kotlin.math.sqrt((f[0]*f[0] + f[1]*f[1] + f[2]*f[2]).toDouble()) *
+             kotlin.math.sqrt((base[0]*base[0] + base[1]*base[1] + base[2]*base[2]).toDouble()) + 1e-9))
+            .coerceIn(-1.0, 1.0)
+        val ang = Math.toDegrees(kotlin.math.acos(dot))
+        if (ang > peakGazeDeg) {
+            peakGazeDeg = ang
+            // direction of deflection in screen terms (from baseline forward)
+            val yawPart = Math.toDegrees(kotlin.math.atan2((f[0] - base[0]).toDouble(), (-(f[2] - base[2])).toDouble()))
+            val pitPart = Math.toDegrees(kotlin.math.asin((f[1] - base[1]).toDouble().coerceIn(-1.0, 1.0)))
+            peakGazeDir = (if (yawPart >= 0) "R" else "L") + (if (pitPart >= 0) "+up" else "+dn")
+        }
+    }
+
+    private fun startSensorTick() {
+        if (sensorTicking) return
+        sensorTicking = true
+        sensorTick.post(sensorTickTask)
+    }
+
+    private fun stopSensorTick() {
+        sensorTicking = false
+        sensorTick.removeCallbacks(sensorTickTask)
+        sensorTick.removeCallbacks(watchTickTask)
+    }
+
+    // Playback stall watchdog: 2s tick while video plays. Distinguishes
+    // BUFFERING-starved (state=BUFFERING, buffered~0 → link too slow) from
+    // STUCK-ready (state=READY but position frozen with buffer → decoder/
+    // render stall) from clean playback. The money log for freezes.
+    // Also re-attaches the video surface if EGL recreated it under us
+    // (orphaned surface = frozen picture, advancing position, no errors).
+    private var attachedSurfaceGen = -1
+    private var lastWatchFrames = 0L
+    private var lastWatchConsumed = 0L
+    private var lastWatchArrived = 0L
+    @Volatile private var lastFrameBatchMs = 0L
+    private val watchTickTask = object : Runnable {
+        override fun run() {
+            val p = player
+            if (p != null && renderer.mode == VrRenderer.Mode.VIDEO) {
+                if (attachedSurfaceGen != renderer.surfaceGen) {
+                    attachedSurfaceGen = renderer.surfaceGen
+                    val s = renderer.surface
+                    if (s != null) {
+                        p.setVideoSurface(s)
+                        FileLog.i(TAG, "video surface (re-)attached gen=${renderer.surfaceGen}")
+                    }
+                }
+                val state = when (p.playbackState) {
+                    Player.STATE_IDLE -> "IDLE"
+                    Player.STATE_BUFFERING -> "BUFFERING"
+                    Player.STATE_READY -> "READY"
+                    Player.STATE_ENDED -> "ENDED"
+                    else -> "?${p.playbackState}"
+                }
+                val pos = p.currentPosition
+                renderer.menuPosMs = pos
+                renderer.menuDurMs = p.duration.coerceAtLeast(0)
+                renderer.menuPlaying = p.playWhenReady && p.playbackState == Player.STATE_READY
+                val buf = (p.bufferedPosition - pos).coerceAtLeast(0)
+                val frames = renderer.frameCount
+                val fps = frames - lastWatchFrames
+                lastWatchFrames = frames
+                val consumed = renderer.consumedFrames
+                val vfps = consumed - lastWatchConsumed
+                lastWatchConsumed = consumed
+                val arrived = renderer.arrivedFrames
+                val afps = arrived - lastWatchArrived
+                lastWatchArrived = arrived
+                // Splitter signals: is the video track still selected, what
+                // format does the player think is current, is it playing, and
+                // how long since the decoder last delivered a frame batch?
+                // (offsetAge growing + vfps 0 = decoder stopped feeding;
+                //  drops climbing instead = render-side stall.)
+                var vidSel = false
+                var vidFmt = "none"
+                runCatching {
+                    for (g in p.currentTracks.groups) {
+                        if (!g.isSelected) continue
+                        val f = g.getTrackFormat(0)
+                        if (f.sampleMimeType?.startsWith("video/") == true) {
+                            vidSel = true
+                            vidFmt = "${f.sampleMimeType} ${f.width}x${f.height}"
+                        }
+                    }
+                }
+                val offsetAge = System.currentTimeMillis() - lastFrameBatchMs
+                FileLog.i(TAG, "watch pos=${pos}ms buf=${buf}ms dur=${p.duration}ms " +
+                    "state=$state playWhenReady=${p.playWhenReady} glfps~${fps / 2} vfps~${vfps / 2} afps~${afps / 2} " +
+                    "vidSel=$vidSel vidFmt=$vidFmt playing=${p.isPlaying} offsetAge=${offsetAge}ms " +
+                    "wh=${renderer.lastWidth}x${renderer.lastHeight} lens=${renderer.lensK1},${renderer.lensK2} " +
+                    "proj=${renderer.projection} stereo=${renderer.stereo} zoom=${settings.videoZoom}")
+            }
+            sensorTick.postDelayed(this, 2000)
+        }
+    }
+
+    private fun startWatchTick() {
+        sensorTick.removeCallbacks(watchTickTask)
+        sensorTick.post(watchTickTask)
+    }
+
+    override fun onPause() {
+        glView.onPause()
+        sensors.unregisterListener(this)
+        cmpSensor?.let { sensors.unregisterListener(cmpListener) }
+        sensors.unregisterListener(envListener)
+        stopSensorTick()
+        stopTrace()
+        player?.pause()
+        mainHandler.removeCallbacks(webPump)
+        webView?.onPause()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        player?.release(); player = null
+        if (playIsProxy) playUrl?.let { StreamProxy.unregisterByUrl(it) }
+        super.onDestroy()
+    }
+
+    override fun onKeyDown(code: Int, e: KeyEvent?): Boolean {
+        // Volume keys are deliberately NOT intercepted: they adjust volume.
+        // Gaze dwell is the selector; DPAD/enter covers devices that have it.
+        if (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER) {
+            renderer.tapSelect()
+            return true
+        }
+        return super.onKeyDown(code, e)
+    }
+
+    private fun hideSystemBars() {
+        val ctrl = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
+        ctrl.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+        ctrl.systemBarsBehavior =
+            androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+
+    // ---------------- browser ----------------
+    // Back to the browser, staying in the directory that was open (NOT top
+    // level): exiting a video returns to its folder.
+    private fun goBrowser() { player?.pause(); enterBrowser() }
+
+    private fun enterBrowser() {
+        player?.pause()
+        renderer.mode = VrRenderer.Mode.BROWSER
+        // Default to the playing file's folder so Files opens where you are.
+        // No recenter: the world (video + panel frame) must not move when
+        // opening a menu. The panel stays world-locked; look around for it.
+        if (playIndex in playQueue.indices) {
+            when (val it = playQueue[playIndex]) {
+                is PlayItem.Smb -> loc = Loc.Smb(it.connId, it.e.path.substringBeforeLast('\\', ""))
+                is PlayItem.Local -> it.f.parentFile?.let { p -> loc = Loc.Local(p) }
+                is PlayItem.Saf -> {
+                    val cur = loc as? Loc.Saf
+                    loc = if (cur != null && cur.treeUri == it.treeUri) Loc.Saf(it.treeUri, it.relPath, cur.label)
+                    else {
+                        val label = SafFiles.removableVolumes(this).find { v ->
+                            SafFiles.grantedTree(this, v.uuid) == it.treeUri
+                        }?.desc ?: "SD card"
+                        Loc.Saf(it.treeUri, it.relPath, label)
+                    }
+                }
+            }
+        } else if (loc !is Loc.Smb && loc !is Loc.Local && loc !is Loc.Saf && loc !is Loc.Root) {
+            // Playing file isn't in the folder queue (single-file play) AND
+            // we're sitting on a non-file page (settings/shaping/sensors):
+            // without this the 📁 button would just re-show that stale page
+            // instead of the file browser. Fall back to the server list.
+            loc = Loc.Root
+        }
+        refresh()
+    }
+
+    private fun refresh() {
+        // Browser panel floats over live video halfway to the play menu
+        // when a video exists; centered at horizon otherwise.
+        renderer.browserElevDeg = if (player != null) renderer.overlayElevDeg() else 0f
+        when (val l = loc) {
+            is Loc.Root -> showRoot()
+            is Loc.Smb -> showSmb(l.connId, l.path)
+            is Loc.Local -> showLocal(l.dir)
+            is Loc.Saf -> showSaf(l.treeUri, l.relPath, l.label)
+            is Loc.SettingsPage -> showSettings()
+            is Loc.ShapingPage -> showShaping()
+            is Loc.Sensors -> showSensors()
+        }
+    }
+
+    private fun pushRows(title: String, status: String, r: List<Row>) {
+        rows = r
+        renderer.browserTitle = title
+        // File pages lead with home + up: pin both above the scroll-up
+        // strip so nav stays reachable without scrolling back to the top.
+        // Settings/shaping/sensor pages get no strips (pin 0).
+        renderer.pinTopRows =
+            if (r.size >= 2 && r[0].action == "home:" && r[1].action == "up:") 2
+            else 0
+        renderer.browserRows = r.map {
+            VrRenderer.BrowserRow(it.label, it.meta, it.kind, it.slideKey, it.slideMin, it.slideMax, it.slideVal, it.slideFmt,
+                it.segLabels, it.segActions, it.segSelected,
+                it.previewMags, it.previewHull, it.previewN, it.previewPos, it.dead)
+        }
+        txtStatus.text = status
+    }
+
+    private fun showRoot() {
+        val r = mutableListOf<Row>()
+        for (c in connections) {
+            r += Row(c.label, "${c.unc} • ${if (c.username.isBlank()) "guest" else c.username}",
+                VrRenderer.BrowserRow.FOLDER, action = "smb:${c.id}")
+        }
+        r += Row("Internal Storage", "phone storage", VrRenderer.BrowserRow.FOLDER, action = "local:")
+        for (vr in LocalFiles.volumeRoots(this).filter { !it.isPrimary }) {
+            if (LocalFiles.sdBlocked(this, vr.dir))
+                r += Row(vr.label, "tap to grant full access",
+                    VrRenderer.BrowserRow.FOLDER, action = "grantfull:${vr.dir.absolutePath}")
+            else r += Row(vr.label, vr.dir.absolutePath,
+                VrRenderer.BrowserRow.FOLDER, action = "local:${vr.dir.absolutePath}")
+        }
+        for (v in SafFiles.removableVolumes(this)) {
+            val granted = SafFiles.grantedTree(this, v.uuid) != null
+            if (!LocalFiles.needsFullAccess() && !granted) continue
+            r += Row(v.desc, if (granted) "SD card" else "tap to grant access",
+                VrRenderer.BrowserRow.FOLDER, action = "safroot:${v.uuid ?: ""}")
+        }
+        r += Row("Settings", currentOpticsSummary(), VrRenderer.BrowserRow.ACTION, action = "settings:")
+        r += Row("Shaping", "warp grids (dome correction)", VrRenderer.BrowserRow.ACTION, action = "shaping:")
+        r += Row("Sensor debug", "live raw values", VrRenderer.BrowserRow.ACTION, action = "sensors:")
+        pushRows("SweepVR", if (connections.isEmpty()) "Add a server in the 2D app, or open Internal Storage" else "${connections.size} servers — stare to open", r)
+    }
+
+    private fun currentOpticsSummary(): String =
+        "${renderer.projection.label} ${renderer.stereo.label} • fov×${String.format("%.2f", settings.fovScale)} • IPD ${settings.ipdMm.toInt()}mm"
+
+    private fun showSmb(connId: String, path: String) {
+        val conn = connections.find { it.id == connId }
+        if (conn == null) { loc = Loc.Root; refresh(); return }
+        pushRows("${conn.host}/${conn.share} /${path.replace('\\', '/')}", "Listing…",
+            listOf(Row("Loading…", "", VrRenderer.BrowserRow.FILE)))
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                if (!SmbHolder.manager.isBoundTo(conn.id)) SmbHolder.manager.connect(conn)
+                val list = SmbHolder.manager.list(path)
+                val r = mutableListOf<Row>()
+                r += Row("⌂ (top)", "servers list", VrRenderer.BrowserRow.FOLDER, action = "home:")
+                r += Row(".. (up)", if (path.isEmpty()) "back to servers" else "parent folder", VrRenderer.BrowserRow.FOLDER, action = "up:")
+                for (e in list) {
+                    val kind = if (e.isDir) VrRenderer.BrowserRow.FOLDER
+                        else if (e.isVideo()) VrRenderer.BrowserRow.VIDEO else VrRenderer.BrowserRow.FILE
+                    val meta = if (e.isDir) "folder" else humanSize(e.size)
+                    r += Row(e.name, meta, kind, smb = e)
+                }
+                withContext(Dispatchers.Main) {
+                    if (loc == Loc.Smb(connId, path)) {
+                        pushRows("${conn.host}/${conn.share} /${path.replace('\\', '/')}",
+                            "${list.size} items • streaming, no download", r)
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "smb list failed", t)
+                withContext(Dispatchers.Main) {
+                    pushRows("Error", "SMB: ${t.message}",
+                        listOf(Row(".. (back)", "${t.message?.take(60)}", VrRenderer.BrowserRow.FOLDER, action = "up:")))
+                    toast("SMB: ${t.message}", long = true)
+                }
+            }
+        }
+    }
+
+    private fun showSaf(treeUri: String, relPath: String, label: String) {
+        val titleRel = if (relPath.isEmpty()) "/" else "/${relPath.replace('/', '/')}"
+        pushRows("$label$titleRel", "Listing…",
+            listOf(Row("Loading…", "", VrRenderer.BrowserRow.FILE)))
+        lifecycleScope.launch(Dispatchers.IO) {
+            val kids = try {
+                SafFiles.list(this@VrPlayerActivity, android.net.Uri.parse(treeUri), relPath)
+            } catch (t: Throwable) { emptyList() }
+            val r = mutableListOf<Row>()
+            r += Row("⌂ (top)", "servers list", VrRenderer.BrowserRow.FOLDER, action = "home:")
+            r += Row(".. (up)", if (relPath.isEmpty()) "back to servers" else "parent folder",
+                VrRenderer.BrowserRow.FOLDER, action = "up:")
+            for (k in kids) {
+                val kind = if (k.isDir) VrRenderer.BrowserRow.FOLDER
+                    else if (SafFiles.isVideo(k)) VrRenderer.BrowserRow.VIDEO else VrRenderer.BrowserRow.FILE
+                val meta = if (k.isDir) "folder" else humanSize(k.size)
+                r += Row(k.name, meta, kind, smb = null, saf = k, safTree = treeUri, safRel = relPath)
+            }
+            withContext(Dispatchers.Main) {
+                if (loc == Loc.Saf(treeUri, relPath, label)) {
+                    pushRows("$label$titleRel", "${kids.size} items", r)
+                }
+            }
+        }
+    }
+
+    private fun showLocal(dir: File) {
+        val (label, rel) = LocalFiles.rootTitle(this, dir)
+        pushRows("$label /${dir.name}", "Listing…",
+            listOf(Row("Loading…", "", VrRenderer.BrowserRow.FILE)))
+        lifecycleScope.launch(Dispatchers.IO) {
+            val kids = try { LocalFiles.list(dir) } catch (t: Throwable) { emptyList() }
+                val r = mutableListOf<Row>()
+                val isRoot = LocalFiles.volumeRoots(this@VrPlayerActivity).any { it.dir == dir }
+                r += Row("⌂ (top)", "servers list", VrRenderer.BrowserRow.FOLDER, action = "home:")
+                r += Row(".. (up)", if (isRoot) "back to servers" else "parent folder", VrRenderer.BrowserRow.FOLDER, action = "up:")
+            for (k in kids) {
+                val kind = if (k.isDir) VrRenderer.BrowserRow.FOLDER
+                    else VrRenderer.BrowserRow.VIDEO
+                r += Row(k.name, if (k.isDir) "folder" else humanSize(k.size), kind, local = k.file)
+            }
+            withContext(Dispatchers.Main) {
+                pushRows("$label $rel", "${kids.size} items", r)
+            }
+        }
+    }
+
+    private fun showSettings() {
+        // gaze sliders: dwell anywhere on the bar to jump straight there
+        fun slide(label: String, value: String, key: String, min: Float, max: Float, cur: Float,
+                  fmt: VrRenderer.SlideFormat = VrRenderer.SlideFormat()) =
+            Row(label, value, VrRenderer.BrowserRow.ACTION,
+                action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur,
+                slideFmt = fmt)
+        val r = mutableListOf(
+            Row("Load defaults", "reset calibration to the startup baseline", VrRenderer.BrowserRow.ACTION, action = "set:defaults"),
+            Row("Video", renderer.stereo.label, VrRenderer.BrowserRow.ACTION,
+                segLabels = listOf("2D", "SBS", "TB"),
+                segActions = listOf("setstereo2:MONO", "setstereo2:SBS", "setstereo2:TB"),
+                segSelected = when (renderer.stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.TB -> 2 }),
+            Row("Screen", renderer.projection.label, VrRenderer.BrowserRow.ACTION,
+                segLabels = listOf("Flat", "180", "220", "270", "360"),
+                segActions = listOf("setscreen:FLAT", "setscreen:DEG180", "setscreen:DEG220", "setscreen:DEG270", "setscreen:DEG360"),
+                segSelected = when (renderer.projection) { Projection.FLAT -> 0; Projection.DEG180 -> 1; Projection.DEG220 -> 2; Projection.DEG270 -> 3; Projection.DEG360 -> 4; else -> -1 }),
+            Row("Lens", if (renderer.projection == Projection.FISHEYE) "Fisheye" else "Normal", VrRenderer.BrowserRow.ACTION,
+                segLabels = listOf("Normal", "Fisheye"),
+                segActions = listOf("setlens:normal", "setlens:fisheye"),
+                segSelected = if (renderer.projection == Projection.FISHEYE) 1 else 0),
+            slide("Fisheye radius", "${String.format("%.2f", settings.fisheyeRadius)}×", "fishR", 0.5f, 1.5f, settings.fisheyeRadius,
+                VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.01f)),
+            Row("Mirror right fisheye", if (settings.fisheyeMirrorR) "ON" else "off", VrRenderer.BrowserRow.ACTION, action = "set:fishmirror"),
+
+            slide("FOV scale", "${String.format("%.2f", settings.fovScale)}×", "fov", 0.5f, 1.5f, settings.fovScale,
+                VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
+            slide("Screen size (Flat only)", "${String.format("%.2f", settings.screenSize)}×", "screensize", 0.5f, 10f, settings.screenSize,
+                VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.25f)),
+            slide("Screen curve (Flat only)", "${(settings.screenCurve * 100).toInt()}%", "curve", 0f, 1f, settings.screenCurve,
+                VrRenderer.SlideFormat("%", 0, 100f, 0f, 0.05f)),
+            slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.1f, 20f, settings.videoZoom,
+                VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
+            Row("", "", VrRenderer.BrowserRow.FILE, dead = true),
+            slide("Eye separation", "${settings.ipdMm.toInt()} mm", "ipd", 40f, 80f, settings.ipdMm,
+                VrRenderer.SlideFormat(" mm", 0, 1f, 0f, 1f)),
+            slide("Convergence", "${String.format("%+.3f", settings.convTrim)}", "convtrim", -0.15f, 0.15f, settings.convTrim,
+                VrRenderer.SlideFormat("", 3, 1f, 0f, 0.005f)),
+            slide("Panel distance", "${String.format("%.1f", settings.panelDistM)} m", "panel", 1.2f, 5f, settings.panelDistM,
+                VrRenderer.SlideFormat(" m", 1, 1f, 0f, 0.1f)),
+            Row("Gaze tooltip", if (settings.enableTooltip) "ON" else "off", VrRenderer.BrowserRow.ACTION, action = "set:tooltip"),
+            Row("Lens distortion", if (settings.disableDist) "off" else "ON", VrRenderer.BrowserRow.ACTION, action = "set:distort"),
+            Row("Pano mesh", if (settings.panoQuality == "vertexhq") "dense" else "normal", VrRenderer.BrowserRow.ACTION,
+                segLabels = listOf("normal", "dense"),
+                segActions = listOf("setpano:vertex", "setpano:vertexhq"),
+                segSelected = if (settings.panoQuality == "vertexhq") 1 else 0),
+        )
+        pushRows("Video settings", "stare at a bar position to jump there", r)
+    }
+
+    private fun showShaping() {
+        fun slide(label: String, value: String, key: String, min: Float, max: Float, cur: Float,
+                  fmt: VrRenderer.SlideFormat = VrRenderer.SlideFormat()) =
+            Row(label, value, VrRenderer.BrowserRow.ACTION,
+                action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur,
+                slideFmt = fmt)
+        val r = mutableListOf<Row>()
+        // Global lens pre-warp first (above the Combined mesh): drag k1/k2
+        // to 0 and the warp visibly vanishes, which proves the coefficients
+        // are applied. Same keys as before, so dwell/nudge handlers work.
+        r += slide("Lens k1", String.format("%.2f", settings.lensK1), "lensK1", 0f, 1f, settings.lensK1,
+            VrRenderer.SlideFormat("", 2, 1f, 0f, 0.01f))
+        r += slide("Lens k2", String.format("%.2f", settings.lensK2), "lensK2", 0f, 1f, settings.lensK2,
+            VrRenderer.SlideFormat("", 2, 1f, 0f, 0.01f))
+        r += slide("Lens strength", String.format("%.2f×", settings.lensStrength), "lensStrength", 0f, 3f, settings.lensStrength,
+            VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f))
+        // Combined preview of the averaged transform (not actionable).
+        val avg = averagedShapeOffsets()
+        if (avg != null) {
+            val (ex, ey, n) = avg
+            var mmax = 0f
+            val mags = FloatArray(ex.size)
+            for (j in ex.indices) {
+                val m = kotlin.math.hypot(ex[j], ey[j])
+                mags[j] = m; if (m > mmax) mmax = m
+            }
+            val norm = if (mmax > 1e-9f) FloatArray(ex.size) { mags[it] / mmax } else FloatArray(ex.size)
+            r += Row("Combined", "averaged transform", VrRenderer.BrowserRow.FILE,
+                previewMags = norm, previewHull = convexHull(ex, ey, mags, n), previewN = n,
+                previewPos = previewPos(ex, ey, n))
+        } else {
+            r += Row("Combined", "nothing enabled — identity", VrRenderer.BrowserRow.FILE)
+        }
+        for (s in shapingShapes) {
+            val on = settings.shapeEnabled(s.id)
+            val w = settings.shapeWeight(s.id)
+            r += Row(s.label, if (on) "ON • ${w.toInt()}%" else "off",
+                VrRenderer.BrowserRow.ACTION, action = "toggleshape:${s.id}",
+                previewMags = s.mags, previewHull = s.hull, previewN = s.n,
+                previewPos = previewPos(s.ox, s.oy, s.n))
+            r += slide("${s.label} weight", "${w.toInt()}%", "shapeWeight-${s.id}", 0f, 100f, w,
+                VrRenderer.SlideFormat("%", 0, 1f, 0f, 1f))
+        }
+        pushRows("Shaping", "dwell a shape to toggle • dwell a bar to set weight", r)
+    }
+
+    /** Live raw sensor readout. Fixed row count; navigation is frozen here
+     *  (activateRow ignores everything but Back) so staring can't fire. */
+    private fun showSensors() {
+        fun f(v: Float) = if (v >= 0) "+${String.format("%.2f", v)}" else String.format("%.2f", v)
+        fun ypr(m: FloatArray?): IntArray {
+            if (m == null) return intArrayOf(999, 999, 999)
+            val o = FloatArray(3)
+            SensorManager.getOrientation(m, o)
+            return intArrayOf(
+                Math.toDegrees(o[0].toDouble()).toInt(),
+                Math.toDegrees(o[1].toDouble()).toInt(),
+                Math.toDegrees(o[2].toDouble()).toInt()
+            )
+        }
+        fun yprOf(m: FloatArray?): String {
+            val d = ypr(m)
+            return if (d[0] > 900) "n/a" else "y${d[0]} p${d[1]} r${d[2]}"
+        }
+        val g = lastGyro
+        val ac = lastAccel
+        val mg = lastMag
+        val gmag = kotlin.math.sqrt((g[0]*g[0] + g[1]*g[1] + g[2]*g[2]).toDouble())
+        val amag = kotlin.math.sqrt((ac[0]*ac[0] + ac[1]*ac[1] + ac[2]*ac[2]).toDouble())
+        val mmag = kotlin.math.sqrt((mg[0]*mg[0] + mg[1]*mg[1] + mg[2]*mg[2]).toDouble())
+        // Turn detector (gimbal-free): gyro-integrated yaw about accel-up vs
+        // rendered-forward yaw, both from page-open baselines. A real head
+        // turn MUST move both, opposite signs (head-R ⇒ image-L), ~equal
+        // magnitude. Head tilt moves NEITHER (correct: no pan on tilt).
+        // (Euler yaw rows above are gimbal-unreliable in-viewer; this row
+        // and the trace file are the ground truth.)
+        val effM = renderer.effCopy()
+        val rfx = -effM[2]; val rfz = -effM[10]
+        // render yaw measured from recenter-forward; baseline at page open
+        val renderYawNow = Math.toDegrees(kotlin.math.atan2(rfx.toDouble(), -rfz.toDouble()))
+        if (turnBaseG == null || turnBaseR == null) {
+            turnBaseG = yawGyroRelDeg; turnBaseR = renderYawNow
+        }
+        fun wrap(d: Double): Double {
+            var x = d % 360.0
+            if (x > 180) x -= 360
+            if (x < -180) x += 360
+            return x
+        }
+        val turnRow = run {
+            val dg = wrap(yawGyroRelDeg - turnBaseG!!)
+            val dr = wrap(renderYawNow - turnBaseR!!)
+            val ok = (kotlin.math.abs(dg) < 3 && kotlin.math.abs(dr) < 3) ||
+                (kotlin.math.abs(dg) > 8 && ((dg > 0) != (dr > 0)) &&
+                    kotlin.math.abs(kotlin.math.abs(dg) - kotlin.math.abs(dr)) <
+                        kotlin.math.max(12.0, kotlin.math.abs(dg) * 0.5))
+            Row("TURN gyro=${if (dg >= 0) "+" else ""}${dg.toInt()} img=${if (dr >= 0) "+" else ""}${dr.toInt()} ${if (ok) "OK" else "WRONG"}",
+                "turn: opposite, ~equal • tilt: both ~0", VrRenderer.BrowserRow.ACTION)
+        }
+        val r = listOf(
+            Row("GYRO ${f(g[0])} ${f(g[1])} ${f(g[2])}", "rad/s — turn head L/R, one axis must swing", VrRenderer.BrowserRow.ACTION),
+            Row("GYROmag ${String.format("%.2f", gmag)}", "still=~0, turning=spikes", VrRenderer.BrowserRow.ACTION),
+            Row("ACC ${f(ac[0])} ${f(ac[1])} ${f(ac[2])}", "|g|=${String.format("%.1f", amag)} — still=~9.8", VrRenderer.BrowserRow.ACTION),
+            Row("MAG ${f(mg[0])} ${f(mg[1])} ${f(mg[2])}", "|m|=${String.format("%.0f", mmag)} — still~=const", VrRenderer.BrowserRow.ACTION),
+            Row("GAMErv ${yprOf(lastTrackM)}", if (useGameRv) "tracking source" else "compare source", VrRenderer.BrowserRow.ACTION),
+            Row("FULLrv ${yprOf(cmpListener.lastRaw)}", if (useGameRv) "compare source" else "tracking source", VrRenderer.BrowserRow.ACTION),
+            Row("RENDER ${yprOf(renderer.effCopy())}", "snaps=${renderer.snapCount} kept=${renderer.keptFrames} — must follow GAMErv", VrRenderer.BrowserRow.ACTION),
+            turnRow,
+            Row("PEAK gyro ${String.format("%.2f", peakGyro[0])}/${String.format("%.2f", peakGyro[1])}/${String.format("%.2f", peakGyro[2])}",
+                "max rate per axis since page opened", VrRenderer.BrowserRow.ACTION),
+            Row("PEAK gaze ${String.format("%.0f", peakGazeDeg)}° $peakGazeDir",
+                "max image deflection since page opened", VrRenderer.BrowserRow.ACTION),
+        )
+        pushRows("Sensors — turn head L/R", "nav frozen here • X exits", r)
+    }
+
+    private fun logSensors() {
+        val g = lastGyro; val ac = lastAccel; val mg = lastMag
+        val e = renderer.effCopy()
+        val eo = FloatArray(3); SensorManager.getOrientation(e, eo)
+        val ed = eo.map { Math.toDegrees(it.toDouble()).toInt() }
+        Log.i("SweepVR-sensors",
+            "gyro=${g[0].fmt()}|${g[1].fmt()}|${g[2].fmt()} " +
+            "acc=${ac[0].fmt()}|${ac[1].fmt()}|${ac[2].fmt()} " +
+            "mag=${mg[0].fmt()}|${mg[1].fmt()}|${mg[2].fmt()} " +
+            "render=y${ed[0]}p${ed[1]}r${ed[2]} snaps=${renderer.snapCount}")
+    }
+
+    private fun Float.fmt(): String = String.format("%.2f", this)
+
+    /** Dual toast: 2D system toast plus the in-headset center toast
+     *  (system toasts are unreadable in VR). */
+    private fun toast(msg: String, long: Boolean = false) {
+        Toast.makeText(this, msg, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+        renderer.showToast(msg)
+    }
+
+    /** X close button (title bar): resume video if one exists, else server list.
+     *  Never recenters: closing must not move the world. */
+    private fun closeOverlay() {
+        if (player != null) {
+            settingsFromVideo = false
+            renderer.mode = VrRenderer.Mode.VIDEO
+        } else {
+            settingsFromVideo = false
+            loc = Loc.Root
+            refresh()
+        }
+    }
+
+    // ---------------- web ----------------
+    private var webView: WebView? = null
+    private var webHostRef: android.view.ViewGroup? = null
+    // Fullscreen video: the page hands us a View to promote. It goes inside
+    // webHost so PixelCopy captures it exactly like the rest of the page and
+    // it appears on the VR screen like any other page content.
+    private var webFullView: android.view.View? = null
+    private var webFullCallback: android.webkit.WebChromeClient.CustomViewCallback? = null
+    private var bookmarks: MutableList<WebBookmark> = mutableListOf()
+    private var webUrl = ""
+    private var lastStateLog = 0L
+    /** Where web mode starts with no bookmark. */
+    private val WEB_HOME = "https://www.iana.org/help/example-domains"
+
+    private val WEB_SCHEMES = setOf("http", "https", "about", "data", "file", "javascript", "blob")
+
+    /** texture px per CSS px on the page (1 with the density-1 context). */
+    private var webDpr = 1f
+    private var webTitle = ""
+    private var webStateAt = 0L
+
+    /** JS shim the gaze code talks to: what is under the reticle, click it,
+     *  scroll by a viewport, and report scroll geometry for the scrollbar. */
+    private val webJs = """
+(function(){
+if (window.__limpet) return;
+function clickable(e){
+  for (var i=0; e && i<6; i++, e=e.parentElement){
+    var t=(e.tagName||'').toLowerCase();
+    if (t==='a'||t==='button'||t==='summary'||t==='details'||t==='label'||t==='video') return true;
+    if (e.onclick) return true;
+    if (e.getAttribute && e.getAttribute('role')==='button') return true;
+    try { if (getComputedStyle(e).cursor==='pointer') return true; } catch (x) {}
+  }
+  return false;
+}
+window.__limpet = {
+  hit: function(x,y){ try { return clickable(document.elementFromPoint(x,y)); } catch (e) { return false; } },
+  click: function(x,y){ try {
+      var el=document.elementFromPoint(x,y);
+      for (var i=0; el && i<6 && !clickable(el); i++) el=el.parentElement;
+      if (!el) return 'none';
+      try { el.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+      // Replay what a real tap produces. Note: no extra el.click() — the
+      // sequence already ends with a click event, and doing both navigated
+      // the link twice.
+      var o = {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y, button:0};
+      ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
+        try { el.dispatchEvent(new MouseEvent(t, o)); } catch (e) {}
+      });
+      return (el.tagName||'?') + '.' + (el.className||'') + '|' + (el.href||'');
+  } catch (e) { return 'err:' + e; } },
+  /* Which element actually scrolls?
+     window.scrollBy only moves the DOCUMENT. A consent wall or modal
+     usually scrolls an inner container instead, so document scrolling is a
+     no-op there: the bar looks live and does nothing. Find the real
+     scroller - the largest visible element that can actually scroll - and
+     use that, falling back to the document. */
+  _sc: null,
+  /* Which element actually scrolls?
+     Two shapes defeat the obvious document scroll:
+       - the document is locked (html/body overflow:hidden) and an inner
+         element scrolls. It is often overflow:hidden too, set by script,
+         so 'auto'/'scroll' alone misses it.
+       - a virtual scroller: content is moved with CSS transforms, so
+         scrollHeight == clientHeight and there is no scrollTop to set.
+     So accept any element that reports more content than it shows, and
+     record how it can be driven. */
+  scroller: function() {
+    var best = null, area = 0;
+    try {
+      var all = document.querySelectorAll('*');
+      for (var i = 0; i < all.length && i < 6000; i++) {
+        var e = all[i];
+        if (e.tagName === 'SCRIPT' || e.tagName === 'STYLE' ||
+            e.tagName === 'HEAD' || e.tagName === 'META') continue;
+        var over = e.scrollHeight - e.clientHeight;
+        if (over < 8) continue;
+        var r = e.getBoundingClientRect();
+        if (r.height < 40 || r.width < 40) continue;
+        if (r.bottom < 0 || r.top > window.innerHeight) continue;
+        var a = r.width * r.height;
+        // A real scroll container wins outright. Without this the largest
+        // any-overflow element wins, and on many sites that is a full-page
+        // wrapper with overflow-y:visible, which SHADOWS the actual inner
+        // scroller - so page() sets scrollTop on something that cannot
+        // scroll and never finds the one that can.
+        var oy = '';
+        try { oy = getComputedStyle(e).overflowY; } catch (err) {}
+        if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') a *= 1000;
+        if (a > area) { area = a; best = e; }
+      }
+    } catch (err) {}
+    return best;
+  },
+  /* Under the gaze if we can find it - the page's own handlers are usually
+     bound to the element actually being pointed at. */
+  gazeTarget: function() {
+    try {
+      var t = document.elementFromPoint(window.innerWidth * 0.5,
+                                        window.innerHeight * 0.5);
+      return t || document.body || document.documentElement;
+    } catch (err) { return document.body; }
+  },
+  _wheel: function(target, dy) {
+    try {
+      var ev;
+      if (typeof WheelEvent === 'function') {
+        ev = new WheelEvent('wheel', {
+          deltaY: dy, deltaMode: 0, bubbles: true, cancelable: true,
+          clientX: (window.innerWidth * 0.5) | 0,
+          clientY: (window.innerHeight * 0.5) | 0
+        });
+      } else {
+        ev = document.createEvent('MouseEvents');
+        ev.initMouseEvent('wheel', true, true, window, 0, 0, 0, 0, 0,
+          false, false, false, false, 0, null);
+        ev.deltaY = dy;
+      }
+      target.dispatchEvent(ev);
+      return true;
+    } catch (err) { return false; }
+  },
+  /* Relative scroll by a fraction of a viewport (default 0.9, the historical
+     page step). The scrollbar arrows pass a small fraction for the entry
+     nudge; held motion is the smooth glide below, so arrows never need full
+     steps here. Callers passing nothing get exactly the old behavior. */
+  page: function(dir, frac) {
+    var moved = false, how = 'none';
+    try {
+      var e = this._sc && e_connected(this._sc) ? this._sc : this.scroller();
+      this._sc = e;
+      var f = (typeof frac === 'number' && frac > 0 && frac <= 2) ? frac : 0.9;
+      var step = window.innerHeight * f * dir;
+      if (e) {
+        var before = e.scrollTop;
+        e.scrollTop = before + e.clientHeight * f * dir;
+        moved = Math.abs(e.scrollTop - before) > 0.5;
+        if (moved) how = 'scrollTop';
+      }
+      if (!moved) {
+        var wb = window.pageYOffset;
+        window.scrollBy(0, step);
+        moved = Math.abs(window.pageYOffset - wb) > 0.5;
+        if (moved) how = 'window';
+      }
+      if (!moved) {
+        // Virtual scroller, or a handler-driven page: synthesise wheel
+        // events, which is what a real scroll gesture produces.
+        var t1 = this.gazeTarget();
+        this._wheel(t1, step);
+        if (t1 !== document.body && t1 !== document.documentElement)
+          this._wheel(document.body, step);
+        moved = true; how = 'wheel';
+      }
+      window.__limpetHow = how;
+      return moved;
+    } catch (err) { return false; }
+  },
+  /* Smooth glide while a scrollbar arrow is held. Started once from native
+     when the hold's initial pause expires (GlideStart), stopped on release
+     (GlideStop) - never driven by the repeat ticks, which stay discrete, so
+     frame hitches slow the glide instead of bursting it.
+     Constant velocity by design; the page end stops it (three still ticks),
+     and every path is idempotent: start restarts cleanly, stop twice is safe.
+     rAF dies with the page, so motion cannot outlive a navigation. */
+  _smooth: null,
+  smoothSpeed: 1.125,   // viewports per second
+  smoothStart: function(dir) {
+    try {
+      this.smoothStop();
+      var e = this._sc && e_connected(this._sc) ? this._sc : this.scroller();
+      this._sc = e;
+      var st = { dir: dir, el: e || null, mode: e ? 'el' : 'doc',
+                 vel: dir * window.innerHeight * this.smoothSpeed,
+                 last: 0, still: 0, moved: false, travelled: 0, raf: 0 };
+      this._smooth = st;
+      var self = this;
+      st.raf = requestAnimationFrame(function(t){ self._smoothTick(st, t); });
+      return true;
+    } catch (err) { return false; }
+  },
+  _smoothTick: function(st, t) {
+    try {
+      if (this._smooth !== st) return;   // superseded or stopped
+      if (!st.last) st.last = t;
+      var dt = Math.min(0.1, Math.max(0, (t - st.last) / 1000)); st.last = t;
+      var d = st.vel * dt, before = 0, after = 0, measurable = true;
+      if (st.mode === 'el' && st.el && e_connected(st.el)) {
+        before = st.el.scrollTop; st.el.scrollTop = before + d; after = st.el.scrollTop;
+      } else if (st.mode === 'el') { st.mode = 'doc'; }
+      if (st.mode === 'doc') {
+        before = window.pageYOffset; window.scrollBy(0, d); after = window.pageYOffset;
+      } else if (st.mode === 'wheel') {
+        // Wheel synthesis cannot be measured, so this tier is capped, not
+        // still-detected. Six viewports is further than any hold needs.
+        this._wheel(this.gazeTarget(), d);
+        st.travelled += Math.abs(d); measurable = false;
+        if (st.travelled > window.innerHeight * 6) { this.smoothStop(); return; }
+      }
+      if (measurable) {
+        if (Math.abs(after - before) < 0.5) {
+          if (++st.still >= 3) {
+            st.still = 0;
+            if (st.mode === 'el') st.mode = 'doc';
+            // A document that moved and now won't has reached the page end:
+            // stop. One that never moved was never the scroller (a virtual
+            // page) - demote to wheel synthesis instead of dying here.
+            else if (st.moved) { this.smoothStop(); return; }
+            else st.mode = 'wheel';
+          }
+        } else { st.still = 0; st.moved = true; }
+      }
+      var self = this;
+      st.raf = requestAnimationFrame(function(t2){ self._smoothTick(st, t2); });
+    } catch (err) { try { this.smoothStop(); } catch (e2) {} }
+  },
+  smoothStop: function() {
+    try {
+      var st = this._smooth; this._smooth = null;
+      if (st && st.raf) cancelAnimationFrame(st.raf);
+      return true;
+    } catch (err) { return false; }
+  },
+  /* What did we find? Logged when a page command appears to do nothing, so
+     the failure mode is identifiable instead of guessed at. */
+  diag: function() {
+    try {
+      var e = this._sc;
+      var parts = [];
+      parts.push('doc=' + (document.scrollingElement ?
+        Math.round(document.scrollingElement.scrollHeight) + '/' +
+        Math.round(document.scrollingElement.clientHeight) : '?'));
+      if (e && e_connected(e)) {
+        parts.push('sc=' + e.tagName + '.' + (e.className || '').toString().slice(0, 24) +
+          ' sh=' + Math.round(e.scrollHeight) + ' ch=' + Math.round(e.clientHeight) +
+          ' top=' + Math.round(e.scrollTop) +
+          ' oy=' + getComputedStyle(e).overflowY +
+          ' tf=' + getComputedStyle(e).transform);
+      } else parts.push('sc=none');
+      var vids = document.querySelectorAll('video');
+      if (vids.length) parts.push('vids=' + vids.length);
+      return parts.join(' ');
+    } catch (err) { return 'err'; }
+  },
+  /* PageUp/PageDown as the browser would deliver them. A synthetic
+     KeyboardEvent does not itself scroll anything (it has no default
+     action), so this is for the site's own key handling; the actual move
+     is page() above. */
+  key: function(dir) {
+    try {
+      var code = dir < 0 ? 33 : 34;          // PAGE_UP / PAGE_DOWN
+      var name = dir < 0 ? 'PageUp' : 'PageDown';
+      var tgt = document.activeElement || document.body;
+      if (!tgt) return false;
+      ['keydown', 'keyup'].forEach(function (t) {
+        tgt.dispatchEvent(new KeyboardEvent(t, {
+          key: name, code: name, keyCode: code, which: code,
+          bubbles: true, cancelable: true
+        }));
+      });
+      return true;
+    } catch (err) { return false; }
+  },
+  scroll: function(f){ return this.page(f > 0 ? 1 : -1); },
+  /* Absolute scroll: put the page at fraction f (0 = top, 1 = bottom).
+     The scrollbar drag needs this - every other path here is RELATIVE
+     (a 0.9-viewport step), so a thumb cannot be dragged anywhere without
+     it. Uses the same scroller detection as page(), which is what makes it
+     work on the locked-document/inner-scroller sites that broke the
+     obvious document scroll. */
+  /* Which element actually scrolls, or null if it is the DOCUMENT that
+     scrolls.
+     *
+     * scroller() picks the largest candidate reporting a scroll range, and on
+     * an ordinary page that is a false positive: it reports a range, it
+     * accepts scrollTop, and it reads the new value straight back - so a
+     "did it move" check passes - while nothing on screen moves at all. On
+     Wikipedia it picks BODY.ext-discussiontools-repl, the discussion-tools
+     element. goFrac then reported "abs@1869/1869", a perfect success, and
+     the page sat at 0.
+     *
+     * So the document is asked first, and only when the document genuinely
+     * cannot scroll is an inner element worth trying. */
+  pickScroller: function() {
+    try {
+      var se = document.scrollingElement || document.documentElement;
+      var dsh = Math.max(se ? se.scrollHeight : 0,
+                        document.body ? document.body.scrollHeight : 0);
+      if (dsh - window.innerHeight > 8) return null;   // the document scrolls
+      var e = this._sc && e_connected(this._sc) ? this._sc : this.scroller();
+      this._sc = e;
+      return e;
+    } catch (x) { return null; }
+  },
+  goFrac: function(f) {
+    try {
+      var want = Math.max(0, Math.min(1, f));
+      var e = this.pickScroller();
+      var se = document.scrollingElement || document.documentElement;
+      var sh, ch;
+      if (e) { sh = e.scrollHeight; ch = e.clientHeight; }
+      else {
+        sh = Math.max(se ? se.scrollHeight : 0, document.body ? document.body.scrollHeight : 0);
+        ch = window.innerHeight;
+      }
+      var span = sh - ch;
+      if (span <= 0) { window.__limpetHow = 'nospan'; return 'nospan'; }
+      var target = want * span;
+      // The cached scroller may be an element that reports a scroll range but
+      // refuses to move (a wrapper with overflow:visible, a scrolled-out
+      // subtree). Verify by actually setting scrollTop and reading it back;
+      // if that element does not respond, fall through to the window, which
+      // is the scroller on an ordinary document. Without this the assignment
+      // silently did nothing and every drop looked like a failure.
+      var at = function() { return e ? e.scrollTop : window.scrollY; };
+      // Smooth scrolling must be off for the jump. Assigning scrollTop on a
+      // page with `scroll-behavior: smooth` only STARTS an animation, so the
+      // position does not change until the next frame: the check below reads
+      // the old value, concludes nothing moved, and falls through to the
+      // step-walker. Forcing it off makes the assignment instantaneous.
+      var se2 = document.scrollingElement || document.documentElement;
+      var prevSB = se2 && se2.style ? se2.style.scrollBehavior : '';
+      try {
+        if (se2 && se2.style) se2.style.scrollBehavior = 'auto';
+        if (e && e.style) e.style.scrollBehavior = 'auto';
+      } catch (x) {}
+      if (e) e.scrollTop = target; else window.scrollTo(0, target);
+      if (e && Math.abs(e.scrollTop - target) > 1.0) {
+        // That element would not move. Use the window instead.
+        window.scrollTo(0, target);
+        e = null;
+      }
+      try {
+        if (se2 && se2.style) se2.style.scrollBehavior = prevSB;
+        if (e && e.style) e.style.scrollBehavior = prevSB;
+      } catch (x) {}
+      if (Math.abs(at() - target) > 1.0) {
+        // Nothing moved: a virtual scroller, or a page that only listens for
+        // wheel events. Walk there with relative steps instead. Imprecise, but
+        // it moves. Reported so the log can say so rather than implying the
+        // thumb landed exactly where it was dropped.
+        var guard = 0;
+        while (Math.abs(at() - target) > ch * 0.35 && guard++ < 60) {
+          this.page(at() < target ? 1 : -1);
+        }
+        window.__limpetHow = 'steps';
+        return 'steps@' + Math.round(at()) + '/' + Math.round(target);
+      }
+      window.__limpetHow = 'abs';
+      return 'abs@' + Math.round(at()) + '/' + Math.round(target);
+    } catch (err) { window.__limpetHow = 'err:' + err; return 'err'; }
+  },
+  state: function(){ try {
+      // The element that REALLY scrolls, by the same rule goFrac uses, so the
+      // thumb reports where the page actually is and not where some inner
+      // element happens to think it is.
+      var e = this.pickScroller();
+      var sh, ch, st;
+      if (e) { sh = e.scrollHeight; ch = e.clientHeight; st = e.scrollTop; }
+      else {
+        var se = document.scrollingElement || document.documentElement;
+        var b = document.body;
+        sh = Math.max(se?se.scrollHeight:0, b?b.scrollHeight:0, b?b.offsetHeight:0);
+        ch = window.innerHeight; st = window.scrollY;
+      }
+      return JSON.stringify({sh:sh, ch:ch, st:st, inner: !!e,
+                             url:location.href, t:document.title}); } catch (e) { return '{}'; } }
+};
+function e_connected(e) {
+  try { return !!(e && e.isConnected && e.getClientRects().length); } catch (x) { return false; }
+}
+/* "the page changed" counter, so a static page costs no captures at all */
+window.__limpetV = (window.__limpetV || 0) + 1;
+try {
+  new MutationObserver(function(){ window.__limpetV++; })
+    .observe(document.documentElement, {childList:true, subtree:true, attributes:true, characterData:true});
+  window.addEventListener('scroll', function(){ window.__limpetV++; }, {passive:true});
+} catch (e) {}
+/* Fullscreen. The JS Fullscreen API is a no-op inside a WebView, so a site
+   asking for it (YouTube does) silently stays windowed. Serve it ourselves:
+   promote the video to fill the page, which is then picked up by the usual
+   capture and shown on the VR screen like any other page content. */
+try {
+  var LIM_STYLE = null;
+  function limRestore() {
+    if (LIM_STYLE) { LIM_STYLE.remove(); LIM_STYLE = null; }
+    var p = document.getElementById('__limpet_fs_prev');
+    if (p && p.parentNode) p.parentNode.removeChild(p);
+    window.__limpetFull = false;
+    window.__limpetV++;
+  }
+  function limFullscreen() {
+    // The element the site asked for, else the largest video on screen.
+    var el = document.fullscreenElement;
+    if (!el) {
+      var vs = document.querySelectorAll('video');
+      var best = null, area = 0;
+      for (var i = 0; i < vs.length; i++) {
+        var r = vs[i].getBoundingClientRect();
+        var a = r.width * r.height;
+        if (a > area) { area = a; best = vs[i]; }
+      }
+      el = best;
+    }
+    if (!el) return false;
+    // Hide the site's own player chrome for the duration: the controls are
+    // sized for a phone screen and land in awkward places on the VR screen.
+    var prev = null;
+    var p = el.parentNode;
+    while (p && p !== document.body) {
+      if (prev) prev.dataset.limpetOrig = prev.style.cssText || '';
+      prev = p; p = p.parentNode;
+    }
+    if (prev) {
+      var ph = document.createElement('div');
+      ph.id = '__limpet_fs_prev';
+      ph.setAttribute('data-limpet-was', prev.id || '');
+      prev.parentNode.insertBefore(ph, prev);
+    }
+    if (!LIM_STYLE) {
+      LIM_STYLE = document.createElement('style');
+      LIM_STYLE.textContent = 'video{position:fixed!important;left:0!important;' +
+        'top:0!important;width:100vw!important;height:100vh!important;' +
+        'max-width:none!important;max-height:none!important;object-fit:contain!important;' +
+        'z-index:2147483647!important;background:#000!important;}';
+      (document.head || document.documentElement).appendChild(LIM_STYLE);
+    }
+    el.setAttribute('controls', '');
+    el.play && el.play().catch(function(){});
+    window.__limpetFull = true;
+    window.__limpetAbsent = 0;
+    window.__limpetV++;
+    return true;
+  }
+  var rafReq = Element.prototype.requestFullscreen;
+  var rafEl = Element.prototype.requestFullscreenElement;
+  var caf = Document.prototype.exitFullscreen;
+  Element.prototype.requestFullscreen = function() {
+    if (limFullscreen()) return Promise.resolve();
+    return rafReq ? rafReq.apply(this, arguments) : Promise.resolve();
+  };
+  Element.prototype.requestFullscreenElement = function() {
+    if (limFullscreen()) return Promise.resolve();
+    return rafEl ? rafEl.apply(this, arguments) : Promise.resolve();
+  };
+  Document.prototype.exitFullscreen = function() {
+    if (window.__limpetFull) { limRestore(); return Promise.resolve(); }
+    return caf ? caf.apply(this, arguments) : Promise.resolve();
+  };
+  // Sites that only toggle a class/attribute need a nudge; poll cheaply while
+  // a video is playing and promote if the site believes it is fullscreen.
+  /* Sites signal fullscreen by restructuring their own DOM, so there is no
+     reliable flag to read: a poll that both promotes AND restores fights the
+     site and the video blinks back to windowed within a second. So the poll
+     only ever PROMOTES, and leaving is driven by the explicit signals
+     (exitFullscreen, Escape, the site's own exit control - which clears its
+     DOM, detected after a short debounce so a momentary gap mid-switch does
+     not drop us out). */
+  var absent = 0;
+  setInterval(function() {
+    try {
+      if (window.__limpetFull) {
+        // Site still looks like its own fullscreen (player fills the window)?
+        var v = document.querySelector('video');
+        var r = v && v.getBoundingClientRect();
+        var filling = r && r.width >= window.innerWidth * 0.9 &&
+          r.height >= window.innerHeight * 0.9;
+        if (filling) absent = 0;
+        else if (++absent > 3) { limRestore(); absent = 0; }
+        return;
+      }
+      var el = document.fullscreenElement;
+      var named = (document.documentElement.className || '').indexOf('fullscreen') >= 0 ||
+        (document.body && (document.body.className || '').indexOf('fullscreen') >= 0);
+      if (el || named) { limFullscreen(); absent = 0; }
+    } catch (e) {}
+  }, 500);
+  window.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && window.__limpetFull) limRestore();
+  });
+} catch (e) {}
+})();
+"""
+
+    private fun setupWeb() {
+        val host = findViewById<android.view.ViewGroup>(R.id.webHost)
+        webHostRef = host
+        // The page's CSS viewport is the WebView's PIXEL size divided by the
+        // DISPLAY density, so 1600 / 2.625 = 609 CSS px wide and 900 / 2.625
+        // = 343 tall. That 343 is fixed by the 900px raster height, which is
+        // itself capped by the window's 900px content area (the display cutout
+        // and nav bar take the rest), so the viewport cannot be made taller
+        // from in here.
+        //
+        // Widening it was tried and abandoned: a density override context
+        // (createConfigurationContext with a different densityDpi) does not
+        // reach the page, because Chromium derives its scale factor from the
+        // display rather than the context. It changed OUR webDpr to 1.125
+        // while the page still reported dpr=2.625, which would have silently
+        // broken every click coordinate by 2.3x. setInitialScale and
+        // setDefaultZoomScale are absent from android-34's WebSettings, so
+        // there is no supported in-app route to a wider layout viewport; it
+        // would need a lower system display density.
+        //
+        // webDpr must therefore stay equal to what the page really does.
+        val wv = WebView(this)
+        webDpr = wv.context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+        FileLog.i("SweepVR-web", "webview density=$webDpr raster=1600x900")
+        wv.settings.javaScriptEnabled = true
+        wv.settings.domStorageEnabled = true
+        wv.settings.mediaPlaybackRequiresUserGesture = false
+        // The picture is zoomed by the GL screen, not by the page.
+        wv.settings.setSupportZoom(false)
+        wv.settings.builtInZoomControls = false
+        wv.settings.displayZoomControls = false
+        // Browser text zoom comes from settings, not a constant: the web
+        // panel's zoom buttons adjust it live. Independent of screenSize
+        // (our zoom) and of the display density.
+        wv.settings.setTextZoom(settings.textZoom)
+        FileLog.i("SweepVR-web", "textZoom=${settings.textZoom}")
+        // The gaze scrollbar is ours.
+        wv.isVerticalScrollBarEnabled = false
+        wv.isHorizontalScrollBarEnabled = false
+        wv.setBackgroundColor(android.graphics.Color.BLACK)
+        wv.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, req: android.webkit.WebResourceRequest): Boolean {
+                val sc = req.url.scheme?.lowercase()
+                // http(s)/about/data/file stay in the page; anything else
+                // (intent://, market://, tel:) would hand off to Android and
+                // throw a chooser over the VR view, so swallow it.
+                return sc != null && sc !in WEB_SCHEMES
+            }
+
+            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                renderer.webResetDwell() // new page: its links must be dwellable
+                webUrl = url
+                renderer.webScrollable = false
+                renderer.webScrollFrac = 0f
+                // Dim nav buttons while loading; onPageFinished restores them.
+                renderer.webCanGoBack = false
+                renderer.webCanGoForward = false
+                webVersion++
+        renderer.webBarForgetSize()
+            }
+            override fun onPageFinished(view: WebView, url: String) {
+                // What the site actually sees, not what the arithmetic says.
+                view.evaluateJavascript(
+                    "window.innerWidth + 'x' + window.innerHeight + ' dpr=' + devicePixelRatio",
+                    { r -> FileLog.i("SweepVR-web", "CSSVIEWPORT ${r?.trim()}") })
+                view.evaluateJavascript(webJs, null)
+                webStateAt = 0L // don't let the throttle swallow this probe
+                webVersion++
+                pushWebState()
+                // Back/forward availability for the toolbar dim states. Read
+                // here (and cleared on start, above) rather than polled: the
+                // history only changes on navigation, and polling it per
+                // frame would be a binder call per frame for nothing.
+                renderer.webCanGoBack = view.canGoBack()
+                renderer.webCanGoForward = view.canGoForward()
+            }
+        }
+        wv.setOnScrollChangeListener { _: View, _: Int, _: Int, _: Int, _: Int ->
+            webVersion++
+            pushWebState()
+        }
+        // The page sits in the window only so PixelCopy can read it, and the
+        // GL surface is drawn on top. It must not swallow touches: taps are
+        // how you recentre, and they were being eaten over the page area.
+        wv.isEnabled = false
+        wv.isFocusable = false
+        wv.isFocusableInTouchMode = false
+        wv.isClickable = false
+        host.addView(
+            wv,
+            android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        // Park it well off-screen. It stays VISIBLE and laid out (so Chromium
+        // keeps producing tiles for our raster), but the window never shows
+        // it — otherwise a single flat page image sits on top of the stereo
+        // view, in the headset as well as on the phone.
+        // The page lives on screen so PixelCopy can read the real composited
+        // surface (see pumpWeb). GVR's own SurfaceView is put on top of the
+        // window in onCreate, so none of this is ever visible.
+
+        // Without a WebChromeClient the fullscreen request is refused
+        // outright ("full screen is not available"): fullscreen video is
+        // delivered as a CustomView that the app must host itself.
+        wv.setWebChromeClient(object : android.webkit.WebChromeClient() {
+            override fun onShowCustomView(view: android.view.View?, cb: android.webkit.WebChromeClient.CustomViewCallback?) {
+                if (view == null) return
+                FileLog.i("SweepVR-web", "onShowCustomView ${view.javaClass.simpleName}")
+                val h = webHostRef ?: return
+                webHideFullView()
+                webFullView = view
+                webFullCallback = cb
+                h.addView(view, android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT))
+                view.requestFocus()
+            }
+
+            override fun onHideCustomView() {
+                FileLog.i("SweepVR-web", "onHideCustomView")
+                webHideFullView()
+            }
+        })
+        webView = wv
+        bookmarks = BookmarkStore(this).load()
+        // The page's own size is the texture's aspect.
+        host.post {
+            val w = host.width.coerceAtLeast(64)
+            val h = host.height.coerceAtLeast(64)
+            renderer.webPageW = w
+            renderer.webPageH = h
+        }
+    }
+
+    /** Copy the page into a GL texture. PixelCopy reads what the window
+     *  actually composited, so this sees GPU-rendered web content (a plain
+     *  Bitmap draw would not). Driven by a JS "something changed" counter so
+     *  a static page costs nothing. */
+    private var webVersion = 0
+    private var webVersionSeen = -1
+    /** Capture pump period. ~30 fps. */
+    private val WEB_PUMP_MS = 33L
+    private var webLastRasterAt = 0L
+    private var webCopyMs = -1L
+    private var webCopyBusy = false
+    private var webCopySlot = 0
+    private var webRectLogged = false
+    private val webBmps = arrayOfNulls<Bitmap>(2)
+    // EXPERIMENT telemetry
+    private var webCopiesDone = 0
+    private var webCopyTotalMs = 0L
+    private var webCopyMaxMs = 0L
+    private var webFpsLogAt = 0L
+    private var webFpsFrom = 0
+    private var webFpsFromAt = 0L
+
+    /** Capture pump. Web pages repaint on their own schedule, so the page
+     *  tells us when it changed (a JS counter) and only then do we pay for
+     *  a PixelCopy + upload. */
+    private val webPump = object : Runnable {
+        override fun run() {
+            // Reschedule FIRST: a throw inside the body used to kill the
+            // pump for good, and the page froze at its first frame.
+            // ~30 fps. This was 250 ms, a hard 4 fps ceiling, which capped
+            // video playback no matter what else was true. Measured PixelCopy
+            // cost at 1600x900 is 0.1-2 ms, so copying every tick is cheap and
+            // the old "static page costs nothing" gate was optimising
+            // something that was never expensive - while making the page
+            // miss any change that did not mutate the DOM (video, CSS
+            // animations, canvas, WebGL).
+            mainHandler.postDelayed(this, WEB_PUMP_MS)
+            if (renderer.mode != VrRenderer.Mode.WEB) return
+            try {
+                pollPageVersion()
+                pumpWeb()
+            } catch (t: Throwable) {
+                FileLog.i("SweepVR-web", "pump error: $t")
+            }
+        }
+    }
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var webPageVersion = -1
+    private var webDiagAt = 0L
+
+    private fun pollPageVersion() {
+        val wv = webView ?: return
+        wv.evaluateJavascript("String(window.__limpetV||0)") { r ->
+            val n = r?.trim()?.toIntOrNull() ?: return@evaluateJavascript
+            if (n != webPageVersion) { webPageVersion = n; webVersion++ }
+        }
+        // The page's own scroll position and size, on the pump.
+        //
+        // pushWebState() is event-driven - page finished, or the page
+        // scrolled - so on a page nobody had scrolled yet it fired once,
+        // before the document had loaded, and never again. The thumb's size
+        // and position therefore stayed at their initial values: full-height
+        // and at the top. That is why the first page after a launch could not
+        // be grabbed, and why the thumb snapped back to the top after a drop.
+        // The comment below already warned about this exact trap for a
+        // periodic log; the state feed had the same bug.
+        pushWebState()
+
+        // Throttled scroller analysis, log only. This found the 16:10
+        // regression: the page reported a document that exactly fitted, so
+        // PgDn and the scrollbar were behaving correctly with nothing to
+        // scroll, which looked like a bug in the scroll code.
+        val t = System.currentTimeMillis()
+        if (t - webDiagAt > 3000L) {
+            webDiagAt = t
+            wv.evaluateJavascript("window.__limpet?__limpet.diag():'d'", { r ->
+                FileLog.i("SweepVR-web", "SCROLLDIAG ${r?.trim()}")
+            })
+        }
+    }
+
+    /** Capture the page for the VR screen.
+     *
+     *  PixelCopy of the window is the only reliable source: WebView.draw()
+     *  re-records the view on the CPU, and once Chromium has scrolled the
+     *  page it only re-rasters what is newly exposed — that produced the
+     *  "mostly white with a strip of text" picture. PixelCopy reads what the
+     *  window actually composited, so it is always the whole page.
+     *
+     *  Two bitmasks in rotation: the GL thread uploads on its own frame, so
+     *  the next copy must not land in the bitmap still being uploaded. */
+    private fun pumpWeb() {
+        val wv = webView ?: return
+        if (renderer.mode != VrRenderer.Mode.WEB || webCopyBusy) return
+        // No change-detection gate: capture on every tick. A copy in flight
+        // is not overwritten (webCopyBusy) and the busy flag paces us to
+        // whatever the hardware can actually sustain.
+        webLastRasterAt = android.os.SystemClock.elapsedRealtime()
+        val v = wv
+        if (v.width <= 0 || v.height <= 0) return
+
+        // PixelCopy on a Window takes WINDOW coordinates, and the page sits
+        // centred in the landscape window — so ask the view where it is.
+        val loc = IntArray(2)
+        v.getLocationInWindow(loc)
+        val ww = window.decorView.width
+        val wh = window.decorView.height
+        val x0 = loc[0].coerceIn(0, maxOf(0, ww - 1))
+        val y0 = loc[1].coerceIn(0, maxOf(0, wh - 1))
+        val x1 = (loc[0] + v.width).coerceIn(x0 + 1, maxOf(x0 + 1, ww))
+        val y1 = (loc[1] + v.height).coerceIn(y0 + 1, maxOf(y0 + 1, wh))
+        val cw = x1 - x0
+        val ch = y1 - y0
+        if (cw <= 0 || ch <= 0) return
+
+        val slot = (webCopySlot + 1) % 2
+        var bmp = webBmps[slot]
+        if (bmp == null || bmp.width != cw || bmp.height != ch) {
+            bmp?.recycle()
+            bmp = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888)
+            webBmps[slot] = bmp
+            renderer.webPageW = cw
+            renderer.webPageH = ch
+        }
+        val dest = bmp
+        val rect = android.graphics.Rect(x0, y0, x1, y1)
+        if (BuildConfig.DEBUG && !webRectLogged) {
+            webRectLogged = true
+            FileLog.i("SweepVR-web", "rect=${rect.left},${rect.top},${rect.right},${rect.bottom} " +
+                "view=${v.width}x${v.height} at ${loc[0]},${loc[1]} window=${ww}x${wh}")
+        }
+        webCopyBusy = true
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        try {
+            android.view.PixelCopy.request(window, rect, dest, { result ->
+                webCopyBusy = false
+                if (result != android.view.PixelCopy.SUCCESS) return@request
+                if (BuildConfig.DEBUG) renderer.webDebugPoint?.let { dp -> drawWebCrosshair(dest, dp) }
+                renderer.submitWebFrame(dest)
+                webCopyMs = android.os.SystemClock.elapsedRealtime() - t0
+                webCopiesDone++
+                webCopyTotalMs += webCopyMs
+                if (webCopyMs > webCopyMaxMs) webCopyMaxMs = webCopyMs
+                val nowMs = android.os.SystemClock.elapsedRealtime()
+                if (nowMs - webFpsLogAt > 2000L) {
+                    val span = ((nowMs - webFpsFromAt).coerceAtLeast(1L)) / 1000f
+                    val n = webCopiesDone - webFpsFrom
+                    FileLog.i("SweepVR-web", "TELE " +
+                        "fps=${"%.1f".format(n / span)} " +
+                        "copyMs avg=${"%.1f".format(webCopyTotalMs.toFloat() / webCopiesDone.coerceAtLeast(1))} " +
+                        "max=$webCopyMaxMs total=${webCopiesDone}")
+                    webFpsLogAt = nowMs; webFpsFrom = webCopiesDone
+                    webFpsFromAt = nowMs
+                    webCopyTotalMs = 0L; webCopyMaxMs = 0L
+                }
+            }, android.os.Handler(android.os.Looper.getMainLooper()))
+        } catch (t: Throwable) {
+            webCopyBusy = false
+            FileLog.i("SweepVR-web", "capture failed: $t")
+        }
+    }
+
+    /** TEMP DEBUG crosshair: where the gaze is sampling, burned into the
+     *  captured page so it can be compared with the reticle. */
+    private fun drawWebCrosshair(bmp: Bitmap, dp: FloatArray) {
+        try {
+            val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+            p.style = android.graphics.Paint.Style.STROKE
+            p.strokeWidth = 5f
+            p.color = android.graphics.Color.RED
+            val c = android.graphics.Canvas(bmp)
+            c.drawCircle(dp[0], dp[1], 22f, p)
+            c.drawLine(dp[0] - 34f, dp[1], dp[0] + 34f, dp[1], p)
+            c.drawLine(dp[0], dp[1] - 34f, dp[0], dp[1] + 34f, p)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun jsNum(v: Float) = String.format(java.util.Locale.US, "%.1f", v)
+
+    /** Throttled: geometry for the scrollbar thumb + the current title. */
+    /** Scroll the page one page-key, for BOTH the PgUp/PgDn buttons and the
+     *  scrollbar arrows - they are the same gesture and must behave the same.
+     *
+     *  The WebView's OWN key handling goes first. A synthetic JS
+     *  KeyboardEvent has no default action, so it can never scroll
+     *  anything; only reaches handlers the site bound itself. The hardware
+     *  PageDown key does scroll, because WebView handles the key natively
+     *  and drives the focused scroller, so that is the route to reuse.
+     *
+     *  Measured on a consent-walled page, where every JS fallback missed:
+     *  scroller() returned DIV.pageWrapper - overflow-y:visible with 70px of
+     *  rounding overflow, not a scroller at all - so setting its scrollTop
+     *  did nothing; window.scrollBy found nothing (doc 343/343); and the
+     *  wheel went to whatever sat at the viewport centre, which is not the
+     *  scroller. The hardware key scrolled it, so a real scroller exists.
+     *
+     *  The JS attempts still run afterwards, for pages the native path
+     *  ignores. */
+    private fun webPageScroll(dir: Int) {
+        val wv = webView ?: return
+        wv.evaluateJavascript("window.__limpet?__limpet.diag():'d'", { d ->
+            FileLog.i("SweepVR-web", "PAGEDIR=$dir $d")
+        })
+        val kc = if (dir > 0) KeyEvent.KEYCODE_PAGE_DOWN else KeyEvent.KEYCODE_PAGE_UP
+        val t = System.currentTimeMillis()
+        wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, kc, 0))
+        wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, kc, 0))
+        FileLog.i("SweepVR-web", "native key $kc")
+        wv.evaluateJavascript("window.__limpet?__limpet.key($dir):false", null)
+        wv.evaluateJavascript("window.__limpet?__limpet.page($dir):false", null)
+    }
+
+    private fun pushWebState() {
+        val wv = webView ?: return
+        val t = System.currentTimeMillis()
+        if (t - webStateAt < 50L) return
+        webStateAt = t
+        wv.evaluateJavascript("window.__limpet?__limpet.state():'{}'") { res ->
+            // evaluateJavascript hands back a JSON-*encoded* string, so the
+            // inner quotes arrive escaped: unwrap with a real parser (a
+            // removePrefix left \" behind and every parse silently failed,
+            // which is why the title and the scrollbar never showed).
+            val inner = try {
+                (org.json.JSONTokener(res ?: return@evaluateJavascript).nextValue() as? String)
+                    ?: return@evaluateJavascript
+            } catch (_: Exception) {
+                return@evaluateJavascript
+            }
+            if (inner.length < 2) return@evaluateJavascript
+            try {
+                val o = org.json.JSONObject(inner)
+                val sh = o.optDouble("sh", 0.0)
+                val ch = o.optDouble("ch", 1.0).coerceAtLeast(1.0)
+                val st = o.optDouble("st", 0.0)
+                renderer.webScrollable = sh > ch + 4.0
+                renderer.webViewFrac = (ch / sh).coerceIn(0.02, 1.0).toFloat()
+                // The thumb's geometry is only real once the page has said
+                // how tall it is; before that the bar must not be drawn or
+                // grabbed, or it is sized for a page that does not exist yet.
+                renderer.webBarMarkSized()
+                // Written unconditionally, even mid-drag and mid-settle.
+                //
+                // Suppressing it during the settle was what made the thumb
+                // jump: the write stopped for 130ms, so the moment the hold
+                // expired the renderer read a value that was two poll
+                // intervals stale - the PREVIOUS page position - flashed it,
+                // and then the next poll corrected it. Letting the poll run
+                // and having the RENDERER hold the dropped value instead means
+                // it is always reading a freshly written one.
+                if (!renderer.webBarDragging) {
+                    val pf = if (sh > ch) (st / (sh - ch)).coerceIn(0.0, 1.0) else 0.0
+                    renderer.webScrollFrac = pf.toFloat()
+                }
+                if (BuildConfig.DEBUG && System.currentTimeMillis() - lastStateLog > 1500L) {
+                    lastStateLog = System.currentTimeMillis()
+                    FileLog.i("SweepVR-bar", "STATE sh=$sh ch=$ch st=$st scrollable=${renderer.webScrollable}")
+                }
+                webUrl = o.optString("url", webUrl)
+                // Toolbar address field. Same poll, same value: the drawn
+                // text cannot disagree with the page the state came from.
+                renderer.webBarUrl = webUrl
+                val ti = o.optString("t", "")
+                if (ti.isNotEmpty()) webTitle = ti
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+
+    /** Gaze on the page: ask what is there, click it, scroll, open the panel. */
+    private fun handleWebEvent(e: VrRenderer.WebEvent) {
+        val wv = webView ?: return
+        when (e) {
+            is VrRenderer.WebEvent.HitTest ->
+                wv.evaluateJavascript("window.__limpet?__limpet.hit(${jsNum(e.px / webDpr)},${jsNum(e.py / webDpr)}):false") { r ->
+                            renderer.onWebHit(e.token, r?.contains("true") == true)
+                }
+            is VrRenderer.WebEvent.Click -> {
+                // A click navigates: re-arm so the next page's links work.
+                renderer.webResetDwell()
+                wv.evaluateJavascript("window.__limpet?__limpet.click(${jsNum(e.px / webDpr)},${jsNum(e.py / webDpr)}):'noshim'") { r ->
+                    FileLog.i("SweepVR-web", "click at ${e.px.toInt()},${e.py.toInt()} -> $r")
+                }
+            }
+            is VrRenderer.WebEvent.Scroll -> webPageScroll(e.dir)
+            is VrRenderer.WebEvent.GoBack -> webView?.let { if (it.canGoBack()) it.goBack() }
+            is VrRenderer.WebEvent.GoForward -> webView?.let { if (it.canGoForward()) it.goForward() }
+            is VrRenderer.WebEvent.ReloadPage -> webView?.reload()
+            is VrRenderer.WebEvent.GoHome -> {
+                val h = bookmarks.homepage()?.url ?: WEB_HOME
+                if (h.isNotEmpty()) webView?.loadUrl(h)
+            }
+            is VrRenderer.WebEvent.OpenMenu -> openWebPanel()
+            is VrRenderer.WebEvent.TextZoom -> webTextZoom(e.dir)
+            is VrRenderer.WebEvent.Nudge ->
+                webView?.evaluateJavascript(
+                    "window.__limpet?__limpet.page(${e.dir},0.15):'noshim'", null)
+            is VrRenderer.WebEvent.GlideStart -> {
+                FileLog.i("SweepVR-web", "glide start dir=${e.dir}")
+                webView?.evaluateJavascript(
+                    "window.__limpet?__limpet.smoothStart(${e.dir}):'noshim'", null)
+            }
+            is VrRenderer.WebEvent.GlideStop ->
+                webView?.evaluateJavascript(
+                    "window.__limpet?__limpet.smoothStop():'noshim'", null)
+            is VrRenderer.WebEvent.Panel -> if (e.open) openWebPanel() else closeWebPanel()
+            is VrRenderer.WebEvent.PageKey -> webPageScroll(e.dir)
+            is VrRenderer.WebEvent.ScrollTo -> {
+                // Absolute scroll from a scrollbar drag. goFrac is the only
+                // path that can land on a position; everything else here is
+                // a relative step, so the thumb would fight itself.
+                val f = e.frac
+                // Hold the thumb at the drop position while the page catches
+                // up; the state poll runs every 33ms and would otherwise snap
+                // it back to where the page was a moment ago.
+                renderer.webBarSettle(f)
+                webView?.evaluateJavascript(
+                    "window.__limpet?__limpet.goFrac(${jsNum(f)}):'noshim'") { r ->
+                    // Do NOT clear the settle window here. This callback
+                    // fires when the JS call RETURNS, which is before the
+                    // page has actually scrolled - so clearing here lifted
+                    // the protection one poll tick early, and the poll wrote
+                    // the page's previous position straight back into the
+                    // thumb. Worst on the first drag of a long page, because
+                    // the previous position is 0, i.e. the top extent.
+                    FileLog.i("SweepVR-bar", "goFrac ${"%.2f".format(f)} -> $r")
+                }
+            }
+            is VrRenderer.WebEvent.Navigate -> {
+                closeWebPanel()
+                renderer.webLockPanel() // gaze is still on the panel: keep it there
+                webView?.loadUrl(e.url)
+                FileLog.i("SweepVR-web", "flyout navigate ${e.url}")
+            }
+        }
+    }
+
+    /** Into web mode. The video keeps its position (paused) so the web panel
+     *  can hand it back. */
+    private fun enterWeb(url: String? = null) {
+        // GVR surface ON TOP: this is what keeps the WebView from compositing
+        // over the headset view. It must keep drawing for PixelCopy to copy
+        // it, so it cannot be hidden by visibility - and being on top also
+        // buries the activity-window close button, which is why the button
+        // lives in its own Dialog window (see showFloatingClose).
+        applyGvrZOrder(true)
+        showFloatingClose()
+        val wv = webView
+        if (wv == null) { toast("Web view unavailable"); return }
+        player?.pause()
+        renderer.webPanelOpen = false
+        // Put the panel where it will be drawn from the start: the gaze test
+        // aims at it, and at elevation 0 it would sit right on the page.
+        renderer.browserElevDeg = renderer.overlayElevDeg()
+        renderer.mode = VrRenderer.Mode.WEB
+        // Both bookmark flyouts (panel + toolbar) need the list from
+        // web-mode entry, not from first panel open: on a fresh process the
+        // list is empty until openWebPanel runs, which left every bookmark
+        // target dead until then. openWebPanel reloads fresh each open.
+        renderer.webBookList = bookmarks.map { b -> b.title.ifBlank { b.url } to b.url }
+        wv.onResume()
+        val want = normalizeUrl(url ?: webUrl.ifBlank {
+            bookmarks.homepage()?.url ?: WEB_HOME
+        })
+        if (want.isNotEmpty() && want != webUrl) wv.loadUrl(want)
+        // TEST BUILD ONLY: auto-open the web panel so the sweep control can
+        // be tried without taking the headset off. -ea opens the panel,
+        // -es testweb <url> also loads a specific page. Both debug-only.
+        if (BuildConfig.DEBUG) {
+            val autoUrl = intent.getStringExtra("testweb")
+            if (autoUrl != null && autoUrl.isNotBlank()) wv.loadUrl(autoUrl)
+            if (intent.getBooleanExtra("ea", false)) mainHandler.postDelayed({
+                openWebPanel()
+                FileLog.i("SweepVR-web", "test: panel opened")
+            }, 3000L)
+            // -ez ep pins the panel open regardless of gaze, for inspecting
+            // it with the phone flat on a desk. Separate from -ez ea because
+            // a pinned panel never closes, which changes the behaviour under
+            // test. The launcher no longer passes it.
+            if (intent.getBooleanExtra("ep", false)) {
+                mainHandler.postDelayed({ renderer.webPanelPin(true) }, 3000L)
+            }
+        }
+        FileLog.i("SweepVR-web", "enterWeb url=$want have=${player != null}")
+        if (BuildConfig.DEBUG) renderer.webDbgOn = true // TEMP DEBUG: gaze crosshair
+    }
+
+    /** Back to video, resuming whatever was playing. With no video there is
+     *  nothing to go back to, so the file browser takes over. */
+    private fun webHideFullView() {
+        val v = webFullView ?: return
+        webFullView = null
+        (v.parent as? android.view.ViewGroup)?.removeView(v)
+        webFullCallback?.onCustomViewHidden()
+        webFullCallback = null
+    }
+
+    /** The close button as a SEPARATE window.
+     *
+     *  In the activity window it is an ordinary view, so it sits UNDER a
+     *  z-order-on-top SurfaceView (the GVR view). Putting the GVR surface on
+     *  top is what lets it hide the WebView - and the WebView has to keep
+     *  drawing, or PixelCopy captures nothing and the headset goes black.
+     *  Making the view INVISIBLE does not help either: it leaves the display
+     *  list, so there is nothing to copy. A Dialog is its own window, ranked
+     *  above the activity window and so above the SurfaceView too, which
+     *  leaves both the page capture and a reachable button. */
+    private var closeDialog: android.app.Dialog? = null
+
+    private fun showFloatingClose() {
+        if (closeDialog != null) return
+        val d = android.app.Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
+        d.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        val tv = android.widget.TextView(this).apply {
+            text = "\u2715"
+            textSize = 16f
+            setTextColor(android.graphics.Color.WHITE)
+            gravity = android.view.Gravity.CENTER
+            setBackgroundResource(R.drawable.close_button_bg)
+        }
+        d.setContentView(tv)
+        d.window?.apply {
+            setBackgroundDrawable(null)
+            setLayout(dp(46), dp(46))
+            setGravity(android.view.Gravity.TOP or android.view.Gravity.START)
+            setFlags(
+                android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            )
+        }
+        tv.setOnClickListener { finish() }
+        d.show()
+        closeDialog = d
+    }
+
+    private fun hideFloatingClose() {
+        closeDialog?.dismiss()
+        closeDialog = null
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun exitWeb() {
+        applyGvrZOrder(false)
+        hideFloatingClose()
+        renderer.webPanelOpen = false
+        settingsFromVideo = false
+        if (player != null) {
+            renderer.mode = VrRenderer.Mode.VIDEO
+            player?.play()
+        } else {
+            loc = Loc.Root
+            renderer.mode = VrRenderer.Mode.BROWSER
+            refresh()
+        }
+        webView?.onPause()
+    }
+
+    private fun openWebPanel() {
+        bookmarks = BookmarkStore(this).load()
+        val r = mutableListOf<Row>()
+        r += Row(
+            "▶ Video",
+            if (player != null) "Resume playback" else "No video playing",
+            VrRenderer.BrowserRow.ACTION, action = "webvideo"
+        )
+        r += Row("Size +", "${"%.2f".format(settings.screenSize)}×", VrRenderer.BrowserRow.ACTION, action = "webzoom+")
+        r += Row("Size -", "${"%.2f".format(settings.screenSize)}×", VrRenderer.BrowserRow.ACTION, action = "webzoom-")
+        // Debug gaze crosshair. Toggleable: it is burned into the page
+        // bitmap, so it sits on the page surface and can be mistaken for a
+        // convergence problem (or cause one) while judging depth.
+        r += Row(
+            "Gaze crosshair",
+            if (renderer.webDbgOn) "On" else "Off",
+            VrRenderer.BrowserRow.ACTION, action = "webxhair"
+        )
+        // Bookmarks live in the top-right icon, not in a row: a dead row for
+        // it cost a full row height plus the 108px icon hanging below, for
+        // nothing. webBookIconRow is only a present-flag now (the icon's
+        // position is fixed in the renderer); its value is the last live
+        // row, which nothing indexes into.
+        pushRows(webTitle.ifBlank { "Web" }, "", r)
+        renderer.webBookList = bookmarks.map { b -> b.title.ifBlank { b.url } to b.url }
+        renderer.webBookIconRow = r.size - 1
+        renderer.webSideBtns = true
+        renderer.browserElevDeg = renderer.overlayElevDeg()
+        renderer.webPanelOpen = true
+    }
+
+    private fun closeWebPanel() {
+        renderer.webPanelOpen = false
+    }
+
+    /** Zoom the page by changing the screen size.
+     *
+     *  The capture is 16:9 and the screen is built 16:9 for it, so the
+     *  texture always covers the surface and there is nothing to crop: the
+     *  screen's extent IS the magnification. A larger screen shows the same
+     *  whole page, bigger, which is what zooming in should mean here.
+     *
+     *  This used to write settings.videoZoom - the shared 2D video zoom - so
+     *  the web panel silently changed the video's crop. Video keeps its own
+     *  crop-zoom, which is right for a frame. */
+    private fun webZoom(dir: Int) {
+        val f = if (dir > 0) 1.25f else 0.8f
+        settings.screenSize = (settings.screenSize * f).coerceIn(0.5f, 10f)
+        applyOptics()
+    }
+
+    /** Browser text zoom step, applied live: setTextZoom re-lays the page
+     *  out with no reload. Clamped to the setting's 50..200 range. */
+    private fun webTextZoom(dir: Int) {
+        settings.textZoom = (settings.textZoom + dir * 10).coerceIn(50, 200)
+        webView?.settings?.textZoom = settings.textZoom
+        FileLog.i("SweepVR-web", "textZoom=${settings.textZoom}")
+    }
+
+    private fun activateRow(idx: Int, frac: Float? = null) {
+        if (renderer.mode == VrRenderer.Mode.WEB) {
+            // X closes the panel (never the web mode itself).
+            if (idx == -10) { closeWebPanel(); return }
+            val a = rows.getOrNull(idx)?.action ?: return
+            when {
+                a == "webvideo" -> if (player != null) { closeWebPanel(); exitWeb() } else toast("No video playing")
+                a == "webzoom+" -> webZoom(+1)
+                a == "webzoom-" -> webZoom(-1)
+                a == "webxhair" -> {
+                    renderer.webDbgOn = !renderer.webDbgOn
+                    // Reopen so the row's On/Off label updates in place.
+                    openWebPanel()
+                    toast(if (renderer.webDbgOn) "Crosshair on" else "Crosshair off")
+                }
+                a.startsWith("weburl:") -> {
+                    closeWebPanel()
+                    renderer.webLockPanel() // gaze is still on the panel: keep it there
+                    val wv = webView
+                    if (wv != null) wv.loadUrl(a.removePrefix("weburl:"))
+                }
+            }
+            return
+        }
+        if (idx == -10) { if (renderer.mode == VrRenderer.Mode.BROWSER) closeOverlay(); return }
+        if (idx !in rows.indices || renderer.mode != VrRenderer.Mode.BROWSER) return
+        // Debug page: frozen except X, so staring at numbers is safe.
+        if (loc == Loc.Sensors) {
+            if (rows[idx].action == "up:") handleAction("up:")
+            return
+        }
+        val row = rows[idx]
+        // SAF (SD card) entries: folders navigate, videos play direct.
+        row.saf?.let { e ->
+            if (loc is Loc.Saf) {
+                val l = loc as Loc.Saf
+                if (e.isDir) {
+                    val child = if (l.relPath.isEmpty()) e.name else "${l.relPath}/${e.name}"
+                    loc = Loc.Saf(l.treeUri, child, l.label)
+                    refresh()
+                } else if (SafFiles.isVideo(e)) playSafFile(e.uri.toString(), e.name, l.treeUri, l.relPath)
+                else toast("Not a playable video")
+            }
+            return
+        }
+        // segmented button row: horizontal gaze fraction picks the segment
+        if (row.segActions.isNotEmpty()) {
+            if (frac == null) return // DPAD tap carries no position; gaze only
+            // frac spans the full panel; buttons span x 20..1004 of TEX 1024
+            val fx = ((frac * 1024f - 20f) / 984f).coerceIn(0f, 0.999f)
+            val seg = (fx * row.segActions.size).toInt().coerceIn(0, row.segActions.size - 1)
+            FileLog.i("SweepVR-browser", "seg fire: row=${row.label} seg=$seg action=${row.segActions[seg]}")
+            handleAction(row.segActions[seg]); return
+        }
+        // gaze slider: one dwell at fraction u sets the value directly
+        if (row.slideKey != null && frac != null) {
+            handleSlide(row.slideKey, frac)
+            return
+        }
+        val act = row.action
+        if (act != null) { handleAction(act); return }
+        when (val l = loc) {
+            is Loc.Smb -> row.smb?.let { e ->
+                if (e.isDir) { loc = Loc.Smb(l.connId, e.path); refresh() }
+                else if (e.isVideo()) playSmbFile(e, l.connId)
+                else toast("Not a playable video")
+            }
+            is Loc.Local -> row.local?.let { f ->
+                if (f.isDirectory) { loc = Loc.Local(f); refresh() }
+                else playLocalFile(f)
+            }
+            else -> {}
+        }
+    }
+
+    /** Gaze-slider set: fraction across the row maps to the key's range,
+     *  snapped to its grid. One dwell reaches any value. */
+    private fun handleSlide(key: String, frac: Float) {
+        val f = frac.coerceIn(0f, 1f)
+        FileLog.i("SweepVR-browser", "slide key=$key frac=$f")
+        when (key) {
+            "fov" -> settings.fovScale = ((0.5f + f * 1f) * 20f).roundToInt() / 20f
+            "screensize" -> settings.screenSize = ((0.5f + f * 9.5f) * 4f).roundToInt() / 4f
+            "curve" -> settings.screenCurve = ((f * 20f).roundToInt() / 20f).coerceIn(0f, 1f)
+            "zoom" -> settings.videoZoom = ((0.1f + f * 19.9f) * 20f).roundToInt() / 20f
+            "ipd" -> settings.ipdMm = (40f + f * 40f).roundToInt().toFloat().coerceIn(40f, 80f)
+            "convtrim" -> settings.convTrim = (((f * 0.3f - 0.15f) / 0.005f).roundToInt() * 0.005f).coerceIn(-0.15f, 0.15f)
+            "panel" -> settings.panelDistM = ((1.2f + f * 3.8f) * 10f).roundToInt() / 10f
+            "lensK1" -> settings.lensK1 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
+            "lensK2" -> settings.lensK2 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
+            "fishR" -> settings.fisheyeRadius = ((0.5f + f * 1f) * 100f).roundToInt() / 100f
+            "lensStrength" -> settings.lensStrength = ((f * 3f * 20f).roundToInt() / 20f).coerceIn(0f, 3f)
+
+            "dwell" -> settings.dwellMs = ((400f + f * 3600f) / 100f).roundToInt() * 100L
+            else -> {
+                // per-shape weight sliders: slideKey "shapeWeight-<slug>"
+                if (key.startsWith("shapeWeight-")) {
+                    val id = key.removePrefix("shapeWeight-")
+                    if (shapingShapes.any { it.id == id })
+                        settings.setShapeWeight(id, (f * 100f).roundToInt().toFloat().coerceIn(0f, 100f))
+                }
+            }
+        }
+        applyOptics(); refresh()
+    }
+
+    private fun handleAction(act: String) {
+        when {
+            act == "home:" -> { loc = Loc.Root; refresh() }
+            act == "up:" -> {
+                loc = when (val l = loc) {
+                    is Loc.Smb -> if (l.path.isEmpty()) Loc.Root else Loc.Smb(l.connId, l.path.substringBeforeLast('\\', ""))
+                    is Loc.Local -> {
+                        val isRoot = LocalFiles.volumeRoots(this).any { it.dir == l.dir }
+                        if (isRoot || l.dir.parentFile == null) Loc.Root else Loc.Local(l.dir.parentFile!!)
+                    }
+                    is Loc.Saf -> if (l.relPath.isEmpty()) Loc.Root
+                        else Loc.Saf(l.treeUri, l.relPath.substringBeforeLast('/', ""), l.label)
+                    else -> Loc.Root
+                }
+                refresh()
+            }
+            act == "settings:" -> { settingsFromVideo = false; loc = Loc.SettingsPage; refresh() }
+            act == "shaping:" -> { settingsFromVideo = false; loc = Loc.ShapingPage; refresh() }
+            act == "shapingback:" -> {
+                if (settingsFromVideo && player != null) {
+                    settingsFromVideo = false
+                    renderer.mode = VrRenderer.Mode.VIDEO
+                } else {
+                    settingsFromVideo = false
+                    loc = Loc.Root
+                    refresh()
+                }
+            }
+            act.startsWith("toggleshape:") -> {
+                val id = act.removePrefix("toggleshape:")
+                if (shapingShapes.any { it.id == id }) {
+                    settings.setShapeEnabled(id, !settings.shapeEnabled(id))
+                    applyOptics(); refresh()
+                }
+            }
+            act == "settingsback:" -> {
+                // Back out of settings: resume the video if we came from it,
+                // otherwise behave like going up to the server list.
+                if (settingsFromVideo && player != null) {
+                    settingsFromVideo = false
+                    renderer.mode = VrRenderer.Mode.VIDEO
+                } else {
+                    settingsFromVideo = false
+                    loc = Loc.Root
+                    refresh()
+                }
+            }
+            act.startsWith("setstereo2:") -> {
+                val s = runCatching { Stereo.valueOf(act.removePrefix("setstereo2:")) }.getOrDefault(Stereo.SBS)
+                settings.stereo = s; renderer.stereo = s; refresh()
+            }
+            act.startsWith("setscreen:") -> {
+                val p = runCatching { Projection.valueOf(act.removePrefix("setscreen:")) }.getOrDefault(Projection.DEG180)
+                settings.screenProj = p; settings.projection = p; renderer.projection = p; syncGvr(); refresh()
+            }
+            act.startsWith("safroot:") -> {
+                val uuid = act.removePrefix("safroot:").ifEmpty { null }
+                val tree = SafFiles.grantedTree(this, uuid)
+                if (tree != null) {
+                    val label = SafFiles.removableVolumes(this).find { it.uuid == uuid }?.desc ?: "SD card"
+                    loc = Loc.Saf(tree, "", label); refresh()
+                } else {
+                    pendingSafVolume = uuid
+                    try { safPicker.launch(null) }
+                    catch (_: Exception) {
+                        Toast.makeText(this, "No folder picker available", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            act.startsWith("setlens:") -> {
+                if (act.removePrefix("setlens:") == "fisheye") {
+                    settings.projection = Projection.FISHEYE; renderer.projection = Projection.FISHEYE
+                } else {
+                    settings.projection = settings.screenProj; renderer.projection = settings.screenProj
+                }
+                syncGvr()
+                refresh()
+            }
+            act == "sensors:" -> { loc = Loc.Sensors; yawBaseG = null; yawBaseR = null; yawBaseC = null; turnBaseG = null; turnBaseR = null; resetPeaks(); refresh() }
+            act.startsWith("smb:") -> { loc = Loc.Smb(act.removePrefix("smb:"), ""); refresh() }
+            act.startsWith("local:") -> {
+                if (LocalFiles.needsPermission(this)) {
+                    toast("Allow videos permission in the 2D app first", long = true)
+                } else {
+                    val d = File(act.removePrefix("local:"))
+                    if (d.path.isEmpty()) loc = Loc.Local(LocalFiles.externalRoot())
+                    else if (LocalFiles.sdBlocked(this, d)) {
+                        toast("Allow all-files access in the 2D app first", long = true)
+                    } else loc = Loc.Local(d)
+                }
+                refresh()
+            }
+            act.startsWith("grantfull:") -> {
+                // drops to the system Settings toggle; onResume re-checks
+                LocalFiles.requestFullAccess(this)
+                refresh()
+            }
+            act == "set:proj" -> { cycleProjection(); refresh() }
+            act == "set:stereo" -> {
+                renderer.stereo = when (renderer.stereo) { Stereo.MONO -> Stereo.SBS; Stereo.SBS -> Stereo.TB; Stereo.TB -> Stereo.MONO }
+                settings.stereo = renderer.stereo; refresh()
+            }
+            act == "set:swap" -> { settings.swapEyes = !settings.swapEyes; applyOptics(); refresh() }
+            act == "set:pin" -> { settings.pinVideo = !settings.pinVideo; applyOptics(); refresh() }
+            act == "set:fishmirror" -> { settings.fisheyeMirrorR = !settings.fisheyeMirrorR; applyOptics(); refresh() }
+            act == "set:tooltip" -> { settings.enableTooltip = !settings.enableTooltip; applyOptics(); refresh() }
+            act == "set:distort" -> { settings.disableDist = !settings.disableDist; applyOptics(); refresh() }
+            act.startsWith("setpano:") -> {
+                settings.panoQuality = if (act.removePrefix("setpano:") == "vertexhq") "vertexhq" else "vertex"
+                applyOptics(); refresh()
+            }
+            act == "set:defaults" -> {
+                settings.fireBaseline(System.currentTimeMillis())
+                applyOptics(); refresh()
+                renderer.showToast("Defaults loaded", 2000L)
+            }
+            act.startsWith("adj:") -> {
+                val parts = act.split(":")
+                val key = parts[1]; val dir = if (parts[2] == "+") 1 else -1
+                when (key) {
+                    "fov" -> settings.fovScale = (settings.fovScale + dir * 0.05f).coerceIn(0.5f, 1.5f)
+                    "screensize" -> settings.screenSize = (settings.screenSize + dir * 0.25f).coerceIn(0.5f, 10f)
+                    "curve" -> settings.screenCurve = (settings.screenCurve + dir * 0.05f).coerceIn(0f, 1f)
+                    "ipd" -> settings.ipdMm = (settings.ipdMm + dir * 1f).coerceIn(40f, 80f)
+                    "zoom" -> settings.videoZoom = (settings.videoZoom * if (dir > 0) 1.25f else 0.8f).coerceIn(0.1f, 20f)
+                    "convtrim" -> settings.convTrim = (settings.convTrim + dir * 0.005f).coerceIn(-0.15f, 0.15f)
+
+                    "panel" -> settings.panelDistM = (settings.panelDistM + dir * 0.2f).coerceIn(1.2f, 5f)
+                    "lensK1" -> settings.lensK1 = (settings.lensK1 + dir * 0.02f).coerceIn(0f, 1f)
+                    "lensK2" -> settings.lensK2 = (settings.lensK2 + dir * 0.02f).coerceIn(0f, 1f)
+                    "fishR" -> settings.fisheyeRadius = (settings.fisheyeRadius + dir * 0.01f).coerceIn(0.5f, 1.5f)
+                    "lensStrength" -> settings.lensStrength = (settings.lensStrength + dir * 0.1f).coerceIn(0f, 3f)
+                    "dwell" -> settings.dwellMs = (settings.dwellMs + dir * 250).coerceIn(400L, 4000L)
+                    else -> {
+                        if (key.startsWith("shapeWeight-")) {
+                            val id = key.removePrefix("shapeWeight-")
+                            if (shapingShapes.any { it.id == id })
+                                settings.setShapeWeight(id, (settings.shapeWeight(id) + dir * 5f).coerceIn(0f, 100f))
+                        }
+                    }
+                }
+                applyOptics(); refresh()
+            }
+        }
+    }
+
+    // ---------------- playback ----------------
+    private fun playSmbFile(e: SmbEntry, connId: String, recenter: Boolean = true) {
+        txtStatus.text = "Opening ${e.name}… (streaming, no download)"
+        Log.i(TAG, "open smb: ${e.path}")
+        // Remember the folder: re-entering VR (or the 2D app) must land
+        // back in the directory the video was started from, not top level.
+        SessionMemory.lastConnectionId = "smb:$connId"
+        SessionMemory.lastPath = e.path.substringBeforeLast('\\', "")
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val probe = SmbHolder.manager.openRead(e.path)
+                val size = probe.size
+                probe.close()
+                Log.i(TAG, "smb probed, size=$size")
+                val url = StreamProxy.register(
+                    opener = { kotlinx.coroutines.runBlocking { SmbHolder.manager.openRead(e.path) } },
+                    size = size,
+                    displayName = e.name
+                )
+                if (playIsProxy) playUrl?.let { StreamProxy.unregisterByUrl(it) }
+                playIsProxy = true; playUrl = url
+                withContext(Dispatchers.Main) { captureQueueSmb(e, connId); startPlayback(url, e.name, recenter) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "smb open failed", t)
+                withContext(Dispatchers.Main) {
+                    txtStatus.text = "Open failed: ${t.message}"
+                    toast("Open failed: ${t.message}", long = true)
+                }
+            }
+        }
+    }
+
+    private fun playLocalFile(f: File, recenter: Boolean = true) {
+        if (playIsProxy) playUrl?.let { StreamProxy.unregisterByUrl(it) }
+        playIsProxy = false
+        playUrl = Uri.fromFile(f).toString()
+        SessionMemory.lastConnectionId = "local:${f.parentFile?.absolutePath ?: ""}"
+        SessionMemory.lastPath = ""
+        captureQueue(f)
+        startPlayback(playUrl!!, f.name, recenter)
+    }
+
+    /** SD-card video via SAF document Uri (ExoPlayer plays it directly). */
+    private fun playSafFile(uri: String, name: String, treeUri: String, relPath: String, recenter: Boolean = true) {
+        if (playIsProxy) playUrl?.let { StreamProxy.unregisterByUrl(it) }
+        playIsProxy = false
+        playUrl = uri
+        SessionMemory.lastConnectionId = "saf:$treeUri"
+        SessionMemory.lastPath = relPath
+        captureQueueSaf(uri, treeUri, relPath)
+        startPlayback(playUrl!!, name, recenter)
+    }
+
+    private fun captureQueueSaf(currentUri: String, treeUri: String, relPath: String) {
+        val vids = rows.mapNotNull { r ->
+            val e = r.saf
+            if (r.kind == VrRenderer.BrowserRow.VIDEO && e != null && !e.isDir)
+                PlayItem.Saf(e.uri.toString(), e.name, treeUri, relPath) else null
+        }
+        if (vids.isNotEmpty()) {
+            playQueue = vids
+            playIndex = vids.indexOfFirst { it.uri == currentUri }
+        } else {
+            playIndex = playQueue.indexOfFirst { (it as? PlayItem.Saf)?.uri == currentUri }
+        }
+    }
+
+    // ---------------- play menu ----------------
+    /** Sibling videos of the playing file, for prev/next. Captured at play
+     *  time from the folder listing (queue = folder as it was opened). */
+    private sealed class PlayItem {
+        data class Smb(val e: SmbEntry, val connId: String) : PlayItem()
+        data class Local(val f: File) : PlayItem()
+        data class Saf(val uri: String, val name: String, val treeUri: String, val relPath: String) : PlayItem()
+    }
+    private var playQueue: List<PlayItem> = emptyList()
+    private var playIndex = -1
+
+    private fun captureQueue(local: File) {
+        val sibs = local.parentFile?.listFiles()
+            ?.filter { it.isFile && LocalFiles.isVideoFile(it) }
+            ?.sortedBy { it.name.lowercase() } ?: emptyList()
+        if (sibs.isNotEmpty()) {
+            playQueue = sibs.map { PlayItem.Local(it) }
+            playIndex = sibs.indexOfFirst { it.absolutePath == local.absolutePath }
+        } else {
+            // No listable dir (stepped from a 2D-started queue): keep the
+            // existing queue, relocate the new index inside it.
+            playIndex = playQueue.indexOfFirst {
+                (it as? PlayItem.Local)?.f?.absolutePath == local.absolutePath
+            }
+        }
+    }
+
+    private fun captureQueueSmb(current: SmbEntry, connId: String) {
+        val vids = rows.mapNotNull { r ->
+            val e = r.smb
+            if (r.kind == VrRenderer.BrowserRow.VIDEO && e != null && !e.isDir) PlayItem.Smb(e, connId) else null
+        }
+        if (vids.isNotEmpty()) {
+            playQueue = vids
+            playIndex = vids.indexOfFirst { it.e.path == current.path }
+        } else {
+            // Browser holds no listing (2D-started playback, or stepped
+            // mid-video): keep the queue, relocate the new index inside it.
+            playIndex = playQueue.indexOfFirst {
+                (it as? PlayItem.Smb)?.e?.path == current.path
+            }
+        }
+    }
+
+    /** The step ramp for zoom+/−: s(z) = 0.12·z + 0.6 — 0.61 at the zoom
+     *  minimum (0.1) up to 3.0 at the maximum (20), one smooth function
+     *  across the whole range (the old ×1.5 was +0.05 at the bottom and
+     *  +5 … +27 at the top). */
+    private val zoomSlope = 0.12f
+    /** s(z) = zoomSlope·(z + zoomOff): the offset that puts the ramp's
+     *  fixed point at −zoomOff (0.6/0.12 = 5.0). */
+    private val zoomOff = 0.6f / zoomSlope
+    /** e^zoomSlope — one press = one unit of the flow dz/dt = s(z). */
+    private val zoomK = Math.exp(zoomSlope.toDouble()).toFloat()
+
+    /** Zoom+/− on the play panel (menu 8/9). A press moves z by one unit
+     *  of that flow, in closed form z ← (z + zoomOff)·e^{±zoomSlope} −
+     *  zoomOff, so the rate at every point is exactly s(z) AND the two
+     *  directions are algebraic inverses: up then down returns to the same
+     *  value, where plain Euler (z ± s(z)) drifts ~0.05 per pair. No flash
+     *  on a change — the picture is the feedback; only the ends flash,
+     *  where nothing would move. */
+    private fun zoomStep(dir: Int) {
+        val z = settings.videoZoom
+        val t = if (dir > 0) (z + zoomOff) * zoomK - zoomOff
+                else (z + zoomOff) / zoomK - zoomOff
+        val target = t.coerceIn(0.1f, 20f)
+        if (Math.abs(target - z) < 1e-4f) {
+            renderer.flashMenu(if (dir > 0) "Zoom max" else "Zoom min")
+            return
+        }
+        settings.videoZoom = target
+        applyOptics()
+    }
+
+    private fun handleMenuEvent(e: VrRenderer.MenuEvent) {
+        val p = player ?: return
+        when (e) {
+            is VrRenderer.MenuEvent.Press -> when (e.idx) {
+                0 -> {
+                    // 3D settings page over the video (player keeps running,
+                    // so zoom/FOV/type changes preview live on return).
+                    // No recenter: opening must not move the world.
+                    settingsFromVideo = true
+                    loc = Loc.SettingsPage
+                    renderer.mode = VrRenderer.Mode.BROWSER
+                    refresh()
+                }
+                1 -> {
+                    // 3D shaping page over the video (same resume behaviour).
+                    settingsFromVideo = true
+                    loc = Loc.ShapingPage
+                    renderer.mode = VrRenderer.Mode.BROWSER
+                    refresh()
+                }
+                2 -> enterBrowser() // 3D file browser, opens the playing file's folder
+                18 -> enterWeb() // web browser; the video keeps its place
+                3 -> stepQueue(-1)
+                4 -> p.seekTo((p.currentPosition - settings.skipSecs * 1000).coerceAtLeast(0))
+                5 -> p.playWhenReady = !p.playWhenReady
+                6 -> {
+                    val d = p.duration.coerceAtLeast(0)
+                    p.seekTo((p.currentPosition + settings.skipSecs * 1000).coerceAtMost(d))
+                }
+                7 -> stepQueue(1)
+                8 -> zoomStep(+1)
+                9 -> zoomStep(-1)
+                10 -> audioManager().adjustStreamVolume(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    android.media.AudioManager.ADJUST_RAISE,
+                    android.media.AudioManager.FLAG_SHOW_UI)
+                11 -> audioManager().adjustStreamVolume(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    android.media.AudioManager.ADJUST_LOWER,
+                    android.media.AudioManager.FLAG_SHOW_UI)
+                12 -> {
+                    // ⇅ flip: sweep the menu top<->bottom, then auto-hide as
+                    // the gaze leaves the activation zone (existing close band).
+                    renderer.menuToggleSide()
+                    settings.menuTop = renderer.menuSideUp
+                }
+                13 -> renderer.requestAim() // menu closes, blue aim arms
+                14 -> { // FOV scale -0.05 (panoramas narrow their frustum)
+                    settings.fovScale = (settings.fovScale - 0.05f).coerceIn(0.5f, 1.5f)
+                    applyOptics()
+                }
+                15 -> { // FOV scale +0.05
+                    settings.fovScale = (settings.fovScale + 0.05f).coerceIn(0.5f, 1.5f)
+                    applyOptics()
+                }
+            }
+            is VrRenderer.MenuEvent.Seek -> {
+                val d = p.duration.coerceAtLeast(0)
+                if (d > 0) {
+                    // optimistic position: bar jumps before the seek lands
+                    val target = (e.frac.coerceIn(0f, 1f) * d).toLong()
+                    renderer.menuPosMs = target
+                    p.seekTo(target)
+                }
+            }
+        }
+    }
+
+    private fun audioManager(): android.media.AudioManager =
+        getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+
+    private fun stepQueue(dir: Int) {
+        if (playQueue.isEmpty() || playIndex < 0) {
+            renderer.flashMenu("No folder queue")
+            return
+        }
+        // Wraps around the ends: next on the last file plays the first,
+        // prev on the first plays the last (floorMod for the -1 side).
+        val n = Math.floorMod(playIndex + dir, playQueue.size)
+        if (n == playIndex) {
+            renderer.flashMenu("Only one video")
+            return
+        }
+        playIndex = n
+        when (val it = playQueue[n]) {
+            is PlayItem.Smb -> playSmbFile(it.e, it.connId, recenter = false)
+            is PlayItem.Local -> playLocalFile(it.f, recenter = false)
+            is PlayItem.Saf -> playSafFile(it.uri, it.name, it.treeUri, it.relPath, recenter = false)
+        }
+    }
+
+    private var playerSwDecode: Boolean? = null
+    private fun startPlayback(url: String, name: String, recenter: Boolean = true) {
+        renderer.mode = VrRenderer.Mode.VIDEO
+        renderer.menuTitle = name
+        // Queue steps keep the current center; fresh plays center on the gaze.
+        if (recenter) renderer.resetBasis("video")
+        // Decoder preference is baked at player build time; rebuild if the
+        // user flipped it since (applies to videos opened after changing).
+        if (player == null || playerSwDecode != settings.softwareDecode) {
+            try { player?.release() } catch (_: Exception) {}
+            player = null
+            playerSwDecode = settings.softwareDecode
+            attachedSurfaceGen = -1 // force surface attach for the new player
+        }
+        if (player == null) {
+            // Buffering sized for the 256MB Java heap: the old 300MB/180s
+            // target could retain more samples than the heap holds (8K
+            // HEVC fills it in seconds on fast storage) and OOM-killed
+            // playback — a consistent crash other players don't have.
+            // 60s covers SMB jitter; the 90MB byte backstop keeps total
+            // retention inside the heap with headroom. Time thresholds
+            // still take priority so audio-front-loaded files can't
+            // strand the video track.
+            val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
+                .setBufferDurationsMs(15_000, 60_000, 2_500, 5_000)
+                .setTargetBufferBytes(90 * 1024 * 1024)
+                .setPrioritizeTimeOverSizeThresholds(true)
+                .build()
+            val preferSw = settings.softwareDecode
+            val renderers = androidx.media3.exoplayer.DefaultRenderersFactory(this)
+                .setMediaCodecSelector(
+                    androidx.media3.exoplayer.mediacodec.MediaCodecSelector { mimeType, requiresSecure, requiresTunnel ->
+                        val all = androidx.media3.exoplayer.mediacodec.MediaCodecSelector.DEFAULT
+                            .getDecoderInfos(mimeType, requiresSecure, requiresTunnel)
+                        val sorted = if (preferSw) {
+                            all.sortedBy { info ->
+                                val n = info.name
+                                if (n.startsWith("OMX.google.") || n.startsWith("c2.android.")) 0 else 1
+                            }
+                        } else all
+                        FileLog.i(TAG, "decoder pick: ${sorted.firstOrNull()?.name} for $mimeType (sw=$preferSw)")
+                        sorted
+                    })
+            player = ExoPlayer.Builder(this, renderers)
+                .setLoadControl(loadControl)
+                .build().also { exo ->
+                exo.playWhenReady = true
+                // Engine-verbose internals to logcat (pull with logcat -d):
+                // decoder init/release, formats, rendered/dropped counters.
+                exo.addAnalyticsListener(androidx.media3.exoplayer.util.EventLogger())
+                exo.addListener(object : Player.Listener {
+                    override fun onPlayerError(error: PlaybackException) {
+                        FileLog.e(TAG, "player error: ${error.message}", error)
+                        txtStatus.text = "Playback error: ${error.errorCodeName} — ${error.message?.take(120)}"
+                        toast("Playback error: ${error.message}", long = true)
+                    }
+                    override fun onTracksChanged(tracks: Tracks) {
+                        // Codec/resolution/bitrate once known — rules out
+                        // decoder-limit issues (e.g. exotic codec, 8K, AV1).
+                        val sb = StringBuilder("tracks")
+                        for (g in tracks.groups) {
+                            if (!g.isSelected) continue
+                            val f = g.getTrackFormat(0)
+                            sb.append(" [${f.sampleMimeType} ${f.width}x${f.height}" +
+                                " br=${f.bitrate} codecs=${f.codecs}]")
+                            // Size the decoder output buffers to the video:
+                            // without this the SurfaceTexture can run small
+                            // buffers and the picture upscales from mush.
+                            if ((f.sampleMimeType ?: "").startsWith("video/") &&
+                                f.width > 0 && f.height > 0
+                            ) {
+                                try {
+                                    renderer.surfaceTexture?.setDefaultBufferSize(f.width, f.height)
+                                    FileLog.i(TAG, "video buffer size ${f.width}x${f.height}")
+                                } catch (t: Throwable) {
+                                    FileLog.w(TAG, "buffer size failed: ${t.message}")
+                                }
+                            }
+                        }
+                        Log.i(TAG, sb.toString())
+                        FileLog.i(TAG, sb.toString())
+                    }
+                })
+                exo.addAnalyticsListener(object : AnalyticsListener {
+                    override fun onLoadError(
+                        eventTime: AnalyticsListener.EventTime,
+                        loadEventInfo: LoadEventInfo,
+                        mediaLoadData: MediaLoadData,
+                        error: IOException,
+                        wasCanceled: Boolean
+                    ) {
+                        // HTTP-level failures (404/416/timeouts/resets) surface here,
+                        // NOT in onPlayerError — this is the money log for freezes.
+                        FileLog.w(TAG, "loadError uri=${loadEventInfo.uri} " +
+                            "bytes=${loadEventInfo.bytesLoaded} " +
+                            "loadMs=${loadEventInfo.loadDurationMs} " +
+                            "canceled=$wasCanceled err=${error.message}")
+                    }
+                    override fun onDroppedVideoFrames(
+                        eventTime: AnalyticsListener.EventTime,
+                        droppedFrames: Int,
+                        elapsedMs: Long
+                    ) {
+                        // Climbing drops with a healthy buffer = the decoder is
+                        // fine but frames never reach eyes (render-side stall).
+                        FileLog.w(TAG, "droppedVideoFrames=$droppedFrames elapsedMs=$elapsedMs")
+                    }
+                    override fun onVideoFrameProcessingOffset(
+                        eventTime: AnalyticsListener.EventTime,
+                        totalProcessingOffsetUs: Long,
+                        frameCount: Int
+                    ) {
+                        // Heartbeat: fires per batch of frames the decoder
+                        // delivers to the video renderer. Timestamp it always;
+                        // the watchdog reports offsetAge (growing = decoder
+                        // stopped feeding, the freeze signature).
+                        lastFrameBatchMs = System.currentTimeMillis()
+                        // Growing offset = renderer falling behind wall clock.
+                        if (frameCount > 0 && totalProcessingOffsetUs > 500_000L * frameCount) {
+                            FileLog.w(TAG, "frameProcessingOffset avg=" +
+                                "${totalProcessingOffsetUs / frameCount}us over $frameCount frames")
+                        }
+                    }
+                    override fun onRenderedFirstFrame(
+                        eventTime: AnalyticsListener.EventTime,
+                        output: Any,
+                        renderTimeMs: Long
+                    ) {
+                        FileLog.i(TAG, "renderedFirstFrame")
+                        lastFrameBatchMs = System.currentTimeMillis()
+                    }
+                    override fun onVideoSizeChanged(
+                        eventTime: AnalyticsListener.EventTime,
+                        videoSize: androidx.media3.common.VideoSize
+                    ) {
+                        FileLog.i(TAG, "videoSize ${videoSize.width}x${videoSize.height}")
+                    }
+                    override fun onVideoEnabled(
+                        eventTime: AnalyticsListener.EventTime,
+                        decoderCounters: androidx.media3.exoplayer.DecoderCounters
+                    ) {
+                        FileLog.i(TAG, "videoEnabled")
+                    }
+                    override fun onVideoDisabled(
+                        eventTime: AnalyticsListener.EventTime,
+                        decoderCounters: androidx.media3.exoplayer.DecoderCounters
+                    ) {
+                        FileLog.w(TAG, "videoDisabled rendered=${decoderCounters.renderedOutputBufferCount} " +
+                            "dropped=${decoderCounters.droppedBufferCount} " +
+                            "skippedOut=${decoderCounters.skippedOutputBufferCount}")
+                    }
+                })
+            }
+            lifecycleScope.launch {
+                for (i in 1..100) {
+                    val s = renderer.surface
+                    if (s != null) { withContext(Dispatchers.Main) { player?.setVideoSurface(s) }; break }
+                    kotlinx.coroutines.delay(100)
+                }
+            }
+        }
+        Log.i(TAG, "play: $url")
+        player?.setMediaItem(MediaItem.fromUri(url))
+        player?.prepare()
+        player?.playWhenReady = true
+        txtStatus.text = "▶ $name  •  ${renderer.projection.label} ${renderer.stereo.label}"
+    }
+
+    private fun cycleProjection() {
+        val order = listOf(Projection.FLAT, Projection.DEG180, Projection.DEG220, Projection.DEG270, Projection.DEG360, Projection.FISHEYE)
+        renderer.projection = order[(order.indexOf(renderer.projection) + 1) % order.size]
+        settings.projection = renderer.projection
+        syncGvr()
+        txtStatus.text = "${renderer.projection.label} • ${renderer.stereo.label}"
+    }
+
+    // Live rotation matrices on this stack arrive TRANSPOSED vs the AOSP
+    // documented convention (proven: column-2, not row-2, equals accel-up at
+    // +1.000 over 10k still samples). Transpose once on receipt so every
+    // downstream consumer (basis derivation, view composition, Euler logs,
+    // trace) sees docs-convention device→world matrices.
+    private val trackFixed = FloatArray(16)
+    private val cmpFixed = FloatArray(16)
+
+    private val cmpListener = object : SensorEventListener {
+        var lastRaw: FloatArray? = null
+        override fun onSensorChanged(e: SensorEvent) {
+            val raw = FloatArray(16)
+            SensorManager.getRotationMatrixFromVector(raw, e.values)
+            android.opengl.Matrix.transposeM(cmpFixed, 0, raw, 0)
+            lastRaw = cmpFixed.clone()
+        }
+        override fun onAccuracyChanged(s: Sensor?, acc: Int) = Unit
+    }
+
+    /** Raw gyro/accel/mag snapshot tap for the sensor debug page. Also
+     *  integrates gyro yaw about accel-up (gimbal-free turn ground truth). */
+    @Volatile private var yawGyroRelDeg = 0.0
+    private var lastGyroTNs = 0L
+    private val envListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            when (e.sensor.type) {
+                Sensor.TYPE_GYROSCOPE -> {
+                    lastGyro = floatArrayOf(e.values[0], e.values[1], e.values[2])
+                    // integrate yaw rate about accel-up for the TURNDET row;
+                    // reject free-fall/handling spikes
+                    val a = lastAccel
+                    val an = kotlin.math.sqrt((a[0]*a[0] + a[1]*a[1] + a[2]*a[2]).toDouble())
+                    if (an in 7.0..13.0 && lastGyroTNs != 0L) {
+                        val dt = (e.timestamp - lastGyroTNs) / 1e9
+                        if (dt in 0.0..0.5) {
+                            val rate = (e.values[0]*a[0] + e.values[1]*a[1] + e.values[2]*a[2]) / an
+                            yawGyroRelDeg += Math.toDegrees(rate * dt)
+                        }
+                    }
+                    lastGyroTNs = e.timestamp
+                }
+                Sensor.TYPE_ACCELEROMETER -> lastAccel = floatArrayOf(e.values[0], e.values[1], e.values[2])
+                Sensor.TYPE_MAGNETIC_FIELD -> lastMag = floatArrayOf(e.values[0], e.values[1], e.values[2])
+            }
+        }
+        override fun onAccuracyChanged(s: Sensor?, acc: Int) = Unit
+    }
+
+    // ---------------- head tracking ----------------
+    // Pass the RAW rotation matrix. The renderer derives the screen frame
+    // from gravity at recenter time, so any phone/viewer orientation works.
+    override fun onSensorChanged(e: SensorEvent) {
+        if (e.sensor.type != Sensor.TYPE_ROTATION_VECTOR &&
+            e.sensor.type != Sensor.TYPE_GAME_ROTATION_VECTOR) return
+        val v = FloatArray(5)
+        System.arraycopy(e.values, 0, v, 0, minOf(e.values.size, 5))
+        val raw = FloatArray(16)
+        SensorManager.getRotationMatrixFromVector(raw, v)
+        // See trackFixed note above: transpose to docs convention first.
+        android.opengl.Matrix.transposeM(trackFixed, 0, raw, 0)
+        // The renderer no longer consumes this: GVR's own head tracker
+        // feeds HeadTransform each frame. Kept for the orientation
+        // diagnostics, the A/B comparison and the sweep trace below.
+        lastTrackM = trackFixed.clone()
+        traceEvent(e.timestamp, trackFixed)
+        // 1Hz orientation diagnostic for tracking issues (logcat -s SweepVR-ori).
+        // All matrices here are post-transpose (docs convention), so Euler
+        // angles and up-rows are meaningful (no gimbal games beyond normal).
+        if (oriLogCountdown-- <= 0) {
+            oriLogCountdown = 50
+            val o = FloatArray(3)
+            SensorManager.getOrientation(trackFixed, o)
+            val cmp = cmpListener.lastRaw
+            var cmpStr = "none"
+            if (cmp != null) {
+                val c = FloatArray(3)
+                SensorManager.getOrientation(cmp, c)
+                // structural agreement: angle between the two "up" rows
+                val dot = (trackFixed[2]*cmp[2] + trackFixed[6]*cmp[6] + trackFixed[10]*cmp[10])
+                cmpStr = "yaw=${Math.toDegrees(c[0].toDouble()).toInt()} " +
+                    "pitch=${Math.toDegrees(c[1].toDouble()).toInt()} " +
+                    "roll=${Math.toDegrees(c[2].toDouble()).toInt()} " +
+                    "upAgree=${String.format("%.3f", dot)}"
+            }
+            Log.i("SweepVR-ori", "src=${if (useGameRv) "game" else "full"} " +
+                "yaw=${Math.toDegrees(o[0].toDouble()).toInt()} " +
+                "pitch=${Math.toDegrees(o[1].toDouble()).toInt()} " +
+                "roll=${Math.toDegrees(o[2].toDouble()).toInt()} " +
+                "upxy=(${String.format("%.2f", trackFixed[2])},${String.format("%.2f", trackFixed[6])}) " +
+                "vsOther=[$cmpStr]")
+        }
+    }
+
+    override fun onAccuracyChanged(s: Sensor?, acc: Int) = Unit
+
+    private fun humanSize(n: Long): String {
+        if (n < 1024) return "$n B"
+        val kb = n / 1024.0
+        if (kb < 1024) return String.format("%.0f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format("%.1f MB", mb)
+        return String.format("%.2f GB", mb / 1024.0)
+    }
+}
