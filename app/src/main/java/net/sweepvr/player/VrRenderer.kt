@@ -3298,8 +3298,7 @@ void main(){
         webLastPoint[1] = webSmoothPoint[1]
         webLastPoint[2] = webSmoothPoint[2]
         webLastPointOk = true
-        Matrix.setIdentityM(tmpA, 0)
-        Matrix.translateM(tmpA, 0, webSmoothPoint[0], webSmoothPoint[1], webSmoothPoint[2])
+        billboardAt(tmpA, webSmoothPoint)
     }
 
     /** Half-size of the reticle quad, from the distance to where it is
@@ -3314,6 +3313,48 @@ void main(){
         val dz = webSmoothPoint[2] - hz
         val dist = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz).coerceAtLeast(0.5f)
         return kotlin.math.sin(RETICLE_ANG) * dist * sizeMul * (1f - 0.85f * prog.coerceIn(0f, 1f))
+    }
+
+    /** tmpA for a reticle quad centred at world point [p], rotated to face
+     *  the eye (billboard).
+     *
+     *  Position stays world-anchored (stereo convergence), but a pure
+     *  translation left the quad world-axis-aligned, so off-centre it was
+     *  viewed obliquely and foreshortened into an ellipse - high, low or
+     *  wide of centre it looked skewed. Facing the eye keeps it round
+     *  everywhere, like the old head-locked ring. Up comes from head-up so
+     *  it stays upright under roll. */
+    private fun billboardAt(t: FloatArray, p: FloatArray) {
+        var zx = invHeadWorldM[12] - p[0]
+        var zy = invHeadWorldM[13] - p[1]
+        var zz = invHeadWorldM[14] - p[2]
+        val zl = kotlin.math.sqrt(zx * zx + zy * zy + zz * zz)
+        if (zl < 1e-6f) {
+            Matrix.setIdentityM(t, 0)
+            Matrix.translateM(t, 0, p[0], p[1], p[2])
+            return
+        }
+        zx /= zl; zy /= zl; zz /= zl
+        val up = lastEffUp
+        // x = up x z, y = z x x: orthonormal, right-handed, so the ring
+        // texture is neither mirrored nor culled.
+        var xx = up[1] * zz - up[2] * zy
+        var xy = up[2] * zx - up[0] * zz
+        var xz = up[0] * zy - up[1] * zx
+        var xl = kotlin.math.sqrt(xx * xx + xy * xy + xz * xz)
+        if (xl < 1e-4f) {
+            // Gaze along head-up: fall back to head-right for x.
+            xx = invHeadWorldM[0]; xy = invHeadWorldM[1]; xz = invHeadWorldM[2]
+            xl = kotlin.math.sqrt(xx * xx + xy * xy + xz * xz).coerceAtLeast(1e-6f)
+        }
+        xx /= xl; xy /= xl; xz /= xl
+        val yx = zy * xz - zz * xy
+        val yy = zz * xx - zx * xz
+        val yz = zx * xy - zy * xx
+        t[0] = xx; t[1] = xy; t[2] = xz; t[3] = 0f
+        t[4] = yx; t[5] = yy; t[6] = yz; t[7] = 0f
+        t[8] = zx; t[9] = zy; t[10] = zz; t[11] = 0f
+        t[12] = p[0]; t[13] = p[1]; t[14] = p[2]; t[15] = 1f
     }
 
     /** Builds tmpA for the reticle quad at [target], easing from the
@@ -3337,8 +3378,7 @@ void main(){
                 for (i in 0..2) webSmoothPoint[i] += (target[i] - webSmoothPoint[i]) * k
             }
         }
-        Matrix.setIdentityM(tmpA, 0)
-        Matrix.translateM(tmpA, 0, webSmoothPoint[0], webSmoothPoint[1], webSmoothPoint[2])
+        billboardAt(tmpA, webSmoothPoint)
     }
 
     private fun noteWebPagePoint(u: Float, v: Float) {
