@@ -2319,6 +2319,11 @@ try {
         // GL video/browser once the GVR surface is no longer on top.
         webHostRef?.visibility = View.GONE
         renderer.webPanelOpen = false
+        // Clear the web-panel flags so nothing stale (side buttons, icon
+        // rect, flyout engagement, compact height) leaks into the file
+        // browser or video panels. openWebPanel sets them all fresh.
+        renderer.webSideBtns = false
+        renderer.webBookIconRow = -1
         settingsFromVideo = false
         if (player != null) {
             renderer.mode = VrRenderer.Mode.VIDEO

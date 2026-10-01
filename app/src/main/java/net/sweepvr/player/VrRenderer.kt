@@ -741,6 +741,9 @@ class VrRenderer(
         const val PANEL_FADE_MS = 180f
     /** How long the gaze must rest on the web panel to toggle it. */
     const val PANEL_TOGGLE_MS = 350f
+    /** Hysteresis band for the tilt trigger, degrees. The panel opens at
+     *  its lower edge and closes this far back below it. */
+    const val PANEL_HYST_DEG = 3f
 
         private const val VERT = """
 attribute vec4 aPos; attribute vec2 aTex; varying vec2 vTex; varying vec3 vDir; uniform mat4 uMvp;
@@ -1618,7 +1621,7 @@ void main(){
      *  the pane an exit counts; inside it, nothing happens. */
     private fun bookIconRect(): FloatArray {
         if (webBookIconRow < 0) return floatArrayOf(0f, 0f, 0f, 0f)
-        if (webPanelOpen && webSideBtns) {
+        if (mode == Mode.WEB && webSideBtns) {
             // Open web panel: fixed top-right slot under PgUp/PgDn, in no
             // row. webBookIconRow is only a present-flag here.
             return floatArrayOf(BOOK_ICON_X0, BOOK_ICON_Y0,
@@ -3440,7 +3443,13 @@ void main(){
      *  A tilt gate was unusable: holding the phone leaves you permanently
      *  past the threshold, so the panel stayed open, swallowed the gaze and
      *  the page never got a single dwell. A short dwell on the panel also
-     *  stops a glance while turning from firing it. */
+     *  stops a glance while turning from firing it.
+     *
+     *  The trigger is gaze ELEVATION against the panel's lower edge, with a
+     *  hysteresis band (webTiltWantOpen). Nothing on the page is read: an
+     *  earlier version intersected the gaze with the panel plane and tested
+     *  the rect, which fired from empty space that merely lined up with the
+     *  old full-height surface. */
     private fun updateWebPanelTilt() {
         // Just recentred: whatever the gaze lands on, the page keeps it for
         // a moment. Without this, recentring while looking at the panel let
@@ -3451,14 +3460,15 @@ void main(){
         // carries the gaze off the panel edge, and without this the tilt
         // logic would close the whole panel before the exit resolved.
         if (webBookIconRow >= 0 && bookActive) { webPanelHold = 1f; return }
-        val onPanel = webGazeOnPanel()
+        val onPanel = webTiltWantOpen()
         val dt = (now() - webPanelT0).coerceIn(0L, 500L)
         webPanelT0 = now()
         if (onPanel) {
             webPanelHold = minOf(1f, webPanelHold + dt / PANEL_TOGGLE_MS)
             if (webPanelHold >= 1f && !webPanelOpen) {
                 webPanelOpen = true
-                FileLog.i("SweepVR-web", "web panel open (gaze on panel)")
+                FileLog.i("SweepVR-web", "web panel open (gaze on panel) " +
+                    "gazeEl=${"%.1f".format(lastTiltGazeEl)} edge=${"%.1f".format(lastTiltEdge)}")
                 onWebEvent(WebEvent.Panel(true))
             }
         } else {
@@ -3471,34 +3481,47 @@ void main(){
                 // the same link then read as already-fired and would not
                 // activate until a recenter cleared it.
                 webResetDwell()
-                FileLog.i("SweepVR-web", "web panel close (gaze back on page)")
+                FileLog.i("SweepVR-web", "web panel close (gaze back on page) " +
+                    "gazeEl=${"%.1f".format(lastTiltGazeEl)} edge=${"%.1f".format(lastTiltEdge)}")
                 onWebEvent(WebEvent.Panel(false))
             }
         }
     }
 
-    private fun webGazeOnPanel(): Boolean {
-        val o = invHeadWorldM
-        val fwd = lastEffFwd
-        val d = panelDistM
-        val el = Math.toRadians(browserElevDeg.toDouble()).toFloat()
-        val cy = kotlin.math.sin(el) * d
-        val cz = -kotlin.math.cos(el) * d
-        var pny = -cy; var pnz = -cz
-        val pnl = kotlin.math.sqrt(pny * pny + pnz * pnz).coerceAtLeast(1e-6f)
-        pny /= pnl; pnz /= pnl
-        val denom = fwd[1] * pny + fwd[2] * pnz
-        if (denom >= -0.05f) return false
-        val t = ((cy - o[13]) * pny + (cz - o[14]) * pnz) / denom
-        if (t <= 0f) return false
-        val hy = o[13] + fwd[1] * t
-        val hz = o[14] + fwd[2] * t
-        val upy = pnz; val upz = -pny
-        val upl = kotlin.math.sqrt(upy * upy + upz * upz).coerceAtLeast(1e-6f)
-        val alongRight = o[12] + fwd[0] * t
-        val alongUp = (hy - cy) * (upy / upl) + (hz - cz) * (upz / upl)
-        val hw = panelHalfW(); val hh = panelHalfH()
-        return alongRight >= -hw && alongRight <= hw && alongUp >= -hh && alongUp <= hh
+    /** Last tilt-trigger inputs, for the open/close trace lines. */
+    private var lastTiltGazeEl = 0f
+    private var lastTiltEdge = 0f
+    /** Tilt trigger for the web panel, with hysteresis.
+     *
+     *  The open edge is the elevation of the panel's LOWER edge (upper edge
+     *  if the panel ever hangs below the horizon): once open, it stays open
+     *  until the gaze drops back past the hysteresis band, so hovering near
+     *  the edge can't flutter it. Governed by tilt angle alone - nothing on
+     *  the page is tested, so no page content can ever open it.
+     *
+     *  The edge follows the compact height, so the trigger tracks the drawn
+     *  surface; full height until the first upload computes the compact one
+     *  (today's behaviour on a fresh panel exactly). */
+    private fun webTiltWantOpen(): Boolean {
+        val gazeEl = Math.toDegrees(kotlin.math.asin(lastEffFwd[1].coerceIn(-1f, 1f)).toDouble())
+        val hc = if (webSideBtns) webCompactH.coerceIn(200f, TEX.toFloat()) else TEX.toFloat()
+        val hhc = panelHalfH() * hc / TEX.toFloat()
+        // Lower edge of the DRAWN surface: the mesh is top-anchored (its top
+        // never moves), so the bottom sits centre + (hh - 2*hhc) up the panel
+        // axis - for the compact web panel that is ABOVE centre, not below
+        // it. Centring it here put the trigger ~8 degrees under the visible
+        // panel, and the address bar kept firing it.
+        val edge = browserElevDeg +
+            Math.toDegrees(kotlin.math.atan2(
+                (panelHalfH() - 2 * hhc).toDouble(), panelDistM.toDouble())).toFloat()
+        lastTiltGazeEl = gazeEl.toFloat(); lastTiltEdge = edge
+        // Panel above the horizon opens looking up; below it opens looking
+        // down.
+        return if (edge >= 0f) {
+            if (webPanelOpen) gazeEl >= edge - PANEL_HYST_DEG else gazeEl >= edge
+        } else {
+            if (webPanelOpen) gazeEl <= edge + PANEL_HYST_DEG else gazeEl <= edge
+        }
     }
 
     /** The scrollbar: up/down arrows plus a thumb, drawn as a strip pinned
@@ -4272,11 +4295,12 @@ void main(){
      *  so the file browser and menu panels keep their exact current geometry:
      *  same corners, same UVs, same gaze mapping. */
     private var webCompactH: Float = TEX.toFloat()
-    /** Visible panel height: the open web panel fits its few rows; every
-     *  other panel uses the full texture. Content is never scaled - text
-     *  keeps its size, the bottom whitespace just goes away. */
+    /** Visible panel height: the web panel fits its content (open, fading,
+     *  or closed - the stored height stands until recomputed); every other
+     *  panel uses the full texture. Content is never scaled - text keeps its
+     *  size, the bottom whitespace just goes away. */
     private fun panelHc(): Float =
-        if (mode == Mode.WEB && webPanelOpen && webSideBtns)
+        if (mode == Mode.WEB && webSideBtns)
             webCompactH.coerceIn(200f, TEX.toFloat())
         else TEX.toFloat()
     private fun drawBrowser(alpha: Float = 1f) {
@@ -4420,11 +4444,13 @@ void main(){
         val base = scrollPos.toInt()
         val winStart = (pin + base).coerceAtMost(rows.size)
         val winEnd = (winStart + win + (if (stm) 1 else 0)).coerceAtMost(rows.size)
-        // Compact height, web panel only: rows region, icon, and open pane
-        // all contribute; the bitmap stays full-size underneath and only rows
-        // 0..hc are shown, unscaled. Stored only for the open web panel - the
-        // file browser and menu panels always read TEX, so this assignment
-        // cannot move them.
+        // Stored only from the open web panel - but RETAINED across closes,
+        // never reset to full: the tilt trigger reads this between uploads,
+        // and resetting it dropped the trigger edge from ~22 to ~13 degrees,
+        // where the address-bar zone sits - open, snap shut, reopen flutter
+        // plus a full-size fade on every close. The file browser and menu
+        // panels never read this field (panelHc gates them to TEX), and
+        // exitWeb clears webSideBtns, so nothing stale can leak out of web.
         if (mode == Mode.WEB && webPanelOpen && webSideBtns) {
             val rowsBottom = if (stm) downStripY0(pin) + STRIP_H
                              else (ROWS_Y0 + (winEnd - winStart) * ROW_H).toFloat()
@@ -4432,9 +4458,9 @@ void main(){
             val paneBottom = if (bookOpen) bookControl.pane?.bottom ?: 0f else 0f
             webCompactH =
                 maxOf(rowsBottom, iconBottom, paneBottom, 200f).coerceAtMost(TEX.toFloat())
-        } else {
-            webCompactH = TEX.toFloat()
         }
+        // No else: the last compact value stands until the next open-panel
+        // upload recomputes it (see above).
         var h = browserTitle.hashCode() * 31 + (if (stm) (scrollPos * ROW_H).toInt() else base) + pin * 7919
         for (i in 0 until pin.coerceAtMost(rows.size)) h = h * 31 + rowHash(rows, i)
         for (i in winStart until winEnd) h = h * 31 + rowHash(rows, i)
