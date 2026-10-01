@@ -5386,7 +5386,10 @@ void main(){
             Projection.DEG270 -> sphereSegment(270f)
             Projection.DEG360 -> sphereSegment(360f)
         }
-        return bakeShaping(m)
+        // No shaping on the web screen: dome-correction warps have no
+        // business denting a flat page (De-point carved its top and bottom
+        // edges). Video keeps it in every mode, including behind panels.
+        return if (mode == Mode.WEB) m else bakeShaping(m)
     }
 
     /** Bake the normalized weighted-average shaping grid into the video mesh
