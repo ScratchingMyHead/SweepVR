@@ -1829,10 +1829,35 @@ void main(){
                     sideBtnDir = 0; sideBtnFired = false
                     sideBtnProg = maxOf(0f, sideBtnProg - dtMs / 600f)
                 }
-                // No close button on the panel: the gaze is still inside the
-                // panel's visibility range, so closing it just made it
-                // spring open again. It closes on its own when the gaze
-                // returns to the page.
+                // X close button, top right of the title bar - everywhere
+                // EXCEPT the open web panel. There it was removed on purpose:
+                // closing it left the gaze inside the panel's visibility
+                // range, so the hold timer sprang it open again (it closes on
+                // gaze return instead). File/settings/shaping/sensor panels
+                // have no such auto-open, so without this they cannot close.
+                if (!webPanelOpen && u > 0.90f && v * TEX < TITLE_Y1) {
+                    inXZone = true
+                    sliderHoverU = -1f
+                    lastFiredU = Float.NaN
+                    fireBlockedLogged = false
+                    highlight = -1; dwellFiredFor = -2
+                    browProgF = maxOf(0f, browProgF - dtMs / 600f)
+                    if (!xDwellFired) {
+                        if (still) xProgF += dtMs / dwellMs.toFloat()
+                        else xProgF = maxOf(0f, xProgF - dtMs / 600f)
+                    }
+                    if (still && !xDwellFired && xProgF >= 1f) {
+                        xDwellFired = true
+                        xProgF = 1f
+                        FileLog.i("SweepVR-browser", "FIRE X close")
+                        onBrowserActivate(-10, null)
+                        return
+                    }
+                    return
+                }
+                inXZone = false
+                xDwellFired = false
+                xProgF = maxOf(0f, xProgF - dtMs / 600f)
                 val pin = pinTopRows.coerceIn(0, 2)
                 var idx = -1
                 // Strips mode on file pages always, and on settings pages
@@ -4392,6 +4417,18 @@ void main(){
         // Don't draw the web title under the PgUp/PgDn buttons.
         val titleMax = if (webSideBtns) 21 else 30
         c.drawText(browserTitle.take(titleMax), 40f, 72f, p)
+        // X close button, top right of the title bar (hit zone u>0.90,
+        // y<TITLE_Y1) - everywhere except the open web panel, which must
+        // not offer a close that springs straight back open.
+        if (!webPanelOpen) {
+            if (inXZone) {
+                p.color = Color.rgb(30, 58, 95)
+                c.drawRect(920f, 16f, 1004f, 96f, p)
+            }
+            p.color = Color.WHITE; p.textSize = 44f; p.textAlign = Paint.Align.CENTER
+            c.drawText("✕", 962f, 72f, p)
+            p.textAlign = Paint.Align.LEFT
+        }
         if (webSideBtns) {
             p.textSize = 26f; p.textAlign = Paint.Align.CENTER
             val upProg = if (sideBtnDir == -1 && !sideBtnFired) sideBtnProg else 0f
