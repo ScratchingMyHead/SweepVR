@@ -7,6 +7,11 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** First-run bookmark: points at the project README on GitHub, so a fresh
+ *  install has something in the bookmark controls (which need at least one
+ *  item to open) and the docs are one sweep away. */
+const val DEFAULT_BOOKMARK_URL = "https://github.com/ScratchingMyHead/SweepVR"
+
 /** A saved web address. Bookmarks are entered on the 2D screen (URLs tab),
  *  because there is no keyboard in VR; the web panel just lists them. */
 data class WebBookmark(
@@ -24,6 +29,23 @@ class BookmarkStore(ctx: Context) {
     private val prefs = ctx.getSharedPreferences("sweepvr_bookmarks", Context.MODE_PRIVATE)
 
     fun load(): MutableList<WebBookmark> {
+        if (!prefs.contains("bookmarks")) {
+            // First run: seed the homepage so the in-headset bookmark
+            // controls have an item and can open. Saved at once, so it is
+            // real data the URLs tab edits or deletes like any other -
+            // and a deliberately emptied list stays empty, it is not
+            // re-seeded over the user's choice.
+            val seed = mutableListOf(
+                WebBookmark(
+                    id = java.util.UUID.randomUUID().toString(),
+                    title = "SweepVR",
+                    url = DEFAULT_BOOKMARK_URL,
+                    isHome = true
+                )
+            )
+            save(seed)
+            return seed
+        }
         val raw = prefs.getString("bookmarks", "[]") ?: "[]"
         val out = mutableListOf<WebBookmark>()
         val arr = JSONArray(raw)
