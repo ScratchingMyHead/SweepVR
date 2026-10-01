@@ -883,6 +883,15 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     }
                 }
             }
+            // Select the playing file once its folder lists: highlight +
+            // scroll land on it, dwell still starts from zero so it never
+            // fires on arrival.
+            pendingRevealLoc = loc
+            pendingRevealPred = when (val it = playQueue[playIndex]) {
+                is PlayItem.Smb -> { r: Row -> r.smb?.path == it.e.path }
+                is PlayItem.Local -> { r: Row -> r.local?.absolutePath == it.f.absolutePath }
+                is PlayItem.Saf -> { r: Row -> r.saf?.uri.toString() == it.uri }
+            }
         } else if (loc !is Loc.Smb && loc !is Loc.Local && loc !is Loc.Saf && loc !is Loc.Root) {
             // Playing file isn't in the folder queue (single-file play) AND
             // we're sitting on a non-file page (settings/shaping/sensors):
@@ -911,6 +920,26 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private fun pushRows(title: String, status: String, r: List<Row>) {
         rows = r
         renderer.browserTitle = title
+        // Pending playing-file reveal (enterBrowser over a video): apply it
+        // to this listing if it is the target folder, drop it if navigation
+        // has moved on. A Loading… push matches nothing and keeps it pending
+        // for the real listing that follows.
+        val wantLoc = pendingRevealLoc
+        if (wantLoc != null) {
+            if (loc == wantLoc) {
+                val idx = r.indexOfFirst { pendingRevealPred?.invoke(it) == true }
+                FileLog.i("SweepVR-reveal", "listing loc=$loc rows=${r.size} match=$idx")
+                if (idx >= 0) {
+                    renderer.revealHighlight = idx
+                    pendingRevealLoc = null
+                    pendingRevealPred = null
+                }
+            } else {
+                FileLog.i("SweepVR-reveal", "drop: loc=$loc want=$wantLoc")
+                pendingRevealLoc = null
+                pendingRevealPred = null
+            }
+        }
         // File pages lead with home + up: pin both above the scroll-up
         // strip so nav stays reachable without scrolling back to the top.
         // Settings/shaping/sensor pages get no strips (pin 0).
@@ -2724,6 +2753,10 @@ try {
     }
     private var playQueue: List<PlayItem> = emptyList()
     private var playIndex = -1
+    /** Playing file to highlight when its folder lists (enterBrowser over a
+     *  video): target folder + row predicate. Applied once by pushRows. */
+    private var pendingRevealLoc: Loc? = null
+    private var pendingRevealPred: ((Row) -> Boolean)? = null
 
     private fun captureQueue(local: File) {
         val sibs = local.parentFile?.listFiles()

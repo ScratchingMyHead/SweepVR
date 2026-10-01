@@ -334,6 +334,11 @@ class VrRenderer(
 
     // highlight index into FULL rows list
     private var highlight = -1
+    /** One-shot row to select on the next listing (consumed by the rows-
+     *  replacement reset below): opening the file browser over a video
+     *  highlights the playing file and ensureVisible scrolls it into view.
+     *  Selection only - dwell still starts from zero, so it never fires. */
+    @Volatile var revealHighlight = -1
     /** Rows list the dwell state was last computed against. A new object
      *  means a new listing (entered a directory, opened the panel): all
      *  gaze accumulators reset so nothing fires on arrival. */
@@ -1724,7 +1729,26 @@ void main(){
         // keeps the same list object and is unaffected.
         if (rows !== lastDwellRows) {
             lastDwellRows = rows
-            highlight = -1; dwellFiredFor = -2; browProgF = 0f
+            highlight = revealHighlight
+            // Scroll the reveal into view HERE, not via the highlight: gaze
+            // landing anywhere overwrites highlight later this same frame,
+            // before ensureVisible ever sees it - so a reveal with the gaze
+            // on-panel scrolled nowhere, and only an off-panel gaze worked.
+            // Positioning scrollPos directly survives any later hover.
+            if (revealHighlight in rows.indices) {
+                // Centre the reveal in the window (context either side),
+                // clamped at the ends where that is impossible. Always
+                // applied, not just when off-screen: opening Files lands on
+                // the playing file mid-list, not at its top or bottom edge.
+                val pin = pinTopRows.coerceIn(0, 2)
+                val win = if (pin > 0 || rows.size > VISIBLE_ROWS) winRows(pin) else VISIBLE_ROWS
+                val maxS = maxOf(0, rows.size - pin - win).toFloat()
+                FileLog.i("SweepVR-reveal", "reset reveal=$revealHighlight win=$win scrollPos=$scrollPos")
+                scrollPos = (revealHighlight - pin - win / 2f).coerceIn(0f, maxS)
+                FileLog.i("SweepVR-reveal", "scrolled to scrollPos=$scrollPos")
+            }
+            revealHighlight = -1
+            dwellFiredFor = -2; browProgF = 0f
             inXZone = false; xDwellFired = false; xProgF = 0f
             sideBtnDir = 0; sideBtnFired = false; sideBtnProg = 0f
             scrollEngage = 0; scrollTrigDir = 0; scrollTrigF = 0f
