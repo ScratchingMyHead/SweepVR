@@ -1374,7 +1374,7 @@ void main(){
             if (panelGaze && webBookIconRow >= 0 && !sweepEnabled) bookControl.dwellProgress else 0f
         val prog = if (bookGaze && sweepEnabled) 0f else if (screenSweep) screenSweepProg() else
             if (panelGaze) maxOf(browserDwellProg(), flyoutProg) else
-            if (cur == Mode.WEB) maxOf(webDwellProg(), toolbarDwellProg) else
+            if (cur == Mode.WEB) maxOf(webDwellProg(), toolbarDwellProg, barDwellProg) else
             if (cur == Mode.BROWSER) browserDwellProg() else menuDwellProg()
         // The reticle is ALWAYS up in web mode: the page is the pointer.
         val show = testSweep || screenSweep || cur == Mode.WEB || cur == Mode.BROWSER ||
@@ -2863,7 +2863,10 @@ void main(){
 
     /** Step both arrows for this frame. True if either is held, so the page
      *  dwell does not also fire underneath a held arrow. */
-    private fun barArrows(u: Float, v: Float, dtMs: Long): Boolean {
+    /** Deepest arrow dwell fill this frame, for the reticle shrink. */
+    private var barDwellProg = 0f
+    private fun barArrows(u: Float, v: Float, dtMs: Long, still: Boolean): Boolean {
+        barDwellProg = 0f
         if (!webScrollable) { barUp.reset(); barDown.reset(); return false }
         // Trace wiring is per-frame, like the dropdown's: bookDbg can change
         // at runtime, and a stale hook would either spam or go blind.
@@ -2883,8 +2886,13 @@ void main(){
                 "down=${"%.3f".format(barDown.rect.top)}..${"%.3f".format(barDown.rect.bottom)}")
         }
         val y = 1f - v                       // the one bar-v -> y-down flip
-        val heldUp = barUp.step(u, y, dtMs)
-        val heldDown = barDown.step(u, y, dtMs)
+        barUp.dwellMode = !sweepEnabled
+        barUp.dwellMs = dwellMs
+        barDown.dwellMode = !sweepEnabled
+        barDown.dwellMs = dwellMs
+        val heldUp = barUp.step(u, y, dtMs, still)
+        val heldDown = barDown.step(u, y, dtMs, still)
+        barDwellProg = maxOf(barUp.dwellProgress, barDown.dwellProgress)
         return heldUp || heldDown
     }
 
@@ -3136,8 +3144,9 @@ void main(){
 
         // The sweep targets claim the frame before the page dwell, so a drag
         // or a held arrow never also registers as a click on the page.
+        barDwellProg = 0f
         if (webScrollable && barSweep(uv[0], uv[1])) { webProgF = 0f; return }
-        if (webScrollable && barArrows(uv[0], uv[1], dtMs)) { webProgF = 0f; return }
+        if (webScrollable && barArrows(uv[0], uv[1], dtMs, still)) { webProgF = 0f; return }
         // Toolbar above the screen: live whether or not the page scrolls.
         if (toolbarStep(uv[0], uv[1], still, dtMs)) { webProgF = 0f; return }
         // The page is drawn with no texture zoom, so the texture coord under
@@ -4156,8 +4165,8 @@ void main(){
         c.drawRoundRect(3f, 2f, (W - 3).toFloat(), (H - 2).toFloat(), 14f, 14f, p)
         // arrows: one square button at each end of the strip
         val bh = BAR_BTN / (barV1 - barV0) * H
-        drawRepeatButton(c, p, 2f, bh, up = true, hot = barUp.active)
-        drawRepeatButton(c, p, H - 2f - bh, bh, up = false, hot = barDown.active)
+        drawRepeatButton(c, p, 2f, bh, up = true, hot = barUp.active || barUp.dwellProgress > 0f)
+        drawRepeatButton(c, p, H - 2f - bh, bh, up = false, hot = barDown.active || barDown.dwellProgress > 0f)
         // thumb: size = visible fraction, position = scroll fraction
         // Position and size come from the control's own thumb rect - the same
         // rect the entry test hits - so the drawn silhouette and the hit area
@@ -4184,7 +4193,8 @@ void main(){
     /** A square repeat button for a strip end: rounded square, triangular dips
      *  cut into the left and right edges (the entry sides, same language as
      *  the dropdown button and the thumb notches), and a small direction
-     *  triangle in the middle.
+     *  triangle in the middle. With sweep disabled the dips are skipped
+     *  (plain square, same rect).
      *
      *  (x0..x1) matches the strip interior so the button sits on the strip;
      *  (yTop..yTop+h) is the BAR_BTN square converted to bitmap rows by the
@@ -4205,18 +4215,21 @@ void main(){
                   else Color.argb(150, 148, 163, 184)
         c.drawRoundRect(x0, yTop, x1, y1, r, r, p)
         // Side dips, cut inward with CLEAR exactly like the thumb notches.
-        val mode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
-        val oldMode = p.xfermode
-        p.xfermode = mode
-        Path().apply {
-            moveTo(x0, my - dh); lineTo(x0, my + dh); lineTo(x0 + dip, my)
-            close()
-        }.let { c.drawPath(it, p) }
-        Path().apply {
-            moveTo(x1, my - dh); lineTo(x1, my + dh); lineTo(x1 - dip, my)
-            close()
-        }.let { c.drawPath(it, p) }
-        p.xfermode = oldMode
+        // Skipped with sweep off: no entry sides to advertise.
+        if (sweepEnabled) {
+            val mode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
+            val oldMode = p.xfermode
+            p.xfermode = mode
+            Path().apply {
+                moveTo(x0, my - dh); lineTo(x0, my + dh); lineTo(x0 + dip, my)
+                close()
+            }.let { c.drawPath(it, p) }
+            Path().apply {
+                moveTo(x1, my - dh); lineTo(x1, my + dh); lineTo(x1 - dip, my)
+                close()
+            }.let { c.drawPath(it, p) }
+            p.xfermode = oldMode
+        }
         // Direction triangle, same proportions as the arrows this replaces,
         // scaled to the square: ~0.27 of the half-width, ~0.55 of the height.
         val tw = (x1 - x0) * 0.27f

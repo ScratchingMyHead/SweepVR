@@ -27,6 +27,10 @@ package net.sweepvr.player.sweep
  * [onFire] is called with the count of how many times it has fired this visit,
  * so an owner that wants a different cadence (accumulating scroll, say) can
  * read the total rather than being called an unknown number of times.
+ *
+ * Dwell mode ([dwellMode], sweep disabled): dwell the whole button to fire
+ * the entry hit, keep holding past the pause to repeat, leave to stop. The
+ * sweep path is untouched when this is false.
  */
 class RepeatControl(
     /** Pause after the entry hit, before repeating starts. */
@@ -76,6 +80,20 @@ class RepeatControl(
      *  hold never got past the pause: stopping something that never started
      *  would send phantom stop events down the wire. */
     var onRepeatStop: (() -> Unit)? = null
+    /** Dwell mode (sweep disabled): dwell to fire, hold to repeat. */
+    var dwellMode: Boolean = false
+    /** Still-gaze time for the entry hit. The pause before repeating stays
+     *  [delayMs], so the validated nudge-then-glide feel is unchanged. */
+    var dwellMs: Long = 1500L
+    /** Tremor ride-through, ms: a head wobble out past the tiny leeway and
+     *  straight back must not end the hold (in sweep the same wobble costs
+     *  only a 150ms standoff before an INSTANT re-entry; in dwell it would
+     *  cost a full refill). Inside the grace the clocks freeze or run but
+     *  nothing ends; past it, the exit is genuine and [leave] runs. */
+    var dwellGraceMs: Long = 200L
+    /** 0..1 fill of the entry dwell (1 while held past it), for the reticle. */
+    var dwellProgress: Float = 0f
+        private set
     /** When true, entry only arms (blue, no fire) and the single hit fires
      *  on leaving up or down; leaving left or right disarms silently. This
      *  is the toolbar gesture: sliding along a button row to reach a far
@@ -114,11 +132,15 @@ class RepeatControl(
      *  ends, never during it, and fires at most once per frame: a long frame
      *  drops the backlog instead of repaying it as a burst.
      */
-    fun step(x: Float, y: Float, dtMs: Long): Boolean {
+    fun step(x: Float, y: Float, dtMs: Long, still: Boolean = true): Boolean {
         val at = Pt(x, y)
         if (rect.isEmpty) { reset(); return false }
         if (cooledMs < reentryStandoffMs)
             cooledMs = minOf(reentryStandoffMs, cooledMs + dtMs.coerceAtLeast(0L))
+        // Dwell twin: the whole button counts (no sides, no corners), still
+        // gaze fills to the entry hit, holding past the pause repeats, and
+        // leaving stops. The engine never steps, so no sweep state goes stale.
+        if (dwellMode) return dwellStep(at, still, dtMs)
         return when (val ev = engine.step(at, rect, config())) {
             is SweepEvent.Entered -> {
                 // Still inside the standoff from a release moments ago: this
@@ -139,6 +161,65 @@ class RepeatControl(
                 false
             }
         }
+    }
+
+    /** Fill toward the entry hit in dwell mode. Reset on exit and on fire. */
+    private var dwellFill = 0f
+    /** Ms continuously outside the rect in dwell mode. */
+    private var outsideMs = 0L
+
+    /**
+     * Dwell twin of the sweep step above: the whole button counts, still
+     * gaze fills to the entry hit (same single fire the sweep entry gives),
+     * holding past [delayMs] repeats through the same [hold] clock, and
+     * leaving stops through the same [leave]. Returns true while filling or
+     * held, so the frame claim matches sweep.
+     */
+    private fun dwellStep(at: Pt, still: Boolean, dtMs: Long): Boolean {
+        engine.reset()
+        if (!rect.contains(at, leeway)) {
+            outsideMs += dtMs.coerceAtLeast(0L)
+            if ((active || dwellFill > 0f) && outsideMs <= dwellGraceMs) {
+                // Tremor, not departure: the hold (and its repeat clock)
+                // and the fill both ride through unchanged.
+                if (active) hold(dtMs)
+                dwellProgress = if (active) 1f else dwellFill
+                return active || dwellFill > 0f
+            }
+            if (active || dwellFill > 0f) onTrace?.invoke("dwell exit")
+            leave("dwell exit")
+            dwellFill = 0f
+            dwellProgress = 0f
+            outsideMs = 0L
+            return false
+        }
+        outsideMs = 0L
+        if (!active) {
+            if (still) dwellFill = minOf(1f, dwellFill + dtMs.toFloat() / dwellMs.coerceAtLeast(1L))
+            else dwellFill = maxOf(0f, dwellFill - dtMs / 600f)
+            dwellProgress = dwellFill
+            if (dwellFill < 1f) return dwellFill > 0f
+            dwellFill = 0f
+            // Same tremor guard as a sweep re-entry: a wobble out and back
+            // inside the standoff swallows the hit rather than double-firing.
+            if (cooledMs < reentryStandoffMs) {
+                onTrace?.invoke("standoff swallow")
+                return false
+            }
+            active = true
+            waiting = true
+            repeating = false
+            heldMs = 0L
+            sinceFireMs = 0L
+            fireCount = 1
+            onTrace?.invoke("dwell fire=$fireCount")
+            onFire?.invoke()
+            dwellProgress = 1f
+            return true
+        }
+        hold(dtMs)
+        dwellProgress = 1f
+        return true
     }
 
     private fun enter(side: Side, at: Pt) {
@@ -218,6 +299,9 @@ class RepeatControl(
     fun reset() {
         leave("reset")
         engine.reset()
+        dwellFill = 0f
+        dwellProgress = 0f
+        outsideMs = 0L
         cooledMs = Long.MAX_VALUE
     }
 }
