@@ -2401,7 +2401,7 @@ try {
             if (idx == -10) { closeWebPanel(); return }
             val a = rows.getOrNull(idx)?.action ?: return
             when {
-                a == "webvideo" -> if (player != null) { closeWebPanel(); exitWeb() } else toast("No video playing")
+                a == "webvideo" -> { closeWebPanel(); exitWeb() }
                 a == "webzoom+" -> webZoom(+1)
                 a == "webzoom-" -> webZoom(-1)
                 a == "webxhair" -> {
