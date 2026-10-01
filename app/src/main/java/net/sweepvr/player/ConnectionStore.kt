@@ -62,6 +62,11 @@ class ConnectionStore(ctx: Context) {
 object SessionMemory {
     var lastConnectionId: String = ""
     var lastPath: String = ""
+    /** Playing file to scroll to when the 2D Watch list next renders it
+     *  ("smb:<conn>:<path>" / "local:<abs path>" / "saf:<uri>"). One-shot:
+     *  set when VR exits with a video loaded, consumed by the first
+     *  matching listing (or dropped on manual navigation). */
+    var revealFile: String? = null
 }
 
 /** Non-secret UI prefs: display mode, last location, buffer. */

@@ -831,6 +831,15 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         player?.pause()
         mainHandler.removeCallbacks(webPump)
         webView?.onPause()
+        // Exiting to the 2D screen with a video loaded: the Watch list
+        // scrolls to the playing file on return (consumed there).
+        if (isFinishing && playIndex in playQueue.indices) {
+            SessionMemory.revealFile = when (val it = playQueue[playIndex]) {
+                is PlayItem.Smb -> "smb:${it.connId}:${it.e.path}"
+                is PlayItem.Local -> "local:${it.f.absolutePath}"
+                is PlayItem.Saf -> "saf:${it.uri}"
+            }
+        }
         super.onPause()
     }
 

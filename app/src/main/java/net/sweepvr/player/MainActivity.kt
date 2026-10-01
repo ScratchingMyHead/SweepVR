@@ -300,6 +300,50 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Key identifying a WatchEntry's file for the return-from-VR reveal. */
+    private fun watchKey(e: WatchEntry): String? = when (e) {
+        is WatchEntry.Smb -> (wloc as? WLoc.Smb)?.let { "smb:${it.connId}:${e.e.path}" }
+        is WatchEntry.Local -> "local:${e.e.file.absolutePath}"
+        is WatchEntry.Saf -> "saf:${e.e.uri}"
+        else -> null
+    }
+
+    /** Playing file's key: set on the VR-exit reveal, cleared on manual
+     *  navigation. The marker persists across re-renders while set. */
+    private var playingKey: String? = null
+
+    /** Push the playing marker into the adapter for this listing (or clear
+     *  it when the file isn't shown). Called after every real submit - the
+     *  adapter is recreated per showWatch, so adapter state alone wouldn't
+     *  survive. */
+    private fun refreshPlayingMarker(items: List<WatchEntry>) {
+        val idx = playingKey?.let { k -> items.indexOfFirst { watchKey(it) == k } } ?: -1
+        val old = fileAdapter.highlightPos
+        if (old == idx) return
+        fileAdapter.highlightPos = idx
+        if (old >= 0) fileAdapter.notifyItemChanged(old)
+        if (idx >= 0) fileAdapter.notifyItemChanged(idx)
+    }
+
+    /** Scroll the Watch list to the playing file after exiting VR - but only
+     *  if Watch is the screen showing, and only once the folder actually
+     *  listing it renders. Otherwise the reveal stays pending (or dies on
+     *  manual navigation). */
+    private fun maybeRevealPlayed(items: List<WatchEntry>) {
+        val key = SessionMemory.revealFile ?: return
+        if (container.getChildAt(0) != watchView) return
+        val idx = items.indexOfFirst { watchKey(it) == key }
+        if (idx < 0) return
+        SessionMemory.revealFile = null
+        playingKey = key
+        refreshPlayingMarker(items)
+        val list = watchView?.findViewById<RecyclerView>(R.id.listFiles) ?: return
+        list.post {
+            (list.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(
+                idx, (list.height / 2).coerceAtLeast(0))
+        }
+    }
+
     private fun renderWatch() {
         val v = watchView ?: return
         // Back from the All-files Settings toggle with a pending SD root:
@@ -332,6 +376,8 @@ class MainActivity : AppCompatActivity() {
                     items += WatchEntry.SdVolume(v.desc, v.uuid)
                 }
                 fileAdapter.submit(items)
+                maybeRevealPlayed(items)
+                refreshPlayingMarker(items)
             }
             is WLoc.Saf -> {
                 fileAdapter.submit(listOf(WatchEntry.Up))
@@ -343,6 +389,8 @@ class MainActivity : AppCompatActivity() {
                     kids.forEach { items += WatchEntry.Saf(it, l.treeUri, l.relPath) }
                     withContext(Dispatchers.Main) {
                         if (wloc == l) fileAdapter.submit(items)
+                        if (wloc == l) maybeRevealPlayed(items)
+                        if (wloc == l) refreshPlayingMarker(items)
                     }
                 }
             }
@@ -359,6 +407,8 @@ class MainActivity : AppCompatActivity() {
                         list.forEach { items += WatchEntry.Smb(it) }
                         withContext(Dispatchers.Main) {
                             if (wloc == l) fileAdapter.submit(items)
+                            if (wloc == l) maybeRevealPlayed(items)
+                            if (wloc == l) refreshPlayingMarker(items)
                         }
                     } catch (t: Throwable) {
                         withContext(Dispatchers.Main) {
@@ -379,13 +429,27 @@ class MainActivity : AppCompatActivity() {
                     kids.forEach { items += WatchEntry.Local(it) }
                     withContext(Dispatchers.Main) {
                         if (wloc == l) fileAdapter.submit(items)
+                        if (wloc == l) maybeRevealPlayed(items)
+                        if (wloc == l) refreshPlayingMarker(items)
                     }
                 }
             }
         }
     }
 
+    /** Drop the playing-file marker (manual navigation). */
+    private fun clearPlayingMarker() {
+        playingKey = null
+        if (::fileAdapter.isInitialized) {
+            val old = fileAdapter.highlightPos
+            fileAdapter.highlightPos = -1
+            if (old >= 0) fileAdapter.notifyItemChanged(old)
+        }
+    }
+
     private fun watchUp() {
+        SessionMemory.revealFile = null // manual navigation cancels the reveal
+        clearPlayingMarker()
         wloc = when (val l = wloc) {
             is WLoc.Root -> WLoc.Root
             is WLoc.Smb -> if (l.path.isEmpty()) WLoc.Root else WLoc.Smb(l.connId, l.path.substringBeforeLast('\\', ""))
@@ -401,11 +465,15 @@ class MainActivity : AppCompatActivity() {
 
     /** Top-level home button: jump straight to the server list. */
     private fun watchHome() {
+        SessionMemory.revealFile = null // manual navigation cancels the reveal
+        clearPlayingMarker()
         wloc = WLoc.Root
         renderWatch()
     }
 
     private fun handleWatchClick(e: WatchEntry) {
+        SessionMemory.revealFile = null // manual navigation cancels the reveal
+        clearPlayingMarker()
         when (e) {
             is WatchEntry.Up -> watchUp()
             is WatchEntry.RootConn -> { wloc = WLoc.Smb(e.conn.id, ""); renderWatch() }
@@ -943,6 +1011,9 @@ class MainActivity : AppCompatActivity() {
         val onScan: (WatchEntry) -> Unit
     ) : RecyclerView.Adapter<FileAdapter.H>() {
         private var items: List<WatchEntry> = emptyList()
+        /** Currently-playing row marker. Pushed from MainActivity after
+         *  every submit (the adapter is recreated per showWatch call). */
+        var highlightPos = -1
         fun submit(l: List<WatchEntry>) { items = l; notifyDataSetChanged() }
         class H(v: View) : RecyclerView.ViewHolder(v) {
             val name: TextView = v.findViewById(R.id.txtName)
@@ -1000,6 +1071,15 @@ class MainActivity : AppCompatActivity() {
                     h.scan.setOnClickListener { onScan(e) }
                     h.itemView.setOnClickListener { if (e.e.isDir) onClick(e) else onPlay(e) }
                 }
+            }
+            // Playing-file marker: accent border, cleared below. Both
+            // branches set: view holders recycle.
+            val card = h.itemView as com.google.android.material.card.MaterialCardView
+            if (pos == highlightPos) {
+                card.strokeWidth = (2 * h.itemView.resources.displayMetrics.density).toInt()
+                card.strokeColor = android.graphics.Color.rgb(125, 211, 252)
+            } else {
+                card.strokeWidth = 0
             }
         }
     }
