@@ -2349,16 +2349,11 @@ try {
             if (renderer.webDbgOn) "On" else "Off",
             VrRenderer.BrowserRow.ACTION, action = "webxhair"
         )
-        // Bookmarks are a flyout, not one row each: the flat list made the
-        // panel grow with the collection. The icon opens the pane when the
-        // reticle arrives from the side.
-        // dead = true: this is a sweep-control target, not a dwell target.
-        // The row is replaced by the icon button, and entering it from the
-        // side is the only way in.
-        r += Row(
-            "Bookmarks",
-            "${bookmarks.size} saved", VrRenderer.BrowserRow.ACTION, dead = true, action = "webbookmarks"
-        )
+        // Bookmarks live in the top-right icon, not in a row: a dead row for
+        // it cost a full row height plus the 108px icon hanging below, for
+        // nothing. webBookIconRow is only a present-flag now (the icon's
+        // position is fixed in the renderer); its value is the last live
+        // row, which nothing indexes into.
         pushRows(webTitle.ifBlank { "Web" }, "", r)
         renderer.webBookList = bookmarks.map { b -> b.title.ifBlank { b.url } to b.url }
         renderer.webBookIconRow = r.size - 1

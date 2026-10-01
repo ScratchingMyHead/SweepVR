@@ -705,6 +705,12 @@ class VrRenderer(
         // ---- bookmarks flyout ----
         /** Icon button: a small square, sized just to carry the glyph. */
         const val BOOK_BTN = 108f
+        /** Icon position on the open web panel: top-right, centred under the
+         *  PgUp/PgDn buttons, clear of every row. Elsewhere (stale web flags
+         *  in other modes) the icon keeps its legacy row-homed rect, so those
+         *  paths are untouched. */
+        const val BOOK_ICON_X0 = 876f // (SIDE_BTN_X0 + SIDE_BTN_X1 - BOOK_BTN) / 2
+        const val BOOK_ICON_Y0 = 124f // SIDE_BTN_DN_Y0 + SIDE_BTN_H + 16
         /** Corner rounding, and the triangular dips in the entry edges.
          *  DIP_H is the half-height of the notch opening, and is wider than
          *  it is deep, so the mouth of the entry reads as an opening rather
@@ -1611,8 +1617,15 @@ void main(){
      *  clamped to what the panel can actually give. Past this far outside
      *  the pane an exit counts; inside it, nothing happens. */
     private fun bookIconRect(): FloatArray {
+        if (webBookIconRow < 0) return floatArrayOf(0f, 0f, 0f, 0f)
+        if (webPanelOpen && webSideBtns) {
+            // Open web panel: fixed top-right slot under PgUp/PgDn, in no
+            // row. webBookIconRow is only a present-flag here.
+            return floatArrayOf(BOOK_ICON_X0, BOOK_ICON_Y0,
+                BOOK_ICON_X0 + BOOK_BTN, BOOK_ICON_Y0 + BOOK_BTN)
+        }
+        // Anywhere else: legacy row-homed rect, exactly as before.
         val i = webBookIconRow
-        if (i < 0) return floatArrayOf(0f, 0f, 0f, 0f)
         // Sits BELOW its row, not centred on it: at 2x the row height a
         // centred button would spill up over the row above and hide it.
         val y0 = (ROWS_Y0 + i * ROW_H).toFloat()
@@ -1754,18 +1767,35 @@ void main(){
             // Panel-relative px, valid even when the point is OFF the panel:
             // the flyout's sideways exit happens past the edge, so clamping
             // here first meant the exit could never be seen.
+            // Compact mapping: on the open web panel rows 0..hc are painted
+            // top-aligned, so the gaze follows the shrunken surface; anywhere
+            // else hc is TEX and this is the old full-panel mapping exactly.
+            val hhc = hh * panelHc() / TEX
             val bxAll = ((alongRight + hw) / (2 * hw) * TEX)
-            val byAll = ((hh - alongUp) / (2 * hh) * TEX)
+            val byAll = ((hh - alongUp) / (2 * hhc) * panelHc())
             val onPanelRect = alongRight >= -hw && alongRight <= hw &&
-                alongUp >= -hh && alongUp <= hh
+                alongUp >= hh - 2 * hhc && alongUp <= hh
             if (webBookIconRow >= 0) {
                 // The flyout owns the frame while it is up, on or off panel.
                 if (bookFlyout(bxAll, byAll, onPanelRect, dtMs)) return
+                // The icon owns its own rect even when the flyout does not
+                // engage: on the open web panel it overlaps live rows, so a
+                // rest on it - or a refused top/bottom approach - must go
+                // inert here rather than fall through and dwell the row
+                // underneath.
+                val icon = bookIconRect()
+                if (bxAll >= icon[0] && bxAll <= icon[2] &&
+                    byAll >= icon[1] && byAll <= icon[3]) {
+                    highlight = -1; dwellFiredFor = -2
+                    sliderHoverU = -1f
+                    browProgF = maxOf(0f, browProgF - dtMs / 600f)
+                    return
+                }
             }
             if (onPanelRect) {
                 hitX = hx; hitY = hy; hitZ = hz; hitValid = true
                 val u = (alongRight + hw) / (2 * hw)
-                val v = (hh - alongUp) / (2 * hh)
+                val v = byAll / TEX
                 // PgUp / PgDn, web panel only. Checked before the rows so a
                 // gaze on a button never selects the row underneath it.
                 if (webSideBtns) {
@@ -3201,8 +3231,11 @@ void main(){
         val hw = panelHalfW(); val hh = panelHalfH()
         val alongRight = hx
         val alongUp = (hy - cy) * (upy / upl) + (hz - cz) * (upz / upl)
+        // Compact panel (open web panel only): the surface ends at hc, so
+        // points below it are off-panel. Full TEX elsewhere - identical.
+        val hhc = hh * panelHc() / TEX
         if (alongRight < -hw || alongRight > hw) return false
-        if (alongUp < -hh || alongUp > hh) return false
+        if (alongUp < hh - 2 * hhc || alongUp > hh) return false
         out[0] = hx; out[1] = hy; out[2] = hz
         return true
     }
@@ -4117,19 +4150,26 @@ void main(){
      *  canvas panels (plain sampler2D, no transform) use flipV = false. */
     private fun gridQuadP(
         p00: FloatArray, p10: FloatArray, p01: FloatArray, p11: FloatArray,
-        nx: Int, ny: Int, flipV: Boolean = false
+        nx: Int, ny: Int, flipV: Boolean = false, vMax: Float = 1f
     ): Mesh {
         val verts = FloatArray((nx + 1) * (ny + 1) * 3)
         val texs = FloatArray((nx + 1) * (ny + 1) * 2)
         var vi = 0; var ti = 0
         for (iy in 0..ny) {
-            val v = iy.toFloat() / ny
+            // t places the VERTEX between the corner rows, v places the
+            // TEXEL. They differ only when vMax < 1 (the compact web panel):
+            // the corners already carry the raised bottom edge, so vertices
+            // must travel the full top->bottom span while texcoords cover
+            // 0..vMax. One parameter for both squeezed the panel into a
+            // (hc/TEX)^2 sliver.
+            val t = iy.toFloat() / ny
+            val v = t * vMax
             for (ix in 0..nx) {
                 val u = ix.toFloat() / nx
                 for (k in 0..2) {
                     val top = p00[k] + (p10[k] - p00[k]) * u
                     val bot = p01[k] + (p11[k] - p01[k]) * u
-                    verts[vi++] = top + (bot - top) * v
+                    verts[vi++] = top + (bot - top) * t
                 }
                 texs[ti++] = u; texs[ti++] = if (flipV) 1f - v else v
             }
@@ -4162,6 +4202,18 @@ void main(){
     private var browserGrid: Mesh? = null
     private var browserGridD = -1f
     private var browserGridEl = -999f
+    private var browserGridHc = -1f
+    /** Web-panel-only compact height, texture px. Full TEX everywhere else,
+     *  so the file browser and menu panels keep their exact current geometry:
+     *  same corners, same UVs, same gaze mapping. */
+    private var webCompactH: Float = TEX.toFloat()
+    /** Visible panel height: the open web panel fits its few rows; every
+     *  other panel uses the full texture. Content is never scaled - text
+     *  keeps its size, the bottom whitespace just goes away. */
+    private fun panelHc(): Float =
+        if (mode == Mode.WEB && webPanelOpen && webSideBtns)
+            webCompactH.coerceIn(200f, TEX.toFloat())
+        else TEX.toFloat()
     private fun drawBrowser(alpha: Float = 1f) {
         maybeUploadBrowser()
         val d = panelDistM; val hw = panelHalfW(); val hh = panelHalfH()
@@ -4170,7 +4222,14 @@ void main(){
         // strobed the whole scene through GC. Panel floats at browserElevDeg
         // (0 = centered; elevated = below the play menu, facing viewer).
         val el = Math.toRadians(browserElevDeg.toDouble()).toFloat()
-        if (browserGrid == null || browserGridD != d || browserGridEl != el) {
+        // hc: visible content height (web panel only - TEX elsewhere, which
+        // reduces to the old full quad exactly). The top edge stays where it
+        // always was and the bottom rises to fit; the mesh maps texture rows
+        // 0..hc at unchanged scale.
+        val hc = panelHc()
+        val syBot = 1f - 2f * hc / TEX
+        if (browserGrid == null || browserGridD != d || browserGridEl != el ||
+            browserGridHc != hc) {
             val cx = 0f; val cy = (kotlin.math.sin(el) * d); val cz = (-kotlin.math.cos(el) * d)
             var nx = -cx; var ny = -cy; var nz = -cz
             val nl = kotlin.math.sqrt(nx * nx + ny * ny + nz * nz).coerceAtLeast(1e-6f)
@@ -4183,10 +4242,11 @@ void main(){
                 cz + uz * sy * hh
             )
             browserGrid = gridQuadP(
-                corner(-1f, 1f), corner(1f, 1f), corner(-1f, -1f), corner(1f, -1f), 12, 8
+                corner(-1f, 1f), corner(1f, 1f), corner(-1f, syBot), corner(1f, syBot),
+                12, 8, vMax = hc / TEX
             )
-            browserGridD = d; browserGridEl = el
-            FileLog.i("SweepVR-browser", "grid rebuild d=$d el=$el")
+            browserGridD = d; browserGridEl = el; browserGridHc = hc
+            FileLog.i("SweepVR-browser", "grid rebuild d=$d el=$el hc=$hc")
         }
         drawMesh2d(browserGrid!!, browserTexId, ovM, alpha)
     }
@@ -4295,6 +4355,21 @@ void main(){
         val base = scrollPos.toInt()
         val winStart = (pin + base).coerceAtMost(rows.size)
         val winEnd = (winStart + win + (if (stm) 1 else 0)).coerceAtMost(rows.size)
+        // Compact height, web panel only: rows region, icon, and open pane
+        // all contribute; the bitmap stays full-size underneath and only rows
+        // 0..hc are shown, unscaled. Stored only for the open web panel - the
+        // file browser and menu panels always read TEX, so this assignment
+        // cannot move them.
+        if (mode == Mode.WEB && webPanelOpen && webSideBtns) {
+            val rowsBottom = if (stm) downStripY0(pin) + STRIP_H
+                             else (ROWS_Y0 + (winEnd - winStart) * ROW_H).toFloat()
+            val iconBottom = if (webBookIconRow >= 0) BOOK_ICON_Y0 + BOOK_BTN else 0f
+            val paneBottom = if (bookOpen) bookControl.pane?.bottom ?: 0f else 0f
+            webCompactH =
+                maxOf(rowsBottom, iconBottom, paneBottom, 200f).coerceAtMost(TEX.toFloat())
+        } else {
+            webCompactH = TEX.toFloat()
+        }
         var h = browserTitle.hashCode() * 31 + (if (stm) (scrollPos * ROW_H).toInt() else base) + pin * 7919
         for (i in 0 until pin.coerceAtMost(rows.size)) h = h * 31 + rowHash(rows, i)
         for (i in winStart until winEnd) h = h * 31 + rowHash(rows, i)
@@ -4325,9 +4400,6 @@ void main(){
             drawSideBtn(c, p, SIDE_BTN_DN_Y0, "PgDn", sideBtnDir == 1, dnProg)
             p.textAlign = Paint.Align.LEFT; p.textSize = 44f
         }
-        if (webBookIconRow >= 0 && webSideBtns) {
-            drawBookFlyout(c, p, rows)
-        }
         if (stm) {
             // File pages: pinned nav rows, scroll strips, fractional window.
             val upY0 = upStripY0(pin); val rY0 = rowsY0(pin); val dnY0 = downStripY0(pin)
@@ -4350,13 +4422,21 @@ void main(){
             c.restore()
             if (scrollable) drawScrollStrip(c, p, dnY0, 1)
         } else {
-            // Settings pages: plain fixed window, no strips.
+            // Settings pages - and the short web panel: plain fixed window,
+            // no strips. Every row is live; the bookmarks icon floats
+            // top-right (not on a row) and paints last, over everything.
             var y = ROWS_Y0
             for (i in winStart until winEnd) {
-                // The bookmark icon draws itself, side-entry styled.
-                if (i != webBookIconRow) drawBrowserRow(c, p, rows, i, y)
+                drawBrowserRow(c, p, rows, i, y)
                 y += ROW_H
             }
+        }
+        // Icon + pane paint last: on the open web panel the icon sits over
+        // live rows (not on its own dead row), and the pane hangs over
+        // everything beneath it. Elsewhere the legacy row-homed icon draws
+        // exactly where it always did.
+        if (webBookIconRow >= 0 && webSideBtns) {
+            drawBookFlyout(c, p, rows)
         }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, browserTexId)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
@@ -4369,9 +4449,8 @@ void main(){
      *  inward. The dips ARE the instruction - they mark the edges you are
      *  meant to arrive from - so it reads without a label, and it is
      *  reusable for any future hover control. */
-    private fun drawSideEntryButton(c: Canvas, p: Paint, y0: Float, hot: Boolean) {
+    private fun drawSideEntryButton(c: Canvas, p: Paint, x0: Float, y0: Float, hot: Boolean) {
         val b = BOOK_BTN
-        val x0 = TEX * 0.5f - b * 0.5f
         c.drawPath(sideEntryPath(x0, y0, b), p.apply {
             color = if (hot) Color.rgb(30, 58, 95) else Color.rgb(21, 32, 45)
         })
@@ -4380,7 +4459,7 @@ void main(){
         p.color = if (hot) Color.rgb(8, 145, 178) else Color.rgb(71, 85, 105)
         c.drawPath(sideEntryPath(x0, y0, b), p)
         p.style = Paint.Style.FILL
-        drawBookmarksGlyph(c, p, TEX * 0.5f, y0 + b * 0.5f, if (hot) Color.WHITE else Color.rgb(203, 213, 225))
+        drawBookmarksGlyph(c, p, x0 + b * 0.5f, y0 + b * 0.5f, if (hot) Color.WHITE else Color.rgb(203, 213, 225))
     }
 
     /** The side-entry silhouette shared by the bookmarks icon and the zoom
@@ -4440,12 +4519,12 @@ void main(){
     }
 
     /** The bookmarks pane, drawn over the rows beneath the icon. Only drawn
-     *  while open; the icon button draws in place of its normal row. */
+     *  while open; the icon draws from the same rect the hit test uses
+     *  (bookIconRect), so the picture cannot disagree with the gesture. */
     private fun drawBookFlyout(c: Canvas, p: Paint, rows: List<BrowserRow>) {
-        val i = webBookIconRow
-        if (i in rows.indices) {
-            val iy = (ROWS_Y0 + i * ROW_H).toFloat()
-            drawSideEntryButton(c, p, iy, bookActive)
+        val icon = bookIconRect()
+        if (icon[2] > icon[0]) {
+            drawSideEntryButton(c, p, icon[0], icon[1], bookActive)
         }
         if (!bookOpen) return
         // Read the pane from the control, not from a second layout pass: the
