@@ -11,7 +11,7 @@ import org.json.JSONObject
  *  so a fresh install has something in the bookmark controls (which need at
  *  least one item to open) and the how-to is one sweep away. The page is
  *  updated in the repo, never in a release, so it stays current. */
-const val DEFAULT_BOOKMARK_URL = "https://github.com/ScratchingMyHead/SweepVR/blob/master/SweepVR.html"
+const val DEFAULT_BOOKMARK_URL = "https://scratchingmyhead.github.io/SweepVR/SweepVR.html"
 
 /** A saved web address. Bookmarks are entered on the 2D screen (URLs tab),
  *  because there is no keyboard in VR; the web panel just lists them. */
