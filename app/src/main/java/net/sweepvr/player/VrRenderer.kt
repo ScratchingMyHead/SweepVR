@@ -453,6 +453,7 @@ class VrRenderer(
     // Fisheye circle-sampling path (§8): same vertex shader, dedicated frag.
     private var progFish = 0
     private var aPosFish = 0; private var aTexFish = 0; private var uMvpFish = 0
+    private var aShapeFish = -1
     private var uTexFish = 0; private var uStereoFish = 0; private var uEyeFish = 0
     private var uTexMatFish = 0; private var uZoomOutFish = 0
     private var uFishC = 0; private var uFishR = 0; private var uFishMirror = 0
@@ -755,10 +756,11 @@ class VrRenderer(
     const val PANEL_HYST_DEG = 3f
 
         private const val VERT = """
-attribute vec4 aPos; attribute vec2 aTex; varying vec2 vTex; varying vec3 vDir; uniform mat4 uMvp;
+attribute vec4 aPos; attribute vec2 aTex; attribute vec2 aShape; varying vec2 vTex; varying vec3 vDir; varying vec2 vShape; uniform mat4 uMvp;
 uniform float uWarpOn; uniform float uWarpCx; uniform float uWarpK1; uniform float uWarpK2; uniform float uWarpAspect;
 void main(){
   vTex = aTex;
+  vShape = aShape;
   vDir = aPos.xyz;
   vec4 p = uMvp * aPos;
   float w = p.w;
@@ -848,6 +850,7 @@ precision highp float;
 precision mediump float;
 #endif
 varying vec2 vTex;
+varying vec2 vShape;
 varying vec3 vDir;
 uniform samplerExternalOES uTex; uniform int uStereo; uniform int uEye;
 uniform mat4 uTexMat; uniform float uZoomOut;
@@ -865,6 +868,14 @@ void main(){
   if (uFishMirror > 0.5) { off.x = -off.x; }
   if (dot(off, off) > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
   vec2 t = uFishC + vec2(off.x * uFishR.x, off.y * uFishR.y);
+  // Shaping (dome correction) lives in the mesh UVs, which this path never
+  // samples - so the shaped delta rides in as a varying instead, scaled
+  // from per-half mesh space to full-frame halves. Unshaped meshes feed
+  // (0,0) and this is a no-op.
+  vec2 sh = vShape;
+  if (uStereo == 1) { sh = vec2(sh.x * 0.5, sh.y); }
+  else if (uStereo == 2) { sh = vec2(sh.x, sh.y * 0.5); }
+  t += sh;
   // Zoom-out minifies in texture space about the half-image center (§5),
   // same as the equirect path: the frustum never widens.
   vec2 zc = vec2(0.5);
@@ -946,6 +957,7 @@ void main(){
         progFish = buildProgram(VERT, FRAG_OES_FISH)
         aPosFish = GLES20.glGetAttribLocation(progFish, "aPos")
         aTexFish = GLES20.glGetAttribLocation(progFish, "aTex")
+        aShapeFish = GLES20.glGetAttribLocation(progFish, "aShape")
         uMvpFish = GLES20.glGetUniformLocation(progFish, "uMvp")
         uTexFish = GLES20.glGetUniformLocation(progFish, "uTex")
         uStereoFish = GLES20.glGetUniformLocation(progFish, "uStereo")
@@ -1230,7 +1242,8 @@ void main(){
                 "|c=" + ((screenCurve * 100f) + 0.5f).toInt() +
                     "|w=" + ((w * 1000f) + 0.5f).toInt() + "|h=" + ((h * 1000f) + 0.5f).toInt()
             } else ""
-        if (meshKey != wantMeshKey) { mesh = buildMesh(effProj()); meshKey = wantMeshKey }
+        if (meshKey != wantMeshKey) { mesh = buildMesh(effProj()); meshKey = wantMeshKey
+            FileLog.i("SweepVR-mesh", "rebuild key=$wantMeshKey shaping=${shapingActive.size}") }
     }
 
     private var browAlpha = 0f
@@ -4425,9 +4438,20 @@ void main(){
         GLES20.glVertexAttribPointer(aPosFish, 3, GLES20.GL_FLOAT, false, 0, m.verts)
         GLES20.glEnableVertexAttribArray(aTexFish)
         GLES20.glVertexAttribPointer(aTexFish, 2, GLES20.GL_FLOAT, false, 0, m.tex)
+        // Shaped delta for the fragment path above. Unshaped (or a driver
+        // that optimised the attribute out, location -1): leave disabled,
+        // which reads (0,0) - no-op.
+        val shape = meshShape
+        if (aShapeFish >= 0 && shape != null && shape.capacity() >= m.tex.capacity()) {
+            GLES20.glEnableVertexAttribArray(aShapeFish)
+            GLES20.glVertexAttribPointer(aShapeFish, 2, GLES20.GL_FLOAT, false, 0, shape)
+        } else if (aShapeFish >= 0) {
+            GLES20.glDisableVertexAttribArray(aShapeFish)
+        }
         GLES20.glDrawElements(GLES20.GL_TRIANGLES, m.indexCount, GLES20.GL_UNSIGNED_SHORT, m.indices)
         GLES20.glDisableVertexAttribArray(aPosFish)
         GLES20.glDisableVertexAttribArray(aTexFish)
+        if (aShapeFish >= 0) GLES20.glDisableVertexAttribArray(aShapeFish)
     }
 
     /** Bilinear grid over the quad (p00 top-left, p10 top-right, p01
@@ -5392,6 +5416,12 @@ void main(){
         return if (mode == Mode.WEB) m else bakeShaping(m)
     }
 
+    /** Per-vertex shaped delta (-dx, +dy, mesh UV space) from the last
+     *  [bakeShaping], for the fisheye path whose fragment shader computes
+     *  its own coords and never samples the shaped UVs. Null when shaping
+     *  is off (attribute left disabled reads zero: no-op). */
+    private var meshShape: java.nio.FloatBuffer? = null
+
     /** Bake the normalized weighted-average shaping grid into the video mesh
      *  UVs (texture space, so head tracking via MVP is unaffected). Mesh UVs
      *  are per-half-frame: u right, v up (GL origin). Grid offsets are
@@ -5402,14 +5432,15 @@ void main(){
      *  and the y write is v + dy. No-op when nothing enabled. */
     private fun bakeShaping(m: Mesh): Mesh {
         val active = shapingActive
-        if (active.isEmpty()) return m
+        if (active.isEmpty()) { meshShape = null; return m }
         val n = active[0].n
         var wsum = 0f; var wcnt = 0
         for (a in active) if (a.n == n) { wsum += a.weight01; wcnt++ }
-        if (wsum <= 0f) return m
+        if (wsum <= 0f) { meshShape = null; return m }
         // Combine on the fly per vertex (meshes are small: 61x49 sphere, 25x13 flat).
         val count = m.tex.capacity() / 2
         val out = FloatArray(m.tex.capacity())
+        val delta = FloatArray(m.tex.capacity())
         m.tex.rewind()
         for (k in 0 until count) {
             val u = m.tex.get()
@@ -5436,8 +5467,12 @@ void main(){
             }
             out[k * 2] = u - dx
             out[k * 2 + 1] = v + dy
+            // Same displacement, as a varying for the fisheye path.
+            delta[k * 2] = -dx
+            delta[k * 2 + 1] = dy
         }
         m.tex.rewind()
+        meshShape = fb(delta)
         return Mesh(m.verts, fb(out), m.indices, m.indexCount)
     }
 

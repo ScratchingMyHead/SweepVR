@@ -566,6 +566,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             .joinToString(";") { "${it.id}:${settings.shapeWeight(it.id)}" }
         if (skey != lastShapingKey) {
             lastShapingKey = skey
+            FileLog.i("SweepVR-mesh", "shaping apply skey=$skey")
             renderer.shapingActive = shapingShapes.filter { settings.shapeEnabled(it.id) }.map {
                 VrRenderer.ActiveShape(it.ox, it.oy, settings.shapeWeight(it.id) / 100f, it.n)
             }
