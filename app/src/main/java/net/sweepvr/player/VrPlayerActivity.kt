@@ -1847,6 +1847,11 @@ try {
             }
         })
         webView = wv
+        // Hidden except in web mode: with the GVR surface NOT on top (video /
+        // browser) a visible 1600x900 black WebView composites over the GL
+        // view as a black square in the centre, with the video behind it.
+        // enterWeb makes it visible again before PixelCopy needs it.
+        host.visibility = View.GONE
         bookmarks = BookmarkStore(this).load()
         // The page's own size is the texture's aspect.
         host.post {
@@ -2207,6 +2212,10 @@ try {
         showFloatingClose()
         val wv = webView
         if (wv == null) { toast("Web view unavailable"); return }
+        // Visible again for PixelCopy while in web mode (see setupWeb: it is
+        // GONE everywhere else so it cannot cover the video/browser).
+        webHostRef?.visibility = View.VISIBLE
+        wv.visibility = View.VISIBLE
         player?.pause()
         renderer.webPanelOpen = false
         // Put the panel where it will be drawn from the start: the gaze test
@@ -2305,6 +2314,10 @@ try {
     private fun exitWeb() {
         applyGvrZOrder(false)
         hideFloatingClose()
+        webHideFullView()
+        // Hide the page host so the black WebView cannot composite over the
+        // GL video/browser once the GVR surface is no longer on top.
+        webHostRef?.visibility = View.GONE
         renderer.webPanelOpen = false
         settingsFromVideo = false
         if (player != null) {
@@ -2336,11 +2349,16 @@ try {
             if (renderer.webDbgOn) "On" else "Off",
             VrRenderer.BrowserRow.ACTION, action = "webxhair"
         )
-        // Bookmarks live in the top-right icon, not in a row: a dead row for
-        // it cost a full row height plus the 108px icon hanging below, for
-        // nothing. webBookIconRow is only a present-flag now (the icon's
-        // position is fixed in the renderer); its value is the last live
-        // row, which nothing indexes into.
+        // Bookmarks are a flyout, not one row each: the flat list made the
+        // panel grow with the collection. The icon opens the pane when the
+        // reticle arrives from the side.
+        // dead = true: this is a sweep-control target, not a dwell target.
+        // The row is replaced by the icon button, and entering it from the
+        // side is the only way in.
+        r += Row(
+            "Bookmarks",
+            "${bookmarks.size} saved", VrRenderer.BrowserRow.ACTION, dead = true, action = "webbookmarks"
+        )
         pushRows(webTitle.ifBlank { "Web" }, "", r)
         renderer.webBookList = bookmarks.map { b -> b.title.ifBlank { b.url } to b.url }
         renderer.webBookIconRow = r.size - 1

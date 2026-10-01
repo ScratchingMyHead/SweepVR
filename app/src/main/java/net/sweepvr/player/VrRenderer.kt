@@ -705,12 +705,6 @@ class VrRenderer(
         // ---- bookmarks flyout ----
         /** Icon button: a small square, sized just to carry the glyph. */
         const val BOOK_BTN = 108f
-        /** Icon position: top-right, centred under the PgUp/PgDn buttons,
-         *  clear of every row. It used to sit below its own dead row at the
-         *  bottom; that row is gone (see openWebPanel), and with it the
-         *  bottom ~108px of the panel. */
-        const val BOOK_ICON_X0 = 876f // (SIDE_BTN_X0 + SIDE_BTN_X1 - BOOK_BTN) / 2
-        const val BOOK_ICON_Y0 = 124f // SIDE_BTN_DN_Y0 + SIDE_BTN_H + 16
         /** Corner rounding, and the triangular dips in the entry edges.
          *  DIP_H is the half-height of the notch opening, and is wider than
          *  it is deep, so the mouth of the entry reads as an opening rather
@@ -1617,15 +1611,13 @@ void main(){
      *  clamped to what the panel can actually give. Past this far outside
      *  the pane an exit counts; inside it, nothing happens. */
     private fun bookIconRect(): FloatArray {
-        if (webBookIconRow < 0) return floatArrayOf(0f, 0f, 0f, 0f)
-        // Fixed position, top-right under PgUp/PgDn - deliberately in NO
-        // row. webBookIconRow is only a present-flag now (the activity sets
-        // it to the last row index); the row it names is a live row, not
-        // the icon's home. See the ownership rule at the gaze call site:
-        // the icon rect always belongs to the flyout, because it overlaps
-        // live rows and nothing may dwell underneath it.
-        return floatArrayOf(BOOK_ICON_X0, BOOK_ICON_Y0,
-            BOOK_ICON_X0 + BOOK_BTN, BOOK_ICON_Y0 + BOOK_BTN)
+        val i = webBookIconRow
+        if (i < 0) return floatArrayOf(0f, 0f, 0f, 0f)
+        // Sits BELOW its row, not centred on it: at 2x the row height a
+        // centred button would spill up over the row above and hide it.
+        val y0 = (ROWS_Y0 + i * ROW_H).toFloat()
+        return floatArrayOf(TEX * 0.5f - BOOK_BTN * 0.5f, y0,
+            TEX * 0.5f + BOOK_BTN * 0.5f, y0 + BOOK_BTN)
     }
 
     /** Space from the pane's edge to the panel's edge, in px. That is the
@@ -1762,34 +1754,18 @@ void main(){
             // Panel-relative px, valid even when the point is OFF the panel:
             // the flyout's sideways exit happens past the edge, so clamping
             // here first meant the exit could never be seen.
-            // Content-height mapping: rows 0..hc painted top-aligned, so
-            // the gaze follows the shrunken surface, not the old full one.
-            val hhc = hh * contentHc() / TEX
             val bxAll = ((alongRight + hw) / (2 * hw) * TEX)
-            val byAll = ((hh - alongUp) / (2 * hhc) * contentHc())
+            val byAll = ((hh - alongUp) / (2 * hh) * TEX)
             val onPanelRect = alongRight >= -hw && alongRight <= hw &&
-                alongUp >= hh - 2 * hhc && alongUp <= hh
+                alongUp >= -hh && alongUp <= hh
             if (webBookIconRow >= 0) {
                 // The flyout owns the frame while it is up, on or off panel.
                 if (bookFlyout(bxAll, byAll, onPanelRect, dtMs)) return
-                // The icon owns its own rect even when the flyout does not
-                // engage: it overlaps live rows now, so a rest on it - or a
-                // refused top/bottom approach - must go inert here rather
-                // than fall through and dwell the row underneath. This is
-                // the rule the old dead row enforced by position.
-                val icon = bookIconRect()
-                if (bxAll >= icon[0] && bxAll <= icon[2] &&
-                    byAll >= icon[1] && byAll <= icon[3]) {
-                    highlight = -1; dwellFiredFor = -2
-                    sliderHoverU = -1f
-                    browProgF = maxOf(0f, browProgF - dtMs / 600f)
-                    return
-                }
             }
             if (onPanelRect) {
                 hitX = hx; hitY = hy; hitZ = hz; hitValid = true
                 val u = (alongRight + hw) / (2 * hw)
-                val v = byAll / TEX
+                val v = (hh - alongUp) / (2 * hh)
                 // PgUp / PgDn, web panel only. Checked before the rows so a
                 // gaze on a button never selects the row underneath it.
                 if (webSideBtns) {
@@ -3424,9 +3400,7 @@ void main(){
         val alongRight = o[12] + fwd[0] * t
         val alongUp = (hy - cy) * (upy / upl) + (hz - cz) * (upz / upl)
         val hw = panelHalfW(); val hh = panelHalfH()
-        val hhc = hh * contentHc() / TEX
-        return alongRight >= -hw && alongRight <= hw &&
-            alongUp >= hh - 2 * hhc && alongUp <= hh
+        return alongRight >= -hw && alongRight <= hw && alongUp >= -hh && alongUp <= hh
     }
 
     /** The scrollbar: up/down arrows plus a thumb, drawn as a strip pinned
@@ -3795,7 +3769,36 @@ void main(){
     /** One toolbar momentary button: rounded square with side dips (the entry
      *  sides, same language as every other sweep button), then [glyph]
      *  centred. (x0, w) in bitmap px; full strip height. Dimmed when
-     *  disabled, which always pairs with never-stepped in toolbarStep. */
+     *  disabled, which always pairs with never-stepped in toolbarStep.
+     *
+     *  Fill and border share one dip-conforming path (like sideEntryPath),
+     *  so the border follows the notch instead of drawing straight sides
+     *  across the dip cutout. */
+    private fun toolButtonPath(x0p: Float, y0p: Float, x1p: Float, y1p: Float): Path {
+        val r = BAR_BTN_R
+        val dip = BAR_BTN_DIP
+        val dh = BAR_BTN_DIP_H
+        val my = (y0p + y1p) * 0.5f
+        return Path().apply {
+            moveTo(x0p + r, y0p)
+            lineTo(x1p - r, y0p)
+            quadTo(x1p, y0p, x1p, y0p + r)
+            lineTo(x1p, my - dh)
+            lineTo(x1p - dip, my)
+            lineTo(x1p, my + dh)
+            lineTo(x1p, y1p - r)
+            quadTo(x1p, y1p, x1p - r, y1p)
+            lineTo(x0p + r, y1p)
+            quadTo(x0p, y1p, x0p, y1p - r)
+            lineTo(x0p, my + dh)
+            lineTo(x0p + dip, my)
+            lineTo(x0p, my - dh)
+            lineTo(x0p, y0p + r)
+            quadTo(x0p, y0p, x0p + r, y0p)
+            close()
+        }
+    }
+
     private fun drawToolButton(c: Canvas, p: Paint, x0: Float, wU: Float,
                                enabled: Boolean, hot: Boolean = false,
                                glyph: (cx: Float, my: Float) -> Unit) {        val bw = wU * TBW
@@ -3805,32 +3808,21 @@ void main(){
         val y1p = TBH - 2f
         val cx = (x0p + x1p) * 0.5f
         val my = (y0p + y1p) * 0.5f
+        val path = toolButtonPath(x0p, y0p, x1p, y1p)
         p.style = Paint.Style.FILL
         p.color = when {
             hot -> Color.argb(245, 56, 189, 248)
             enabled -> Color.rgb(21, 32, 45)
             else -> Color.rgb(13, 20, 28)
         }
-        c.drawRoundRect(x0p, y0p, x1p, y1p, 4f, 4f, p)
-        val mode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
-        val oldMode = p.xfermode
-        p.xfermode = mode
-        Path().apply {
-            moveTo(x0p, my - 10f); lineTo(x0p, my + 10f); lineTo(x0p + 4f, my)
-            close()
-        }.let { c.drawPath(it, p) }
-        Path().apply {
-            moveTo(x1p, my - 10f); lineTo(x1p, my + 10f); lineTo(x1p - 4f, my)
-            close()
-        }.let { c.drawPath(it, p) }
-        p.xfermode = oldMode
+        c.drawPath(path, p)
         p.style = Paint.Style.FILL
         p.color = if (enabled) Color.rgb(203, 213, 225) else Color.rgb(71, 85, 105)
         glyph(cx, my)
         p.style = Paint.Style.STROKE
         p.strokeWidth = 1.5f
-        p.color = Color.rgb(71, 85, 105)
-        c.drawRoundRect(x0p, y0p, x1p, y1p, 4f, 4f, p)
+        p.color = if (hot) Color.WHITE else Color.rgb(71, 85, 105)
+        c.drawPath(path, p)
         p.style = Paint.Style.FILL
     }
 
@@ -4125,13 +4117,13 @@ void main(){
      *  canvas panels (plain sampler2D, no transform) use flipV = false. */
     private fun gridQuadP(
         p00: FloatArray, p10: FloatArray, p01: FloatArray, p11: FloatArray,
-        nx: Int, ny: Int, flipV: Boolean = false, vMax: Float = 1f
+        nx: Int, ny: Int, flipV: Boolean = false
     ): Mesh {
         val verts = FloatArray((nx + 1) * (ny + 1) * 3)
         val texs = FloatArray((nx + 1) * (ny + 1) * 2)
         var vi = 0; var ti = 0
         for (iy in 0..ny) {
-            val v = iy.toFloat() / ny * vMax
+            val v = iy.toFloat() / ny
             for (ix in 0..nx) {
                 val u = ix.toFloat() / nx
                 for (k in 0..2) {
@@ -4170,7 +4162,6 @@ void main(){
     private var browserGrid: Mesh? = null
     private var browserGridD = -1f
     private var browserGridEl = -999f
-    private var browserGridHc = -1f
     private fun drawBrowser(alpha: Float = 1f) {
         maybeUploadBrowser()
         val d = panelDistM; val hw = panelHalfW(); val hh = panelHalfH()
@@ -4179,12 +4170,7 @@ void main(){
         // strobed the whole scene through GC. Panel floats at browserElevDeg
         // (0 = centered; elevated = below the play menu, facing viewer).
         val el = Math.toRadians(browserElevDeg.toDouble()).toFloat()
-        // hc: visible content height. The top edge stays where it always was
-        // and the bottom rises to fit - the mesh maps texture rows 0..hc.
-        val hc = contentHc()
-        val syBot = 1f - 2f * hc / TEX
-        if (browserGrid == null || browserGridD != d || browserGridEl != el ||
-            browserGridHc != hc) {
+        if (browserGrid == null || browserGridD != d || browserGridEl != el) {
             val cx = 0f; val cy = (kotlin.math.sin(el) * d); val cz = (-kotlin.math.cos(el) * d)
             var nx = -cx; var ny = -cy; var nz = -cz
             val nl = kotlin.math.sqrt(nx * nx + ny * ny + nz * nz).coerceAtLeast(1e-6f)
@@ -4197,11 +4183,10 @@ void main(){
                 cz + uz * sy * hh
             )
             browserGrid = gridQuadP(
-                corner(-1f, 1f), corner(1f, 1f), corner(-1f, syBot), corner(1f, syBot),
-                12, 8, vMax = hc / TEX
+                corner(-1f, 1f), corner(1f, 1f), corner(-1f, -1f), corner(1f, -1f), 12, 8
             )
-            browserGridD = d; browserGridEl = el; browserGridHc = hc
-            FileLog.i("SweepVR-browser", "grid rebuild d=$d el=$el hc=$hc")
+            browserGridD = d; browserGridEl = el
+            FileLog.i("SweepVR-browser", "grid rebuild d=$d el=$el")
         }
         drawMesh2d(browserGrid!!, browserTexId, ovM, alpha)
     }
@@ -4301,13 +4286,6 @@ void main(){
         p.strokeWidth = 1f
     }
 
-    /** Visible panel height, texture px: fits the controls, top-aligned.
-     *  The bitmap stays full-size underneath; mesh, UVs and gaze all read
-     *  through here, so the three cannot disagree. Full height until the
-     *  first upload computes it - which is today's behaviour exactly. */
-    private var browserContentH: Float = TEX.toFloat()
-    private fun contentHc(): Float = browserContentH.coerceIn(200f, TEX.toFloat())
-
     private fun maybeUploadBrowser() {
         ensureVisible()
         val rows = browserRows
@@ -4317,17 +4295,6 @@ void main(){
         val base = scrollPos.toInt()
         val winStart = (pin + base).coerceAtMost(rows.size)
         val winEnd = (winStart + win + (if (stm) 1 else 0)).coerceAtMost(rows.size)
-        // Visible content height, texture px: the surface fits the controls,
-        // top-aligned. Rows region, icon, and open pane all contribute; the
-        // bitmap stays full-size underneath and only rows 0..H_c are shown.
-        // File pages contribute their strips; plain pages their window.
-        val rowsBottom = if (stm) downStripY0(pin) + STRIP_H
-                         else (ROWS_Y0 + (winEnd - winStart) * ROW_H).toFloat()
-        val iconBottom =
-            if (webBookIconRow >= 0 && webSideBtns) BOOK_ICON_Y0 + BOOK_BTN else 0f
-        val paneBottom = if (bookOpen) bookControl.pane?.bottom ?: 0f else 0f
-        browserContentH =
-            maxOf(rowsBottom, iconBottom, paneBottom, 200f).coerceAtMost(TEX.toFloat())
         var h = browserTitle.hashCode() * 31 + (if (stm) (scrollPos * ROW_H).toInt() else base) + pin * 7919
         for (i in 0 until pin.coerceAtMost(rows.size)) h = h * 31 + rowHash(rows, i)
         for (i in winStart until winEnd) h = h * 31 + rowHash(rows, i)
@@ -4358,6 +4325,9 @@ void main(){
             drawSideBtn(c, p, SIDE_BTN_DN_Y0, "PgDn", sideBtnDir == 1, dnProg)
             p.textAlign = Paint.Align.LEFT; p.textSize = 44f
         }
+        if (webBookIconRow >= 0 && webSideBtns) {
+            drawBookFlyout(c, p, rows)
+        }
         if (stm) {
             // File pages: pinned nav rows, scroll strips, fractional window.
             val upY0 = upStripY0(pin); val rY0 = rowsY0(pin); val dnY0 = downStripY0(pin)
@@ -4383,14 +4353,10 @@ void main(){
             // Settings pages: plain fixed window, no strips.
             var y = ROWS_Y0
             for (i in winStart until winEnd) {
-                drawBrowserRow(c, p, rows, i, y)
+                // The bookmark icon draws itself, side-entry styled.
+                if (i != webBookIconRow) drawBrowserRow(c, p, rows, i, y)
                 y += ROW_H
             }
-        }
-        // Icon + pane paint last: the icon sits over live rows now (not on
-        // its own dead row), and the pane hangs over everything beneath it.
-        if (webBookIconRow >= 0 && webSideBtns) {
-            drawBookFlyout(c, p, rows)
         }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, browserTexId)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
@@ -4403,8 +4369,9 @@ void main(){
      *  inward. The dips ARE the instruction - they mark the edges you are
      *  meant to arrive from - so it reads without a label, and it is
      *  reusable for any future hover control. */
-    private fun drawSideEntryButton(c: Canvas, p: Paint, x0: Float, y0: Float, hot: Boolean) {
+    private fun drawSideEntryButton(c: Canvas, p: Paint, y0: Float, hot: Boolean) {
         val b = BOOK_BTN
+        val x0 = TEX * 0.5f - b * 0.5f
         c.drawPath(sideEntryPath(x0, y0, b), p.apply {
             color = if (hot) Color.rgb(30, 58, 95) else Color.rgb(21, 32, 45)
         })
@@ -4413,7 +4380,7 @@ void main(){
         p.color = if (hot) Color.rgb(8, 145, 178) else Color.rgb(71, 85, 105)
         c.drawPath(sideEntryPath(x0, y0, b), p)
         p.style = Paint.Style.FILL
-        drawBookmarksGlyph(c, p, x0 + b * 0.5f, y0 + b * 0.5f, if (hot) Color.WHITE else Color.rgb(203, 213, 225))
+        drawBookmarksGlyph(c, p, TEX * 0.5f, y0 + b * 0.5f, if (hot) Color.WHITE else Color.rgb(203, 213, 225))
     }
 
     /** The side-entry silhouette shared by the bookmarks icon and the zoom
@@ -4473,12 +4440,12 @@ void main(){
     }
 
     /** The bookmarks pane, drawn over the rows beneath the icon. Only drawn
-     *  while open; the icon button draws at its fixed top-right spot. Must
-     *  run AFTER the rows loop: the icon overlaps live rows, and it has to
-     *  paint over them, not under. */
+     *  while open; the icon button draws in place of its normal row. */
     private fun drawBookFlyout(c: Canvas, p: Paint, rows: List<BrowserRow>) {
-        if (webBookIconRow >= 0) {
-            drawSideEntryButton(c, p, BOOK_ICON_X0, BOOK_ICON_Y0, bookActive)
+        val i = webBookIconRow
+        if (i in rows.indices) {
+            val iy = (ROWS_Y0 + i * ROW_H).toFloat()
+            drawSideEntryButton(c, p, iy, bookActive)
         }
         if (!bookOpen) return
         // Read the pane from the control, not from a second layout pass: the
