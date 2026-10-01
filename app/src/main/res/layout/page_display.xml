@@ -9,8 +9,28 @@
     android:layout_height="wrap_content"
     android:padding="16dp">
 
-    <TextView android:text="Projection" android:textAppearance="?attr/textAppearanceTitleSmall"
+    <TextView android:text="Startup" android:textAppearance="?attr/textAppearanceTitleSmall"
         android:layout_width="wrap_content" android:layout_height="wrap_content" />
+    <com.google.android.material.button.MaterialButtonToggleGroup
+        android:id="@+id/groupStartup"
+        android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        app:singleSelection="true"
+        app:selectionRequired="true">
+        <com.google.android.material.button.MaterialButton android:id="@+id/btnStartupMain" android:text="Main"
+            style="?attr/materialButtonOutlinedStyle"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        <com.google.android.material.button.MaterialButton android:id="@+id/btnStartupWeb" android:text="Web"
+            style="?attr/materialButtonOutlinedStyle"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        <com.google.android.material.button.MaterialButton android:id="@+id/btnStartupFiles" android:text="Files"
+            style="?attr/materialButtonOutlinedStyle"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
+    </com.google.android.material.button.MaterialButtonToggleGroup>
+
+    <TextView android:text="Projection" android:textAppearance="?attr/textAppearanceTitleSmall"
+        android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:paddingTop="12dp" />
     <RadioGroup android:id="@+id/groupProjection"
         android:layout_width="match_parent" android:layout_height="wrap_content">
         <RadioButton android:id="@+id/modeFlat" android:text="Flat 2D (theater screen)" android:layout_width="wrap_content" android:layout_height="wrap_content" />
@@ -181,12 +201,6 @@
         android:layout_width="match_parent" android:layout_height="wrap_content"
         android:valueFrom="400" android:valueTo="4000" android:stepSize="100"
         app:labelBehavior="floating" />
-
-    <com.google.android.material.switchmaterial.SwitchMaterial
-        android:id="@+id/switchStartInVrBrowser"
-        android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:text="Start VR in file browser (recommended)"
-        android:paddingTop="12dp" />
 
     <com.google.android.material.textfield.TextInputLayout
         android:layout_width="match_parent" android:layout_height="wrap_content"

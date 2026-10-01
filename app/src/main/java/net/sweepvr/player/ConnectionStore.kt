@@ -74,9 +74,13 @@ class SettingsStore(ctx: Context) {
     var stereo: Stereo
         get() = runCatching { Stereo.valueOf(p.getString("stereo", "SBS")!!) }.getOrDefault(Stereo.SBS)
         set(v) { p.edit().putString("stereo", v.name).apply() }
-    var startInVrBrowser: Boolean
-        get() = p.getBoolean("vr_browser", true)
-        set(v) { p.edit().putBoolean("vr_browser", v).apply() }
+    /** What the app shows at startup: the 2D main screen, or straight into
+     *  VR web / VR files. Replaces the old start-in-VR-browser switch, whose
+     *  pref was written but never read. */
+    enum class StartupTarget { MAIN, WEB, FILES }
+    var startup: StartupTarget
+        get() = runCatching { StartupTarget.valueOf(p.getString("startup", "MAIN")!!) }.getOrDefault(StartupTarget.MAIN)
+        set(v) { p.edit().putString("startup", v.name).apply() }
     var bufferKb: Int
         get() = p.getInt("buffer_kb", 256).coerceIn(32, 2048)
         set(v) { p.edit().putInt("buffer_kb", v).apply() }

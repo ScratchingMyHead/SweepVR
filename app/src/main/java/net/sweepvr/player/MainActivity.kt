@@ -196,6 +196,17 @@ class MainActivity : AppCompatActivity() {
             true
         }
         showWatch()
+        // Startup destination (fresh launch only - never on rotation, which
+        // recreates the activity and must not re-enter VR). An explicit
+        // video VIEW intent and the debug test extras both win over it.
+        if (savedInstanceState == null && intent?.action != Intent.ACTION_VIEW &&
+            !intent.hasExtra("ea") && !intent.hasExtra("ep") && !intent.hasExtra("testweb")) {
+            when (settings.startup) {
+                SettingsStore.StartupTarget.WEB -> enterVrWeb()
+                SettingsStore.StartupTarget.FILES -> enterVrBrowser()
+                else -> Unit
+            }
+        }
         handleViewIntent(intent)
     }
 
@@ -869,9 +880,26 @@ class MainActivity : AppCompatActivity() {
         val swHq = v.findViewById<com.google.android.material.switchmaterial.SwitchMaterial>(R.id.switchPanoHq)
         swHq.isChecked = settings.panoQuality == "vertexhq"
         swHq.setOnCheckedChangeListener { _, b -> settings.panoQuality = if (b) "vertexhq" else "vertex" }
-        val sw = v.findViewById<com.google.android.material.switchmaterial.SwitchMaterial>(R.id.switchStartInVrBrowser)
-        sw.isChecked = settings.startInVrBrowser
-        sw.setOnCheckedChangeListener { _, b -> settings.startInVrBrowser = b }
+        // Startup destination: single-row exclusive toggle (the Android
+        // standard for this). Listener attached after the initial check so
+        // setup never writes the pref.
+        val startupGroup = v.findViewById<com.google.android.material.button.MaterialButtonToggleGroup>(R.id.groupStartup)
+        startupGroup.clearOnButtonCheckedListeners()
+        startupGroup.check(
+            when (settings.startup) {
+                SettingsStore.StartupTarget.WEB -> R.id.btnStartupWeb
+                SettingsStore.StartupTarget.FILES -> R.id.btnStartupFiles
+                else -> R.id.btnStartupMain
+            }
+        )
+        startupGroup.addOnButtonCheckedListener { _, id, checked ->
+            if (!checked) return@addOnButtonCheckedListener
+            settings.startup = when (id) {
+                R.id.btnStartupWeb -> SettingsStore.StartupTarget.WEB
+                R.id.btnStartupFiles -> SettingsStore.StartupTarget.FILES
+                else -> SettingsStore.StartupTarget.MAIN
+            }
+        }
         val buf = v.findViewById<TextInputEditText>(R.id.editBufferKb)
         if (buf.text.isNullOrEmpty()) buf.setText(settings.bufferKb.toString())
         buf.setOnFocusChangeListener { _, has -> if (!has) buf.text?.toString()?.toIntOrNull()?.let { settings.bufferKb = it.coerceIn(32, 2048) } }
