@@ -334,6 +334,10 @@ class VrRenderer(
 
     // highlight index into FULL rows list
     private var highlight = -1
+    /** Rows list the dwell state was last computed against. A new object
+     *  means a new listing (entered a directory, opened the panel): all
+     *  gaze accumulators reset so nothing fires on arrival. */
+    private var lastDwellRows: List<BrowserRow>? = null
     /** Top edge of the rows window, in row units. File pages glide it
      *  fractionally while a scroll strip is engaged; settings pages snap
      *  it to integers via ensureVisible. Counts from the first SCROLLING
@@ -1713,6 +1717,19 @@ void main(){
         val rows = browserRows
         if (rows.isEmpty()) { highlight = -1; hitValid = false; inXZone = false; xDwellFired = false;
             sideBtnDir = 0; sideBtnFired = false; sideBtnProg = 0f; scrollTrigF = 0f; sliderHoverU = -1f; lastFiredU = Float.NaN; return }
+        // New listing (entered a directory): the rows under a motionless
+        // reticle are different rows now, so no retained progress, latch or
+        // highlight may survive - otherwise the entry that lands under the
+        // gaze inherits a full charge and fires as if stared at. Scrolling
+        // keeps the same list object and is unaffected.
+        if (rows !== lastDwellRows) {
+            lastDwellRows = rows
+            highlight = -1; dwellFiredFor = -2; browProgF = 0f
+            inXZone = false; xDwellFired = false; xProgF = 0f
+            sideBtnDir = 0; sideBtnFired = false; sideBtnProg = 0f
+            scrollEngage = 0; scrollTrigDir = 0; scrollTrigF = 0f
+            sliderHoverU = -1f; lastFiredU = Float.NaN; fireBlockedLogged = false
+        }
         if (now() < inputGraceUntil) { dwellStart = now(); sliderHoverU = -1f; return }
         // The flyout swallows the whole panel while it is up: rows must not
         // highlight or dwell underneath it. It is deliberately NOT an early
@@ -1869,6 +1886,10 @@ void main(){
                 val stripsOn = pin > 0 || rows.size > VISIBLE_ROWS
                 if (stripsOn) {
                     // File pages: strips + pinned rows + fractional window.
+                    // Hit only rows that are actually drawn: the window spans
+                    // `win` rows regardless, so below a short list the empty
+                    // area used to coerce onto the bottom file and dwell it.
+                    // Off-row areas fall through to the drain below.
                     val win = winRows(pin)
                     val ypx = v * TEX
                     val upY0 = upStripY0(pin); val rY0 = rowsY0(pin); val dnY0 = downStripY0(pin)
@@ -1885,11 +1906,16 @@ void main(){
                     if (scrollEngage != 0 || scrollTrigDir != 0) {
                         scrollEngage = 0; scrollTrigDir = 0; scrollTrigF = 0f
                     }
-                    if (ypx >= PIN_Y0 && ypx < PIN_Y0 + pin * ROW_H) {
-                        idx = ((ypx - PIN_Y0) / ROW_H).toInt().coerceIn(0, pin - 1)
-                    } else if (ypx >= rY0 && ypx < rY0 + win * ROW_H && rows.size > pin) {
+                    // Same window the upload draws (fractional row included).
+                    val base = scrollPos.toInt()
+                    val winStart = (pin + base).coerceAtMost(rows.size)
+                    val winEnd = (winStart + win + 1).coerceAtMost(rows.size)
+                    val drawnPin = pin.coerceAtMost(rows.size)
+                    if (drawnPin > 0 && ypx >= PIN_Y0 && ypx < PIN_Y0 + drawnPin * ROW_H) {
+                        idx = ((ypx - PIN_Y0) / ROW_H).toInt().coerceIn(0, drawnPin - 1)
+                    } else if (winEnd > winStart && ypx >= rY0 && ypx < rY0 + (winEnd - winStart) * ROW_H) {
                         val f = pin + scrollPos + (ypx - rY0) / ROW_H
-                        idx = f.toInt().coerceIn(pin, rows.size - 1)
+                        idx = f.toInt().coerceIn(winStart, winEnd - 1)
                     }
                 } else {
                     // Settings pages: plain fixed window, no strips.
@@ -4480,9 +4506,24 @@ void main(){
         c.drawColor(Color.rgb(13, 20, 28))
         val p = Paint(Paint.ANTI_ALIAS_FLAG)
         p.color = Color.WHITE; p.textSize = 44f
-        // Don't draw the web title under the PgUp/PgDn buttons.
-        val titleMax = if (webSideBtns) 21 else 30
-        c.drawText(browserTitle.take(titleMax), 40f, 72f, p)
+        // Title shares its bar with buttons: PgUp/PgDn on the web panel,
+        // the X close button everywhere else. Shrink slightly to fit rather
+        // than cutting the path short, and middle-truncate only if even the
+        // floor overflows.
+        val titleAvail = (if (webSideBtns) SIDE_BTN_X0 else 912f) - 40f
+        var titleTs = 44f
+        var title = browserTitle.take(64)
+        p.textSize = titleTs
+        while (titleTs > 30f && p.measureText(title) > titleAvail) {
+            titleTs -= 2f; p.textSize = titleTs
+        }
+        if (p.measureText(title) > titleAvail && title.length > 12) {
+            var keep = title.length - 1
+            fun mid(k: Int) = title.take(k / 2) + "…" + title.takeLast(k - k / 2)
+            while (keep > 12 && p.measureText(mid(keep)) > titleAvail) keep--
+            title = mid(keep)
+        }
+        c.drawText(title, 40f, 72f, p)
         // X close button, top right of the title bar (hit zone u>0.90,
         // y<TITLE_Y1) - everywhere except the open web panel, which must
         // not offer a close that springs straight back open.
