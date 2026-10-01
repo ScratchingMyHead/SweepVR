@@ -3027,13 +3027,18 @@ void main(){
      *  page has the gaze.
      *
      *  Enter the thumb from above or below and it snaps to the reticle and
-     *  follows it. Let go sideways, past the leeway, and it drops at the
+     *  follows it - or, with sweep off, dwell anywhere on it (barDwellGrab).
+     *  Let go sideways, past the leeway, and it drops at the
      *  current value. Carry on past the end of the track and it exits AT
      *  that extreme: fully scrolled to the top or the bottom.
      *
      *  Returns true while it owns the frame, so the page dwell does not
      *  also fire while the thumb is being dragged. */
-    private fun barSweep(u: Float, v: Float): Boolean {
+    /** Dwell fill toward a thumb grab (sweep off), and tremor time outside. */
+    private var barDwellFill = 0f
+    private var barDwellOutsideMs = 0L
+
+    private fun barSweep(u: Float, v: Float, still: Boolean, dtMs: Long): Boolean {
         barPrevV = barCurV
         barCurV = v
         barPrevU = barCurU
@@ -3050,11 +3055,21 @@ void main(){
         }
         if (u < barU0 - BAR_SLOP_U || u > barU1 + BAR_SLOP_U) {
             if (barDragging) barRelease("off-bar", barDragFrac)
+            else if (!sweepEnabled) {
+                // Far outside the bar: genuine leave, not wobble. The near-
+                // edge grace lives inside barDwellGrab; out here the fill
+                // goes, or a lit thumb would hover over the page dwell.
+                barDwellFill = 0f; barEnterOpen = false; barDwellOutsideMs = 0L
+            }
             return false
         }
         val span = barThumbSpan()
         val tol = BAR_GRIP_TOL
         if (!barDragging) {
+            // Dwell twin of the edge-entry grab below (sweep off): dwell
+            // anywhere on the thumb to grab it. Follow, sideways drop and
+            // end-cancel are positional, never sweep, so they run unchanged.
+            if (!sweepEnabled) return barDwellGrab(u, v, span, still, dtMs)
             // Leave the latch behind when the reticle goes away, so each
             // approach is judged on its own crossing.
             if (v < span[0] - BAR_REARM_V || v > span[1] + BAR_REARM_V ||
@@ -3112,6 +3127,41 @@ void main(){
         return true
     }
 
+    /** Dwell-to-grab for the thumb (sweep off): dwell anywhere on it and it
+     *  snaps exactly as the edge grab does. Whole thumb counts, no edges,
+     *  no corners. Stillness fills, motion drains, a brief wobble outside
+     *  rides through (same 200ms as the arrow holds), leaving properly
+     *  resets. Returns true while filling, so the frame claim matches the
+     *  sweep grab and the page cannot fire underneath. */
+    private fun barDwellGrab(u: Float, v: Float, span: FloatArray, still: Boolean, dtMs: Long): Boolean {
+        val onThumb = u >= barU0 && u <= barU1 && v >= span[0] && v <= span[1]
+        if (!onThumb) {
+            barDwellOutsideMs += dtMs.coerceAtLeast(0L)
+            if (barDwellFill > 0f && barDwellOutsideMs <= 200L) {
+                barEnterOpen = true
+                barDwellProg = maxOf(barDwellProg, barDwellFill)
+                return true
+            }
+            if (barDwellFill > 0f && bookDbg) FileLog.i("SweepVR-bar", "dwell exit reset")
+            barDwellFill = 0f
+            barEnterOpen = false
+            barDwellOutsideMs = 0L
+            return false
+        }
+        barDwellOutsideMs = 0L
+        if (still) barDwellFill = minOf(1f, barDwellFill + dtMs.toFloat() / dwellMs.toFloat().coerceAtLeast(1f))
+        else barDwellFill = maxOf(0f, barDwellFill - dtMs / 600f)
+        barEnterOpen = true
+        barDwellProg = maxOf(barDwellProg, barDwellFill)
+        if (barDwellFill < 1f) return true
+        barDwellFill = 0f
+        barEnterLocked = true
+        barDragging = true
+        barDragFrac = barFracOf(v)
+        FileLog.i("SweepVR-bar", "grab dwell frac=${"%.2f".format(barDragFrac)}")
+        return true
+    }
+
     /** The thumb's position as a fraction, for restoring it on a cancel. */
     private fun barThumbSpanValue(): Float = webScrollFrac.coerceIn(0f, 1f)
 
@@ -3145,7 +3195,7 @@ void main(){
         // The sweep targets claim the frame before the page dwell, so a drag
         // or a held arrow never also registers as a click on the page.
         barDwellProg = 0f
-        if (webScrollable && barSweep(uv[0], uv[1])) { webProgF = 0f; return }
+        if (webScrollable && barSweep(uv[0], uv[1], still, dtMs)) { webProgF = 0f; return }
         if (webScrollable && barArrows(uv[0], uv[1], dtMs, still)) { webProgF = 0f; return }
         // Toolbar above the screen: live whether or not the page scrolls.
         if (toolbarStep(uv[0], uv[1], still, dtMs)) { webProgF = 0f; return }
@@ -4182,7 +4232,10 @@ void main(){
                 barEnterOpen -> Color.argb(235, 125, 211, 252)
                 else -> Color.argb(150, 148, 163, 184)
             }
-            drawThumbDips(c, p, 7f, ty, (W - 7).toFloat(), ty + th, minOf(8f, th * 0.15f))
+            // Entry notches only in sweep mode: dwell grabs anywhere, so with
+            // sweep off the thumb is a plain bar (same rect, same tell).
+            drawThumbDips(c, p, 7f, ty, (W - 7).toFloat(), ty + th,
+                if (sweepEnabled) minOf(8f, th * 0.15f) else 0f)
         }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, webBarTexId)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
