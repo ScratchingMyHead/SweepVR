@@ -79,6 +79,11 @@ class SettingsStore(ctx: Context) {
     var stereo: Stereo
         get() = runCatching { Stereo.valueOf(p.getString("stereo", "SBS")!!) }.getOrDefault(Stereo.SBS)
         set(v) { p.edit().putString("stereo", v.name).apply() }
+    /** Sweep controls on/off. Off means dwell-to-trigger everywhere; the
+     *  fallback behavior is still to be designed (see TODO list). */
+    var sweepEnabled: Boolean
+        get() = p.getBoolean("sweep_enabled", true)
+        set(v) { p.edit().putBoolean("sweep_enabled", v).apply() }
     /** What the app shows at startup: the 2D main screen, or straight into
      *  VR web / VR files. Replaces the old start-in-VR-browser switch, whose
      *  pref was written but never read. */

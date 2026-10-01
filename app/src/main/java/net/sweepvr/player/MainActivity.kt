@@ -968,6 +968,11 @@ class MainActivity : AppCompatActivity() {
                 else -> SettingsStore.StartupTarget.MAIN
             }
         }
+        // Sweep on/off (checked = sweep DISABLED). Stored only for now -
+        // the dwell fallback it will drive is still to be designed.
+        val swSweepControls = v.findViewById<com.google.android.material.switchmaterial.SwitchMaterial>(R.id.switchSweepControls)
+        swSweepControls.isChecked = !settings.sweepEnabled
+        swSweepControls.setOnCheckedChangeListener { _, b -> settings.sweepEnabled = !b }
         val buf = v.findViewById<TextInputEditText>(R.id.editBufferKb)
         if (buf.text.isNullOrEmpty()) buf.setText(settings.bufferKb.toString())
         buf.setOnFocusChangeListener { _, has -> if (!has) buf.text?.toString()?.toIntOrNull()?.let { settings.bufferKb = it.coerceIn(32, 2048) } }

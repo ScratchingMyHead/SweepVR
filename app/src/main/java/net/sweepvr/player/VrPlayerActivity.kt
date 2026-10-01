@@ -547,6 +547,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.zoom = settings.videoZoom
         renderer.panelDistM = settings.panelDistM
         renderer.dwellMs = settings.dwellMs
+        renderer.sweepEnabled = settings.sweepEnabled
         renderer.pinVideo = settings.pinVideo
         renderer.skipSecs = settings.skipSecs
         // Optics: FOV scale + screen size feed the per-eye projection and

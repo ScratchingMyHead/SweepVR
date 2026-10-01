@@ -1370,7 +1370,7 @@ void main(){
         val bookGaze = panelGaze && webBookIconRow >= 0 && bookActive
         val prog = if (bookGaze) 0f else if (screenSweep) screenSweepProg() else
             if (panelGaze) browserDwellProg() else
-            if (cur == Mode.WEB) webDwellProg() else
+            if (cur == Mode.WEB) maxOf(webDwellProg(), toolbarDwellProg) else
             if (cur == Mode.BROWSER) browserDwellProg() else menuDwellProg()
         // The reticle is ALWAYS up in web mode: the page is the pointer.
         val show = testSweep || screenSweep || cur == Mode.WEB || cur == Mode.BROWSER ||
@@ -3133,7 +3133,7 @@ void main(){
         if (webScrollable && barSweep(uv[0], uv[1])) { webProgF = 0f; return }
         if (webScrollable && barArrows(uv[0], uv[1], dtMs)) { webProgF = 0f; return }
         // Toolbar above the screen: live whether or not the page scrolls.
-        if (toolbarStep(uv[0], uv[1], dtMs)) { webProgF = 0f; return }
+        if (toolbarStep(uv[0], uv[1], still, dtMs)) { webProgF = 0f; return }
         // The page is drawn with no texture zoom, so the texture coord under
         // the reticle IS the screen coord. The inversion that used to live
         // here was the source of a run of gaze/page misalignments: it fed
@@ -3615,11 +3615,29 @@ void main(){
     private var toolbarMesh: Mesh? = null
     private var toolbarMeshKey = ""
     private var toolbarBitmap: Bitmap? = null
+    /** Sweep controls on/off (2D Display setting). Off rejects the sweep
+     *  activation wholesale - toolbarStep never steps a sweep engine and
+     *  runs dwell buttons over the same rects instead. No sweep logic is
+     *  altered; it simply never runs. */
+    @Volatile var sweepEnabled: Boolean = true
+    /** Deepest dwell fill across the toolbar dwell buttons this frame, for
+     *  the reticle shrink. Zero unless dwell mode is holding the gaze. */
+    private var toolbarDwellProg = 0f
     private val tbBack = net.sweepvr.player.sweep.MomentaryControl()
     private val tbFwd = net.sweepvr.player.sweep.MomentaryControl()
     private val tbReload = net.sweepvr.player.sweep.MomentaryControl()
     private val tbHome = net.sweepvr.player.sweep.MomentaryControl()
     private val tbMenu = net.sweepvr.player.sweep.MomentaryControl()
+    /** Dwell twins of the seven toolbar buttons above (back, forward,
+     *  reload, home, menu, zoom-out, zoom-in). Stepped only with sweep off,
+     *  over the same rects with the same fires. */
+    private val dwBack = net.sweepvr.player.sweep.DwellButton()
+    private val dwFwd = net.sweepvr.player.sweep.DwellButton()
+    private val dwReload = net.sweepvr.player.sweep.DwellButton()
+    private val dwHome = net.sweepvr.player.sweep.DwellButton()
+    private val dwMenu = net.sweepvr.player.sweep.DwellButton()
+    private val dwZoomOut = net.sweepvr.player.sweep.DwellButton()
+    private val dwZoomIn = net.sweepvr.player.sweep.DwellButton()
     /** Bar-space bookmarks pane: a second DropdownControl in flipped bar
      *  coords, hanging below the strip over the page. Same items, same
      *  commit/cancel rule as the panel flyout; the two never meet. */
@@ -3634,8 +3652,14 @@ void main(){
     /** Step the toolbar for this frame. True if anything claimed it, so the
      *  page dwell does not fire underneath. Live in every web frame - unlike
      *  the bar, nothing here needs a scrollable page. */
-    private fun toolbarStep(u: Float, v: Float, dtMs: Long): Boolean {
+    private fun toolbarStep(u: Float, v: Float, still: Boolean, dtMs: Long): Boolean {
         val y = 1f - v
+        toolbarDwellProg = 0f
+        // Sweep disabled: the sweep engines below never step (their entries,
+        // sides and corners are rejected wholesale, not altered) - seven
+        // dwell buttons own the frame instead. Bookmarks stay sweep-driven
+        // until chunk 2 gives them their two dwells; the slot sits inert.
+        if (!sweepEnabled) return toolbarDwell(u, v, still, dtMs)
         fun mrect(u0: Float, u1: Float) =
             net.sweepvr.player.sweep.Rect(u0, TB_Y0, u1, TB_Y1)
         fun cfgMomentary(c: net.sweepvr.player.sweep.MomentaryControl,
@@ -3718,6 +3742,45 @@ void main(){
         return b0 || b1 || b2 || b3 || b4 || z0 || z1
     }
 
+    /** Dwell twin of toolbarStep for sweep-disabled mode. Same rects, same
+     *  fires, one shared DwellButton each - no sides, no dips, no angles.
+     *  The sweep engines are reset, never stepped. Returns true while any
+     *  button is filling, and feeds the reticle shrink through
+     *  toolbarDwellProg. */
+    private fun toolbarDwell(u: Float, v: Float, still: Boolean, dtMs: Long): Boolean {
+        tbBack.reset(); tbFwd.reset(); tbReload.reset()
+        tbHome.reset(); tbMenu.reset()
+        zoomOutCtl.reset(); zoomInCtl.reset()
+        bookBarCtl.close()
+        bookBarOpen = false
+        toolbarAddrFocused =
+            u >= TB_ADDR_U0 && u <= TB_ADDR_U1 && v >= TB_V0 && v <= TB_V1
+        val y = 1f - v
+        fun cfgDwell(c: net.sweepvr.player.sweep.DwellButton,
+                     u0: Float, u1: Float, tag: String, fire: () -> Unit): Float {
+            c.rect = net.sweepvr.player.sweep.Rect(u0, TB_Y0, u1, TB_Y1)
+            c.dwellMs = dwellMs
+            if (bookDbg) c.onTrace = { FileLog.i("SweepVR-tools", "$tag $it") }
+            else c.onTrace = null
+            c.onFire = fire
+            return c.step(u, y, still, dtMs)
+        }
+        var prog = 0f
+        prog = maxOf(prog, if (webCanGoBack)
+            cfgDwell(dwBack, 0f, TB_BTN, "back") { onWebEvent(WebEvent.GoBack) }
+            else { dwBack.reset(); 0f })
+        prog = maxOf(prog, if (webCanGoForward)
+            cfgDwell(dwFwd, TB_BTN, TB_BTN * 2, "fwd") { onWebEvent(WebEvent.GoForward) }
+            else { dwFwd.reset(); 0f })
+        prog = maxOf(prog, cfgDwell(dwReload, TB_BTN * 2, TB_BTN * 3, "reload") { onWebEvent(WebEvent.ReloadPage) })
+        prog = maxOf(prog, cfgDwell(dwHome, TB_BTN * 3, TB_BTN * 4, "home") { onWebEvent(WebEvent.GoHome) })
+        prog = maxOf(prog, cfgDwell(dwMenu, 1f - TB_BTN, 1f, "menu") { onWebEvent(WebEvent.OpenMenu) })
+        prog = maxOf(prog, cfgDwell(dwZoomOut, 1f - TB_BTN * 3, 1f - TB_BTN * 2, "zoomout") { onWebEvent(WebEvent.TextZoom(-1)) })
+        prog = maxOf(prog, cfgDwell(dwZoomIn, 1f - TB_BTN * 2, 1f - TB_BTN, "zoomin") { onWebEvent(WebEvent.TextZoom(1)) })
+        toolbarDwellProg = prog
+        return prog > 0f
+    }
+
     /** Configure the bar-space bookmarks pane for this frame. Units are gaze
      *  (y-down after the flip); the control is unit-agnostic, so a row is
      *  0.05 tall here the way it is 64px on the panel. The pane hangs below
@@ -3798,19 +3861,19 @@ void main(){
         // Momentary buttons: rounded square, side dips, vector glyph. Inert
         // when disabled (back/forward with empty history) - dimmed, never
         // stepped, so the gaze passes over to whatever is behind.
-        drawToolButton(c, p, bx(0f), TB_BTN, webCanGoBack, hot = tbBack.active) { cx, my ->
+        drawToolButton(c, p, bx(0f), TB_BTN, webCanGoBack, hot = tbBack.active || dwBack.progress > 0f) { cx, my ->
             c.drawPath(Path().apply {
                 moveTo(cx - 9f, my); lineTo(cx + 7f, my - 11f); lineTo(cx + 7f, my + 11f)
                 close()
             }, p)
         }
-        drawToolButton(c, p, bx(TB_BTN), TB_BTN, webCanGoForward, hot = tbFwd.active) { cx, my ->
+        drawToolButton(c, p, bx(TB_BTN), TB_BTN, webCanGoForward, hot = tbFwd.active || dwFwd.progress > 0f) { cx, my ->
             c.drawPath(Path().apply {
                 moveTo(cx + 9f, my); lineTo(cx - 7f, my - 11f); lineTo(cx - 7f, my + 11f)
                 close()
             }, p)
         }
-        drawToolButton(c, p, bx(TB_BTN * 2), TB_BTN, enabled = true, hot = tbReload.active) { cx, my ->
+        drawToolButton(c, p, bx(TB_BTN * 2), TB_BTN, enabled = true, hot = tbReload.active || dwReload.progress > 0f) { cx, my ->
             p.style = Paint.Style.STROKE; p.strokeWidth = 4f
             c.drawArc(cx - 11f, my - 11f, cx + 11f, my + 11f, -60f, 270f, false, p)
             p.style = Paint.Style.FILL
@@ -3823,14 +3886,14 @@ void main(){
                 close()
             }, p)
         }
-        drawToolButton(c, p, bx(TB_BTN * 3), TB_BTN, enabled = true, hot = tbHome.active) { cx, my ->
+        drawToolButton(c, p, bx(TB_BTN * 3), TB_BTN, enabled = true, hot = tbHome.active || dwHome.progress > 0f) { cx, my ->
             c.drawRect(cx - 10f, my - 3f, cx + 10f, my + 12f, p)
             c.drawPath(Path().apply {
                 moveTo(cx - 14f, my - 2f); lineTo(cx + 14f, my - 2f); lineTo(cx, my - 14f)
                 close()
             }, p)
         }
-        drawToolButton(c, p, bx(1f - TB_BTN), TB_BTN, enabled = true, hot = tbMenu.active) { cx, my ->
+        drawToolButton(c, p, bx(1f - TB_BTN), TB_BTN, enabled = true, hot = tbMenu.active || dwMenu.progress > 0f) { cx, my ->
             c.drawCircle(cx - 9f, my, 3f, p)
             c.drawCircle(cx, my, 3f, p)
             c.drawCircle(cx + 9f, my, 3f, p)
@@ -3846,12 +3909,12 @@ void main(){
         // Zoom steppers, moved from the panel icon row: same side-entry
         // silhouette + magnifier, sized to the toolbar square.
         drawToolButton(c, p, bx(1f - TB_BTN * 3), TB_BTN, enabled = true,
-            hot = zoomOutCtl.active) { cx, my ->
-            magnifierGlyph(c, p, cx, my, 27f, if (zoomOutCtl.active) 255 else 190, false)
+            hot = zoomOutCtl.active || dwZoomOut.progress > 0f) { cx, my ->
+            magnifierGlyph(c, p, cx, my, 27f, if (zoomOutCtl.active || dwZoomOut.progress > 0f) 255 else 190, false)
         }
         drawToolButton(c, p, bx(1f - TB_BTN * 2), TB_BTN, enabled = true,
-            hot = zoomInCtl.active) { cx, my ->
-            magnifierGlyph(c, p, cx, my, 27f, if (zoomInCtl.active) 255 else 190, true)
+            hot = zoomInCtl.active || dwZoomIn.progress > 0f) { cx, my ->
+            magnifierGlyph(c, p, cx, my, 27f, if (zoomInCtl.active || dwZoomIn.progress > 0f) 255 else 190, true)
         }
         drawToolbarAddress(c, p)
         if (bookBarOpen) drawBookBarPane(c, p, ::rowY)
@@ -3944,7 +4007,9 @@ void main(){
      *
      *  Fill and border share one dip-conforming path (like sideEntryPath),
      *  so the border follows the notch instead of drawing straight sides
-     *  across the dip cutout. */
+     *  across the dip cutout. With sweep disabled the dips are not drawn
+     *  (plain rounded square, same rect): entry notches must not advertise
+     *  a gesture that is turned off. */
     private fun toolButtonPath(x0p: Float, y0p: Float, x1p: Float, y1p: Float): Path {
         val r = BAR_BTN_R
         val dip = BAR_BTN_DIP
@@ -3979,21 +4044,22 @@ void main(){
         val y1p = TBH - 2f
         val cx = (x0p + x1p) * 0.5f
         val my = (y0p + y1p) * 0.5f
-        val path = toolButtonPath(x0p, y0p, x1p, y1p)
         p.style = Paint.Style.FILL
         p.color = when {
             hot -> Color.argb(245, 56, 189, 248)
             enabled -> Color.rgb(21, 32, 45)
             else -> Color.rgb(13, 20, 28)
         }
-        c.drawPath(path, p)
+        if (sweepEnabled) c.drawPath(toolButtonPath(x0p, y0p, x1p, y1p), p)
+        else c.drawRoundRect(x0p, y0p, x1p, y1p, BAR_BTN_R, BAR_BTN_R, p)
         p.style = Paint.Style.FILL
         p.color = if (enabled) Color.rgb(203, 213, 225) else Color.rgb(71, 85, 105)
         glyph(cx, my)
         p.style = Paint.Style.STROKE
         p.strokeWidth = 1.5f
         p.color = if (hot) Color.WHITE else Color.rgb(71, 85, 105)
-        c.drawPath(path, p)
+        if (sweepEnabled) c.drawPath(toolButtonPath(x0p, y0p, x1p, y1p), p)
+        else c.drawRoundRect(x0p, y0p, x1p, y1p, BAR_BTN_R, BAR_BTN_R, p)
         p.style = Paint.Style.FILL
     }
 

@@ -28,6 +28,12 @@
             android:layout_width="wrap_content" android:layout_height="wrap_content" />
     </com.google.android.material.button.MaterialButtonToggleGroup>
 
+    <com.google.android.material.switchmaterial.SwitchMaterial
+        android:id="@+id/switchSweepControls"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="Disable sweep (I am a boring person)"
+        android:paddingTop="12dp" />
+
     <TextView android:text="Projection" android:textAppearance="?attr/textAppearanceTitleSmall"
         android:layout_width="wrap_content" android:layout_height="wrap_content"
         android:paddingTop="12dp" />
