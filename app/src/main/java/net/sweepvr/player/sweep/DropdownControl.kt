@@ -19,6 +19,13 @@ package net.sweepvr.player.sweep
  *  - a release sideways only counts as a choice if the reticle actually
  *    reached the pane first, so sweeping across the button on the way to
  *    something else cannot commit whatever row was last under it
+ *
+ * What the dwell fallback means ([dwellMode], sweep disabled):
+ *  - dwell anywhere on the button and the pane opens
+ *  - the cursor still follows free - movement is not the enemy, only
+ *    activation by movement is
+ *  - dwell on a row commits it; leaving the pane cancels. Two dwells: one
+ *    to open, one to select.
  */
 class DropdownControl(
     var rowH: Float = 64f,
@@ -52,6 +59,16 @@ class DropdownControl(
     var visibleCount: Int = 0; private set
     var needsArrows: Boolean = false; private set
 
+    /** Dwell mode (sweep disabled): two dwells, open then select. The sweep
+     *  path below is untouched when this is false. */
+    var dwellMode: Boolean = false
+    /** Still-gaze time to open/commit. Mirrors the page/row dwell. */
+    var dwellMs: Long = 1500L
+    /** 0..1 fill of the current dwell (icon before open, row after), for
+     *  the reticle. */
+    var dwellProgress: Float = 0f
+        private set
+
     /** Fired with the chosen item when a release counts as a choice. */
     var onCommit: ((Item) -> Unit)? = null
     /** Trace hook, so the owner can log without this depending on anything. */
@@ -77,9 +94,10 @@ class DropdownControl(
         return if (open && p != null) iconRect.union(p) else iconRect
     }
 
-    fun step(x: Float, y: Float, dtMs: Long): Boolean {
+    fun step(x: Float, y: Float, dtMs: Long, still: Boolean = true): Boolean {
         if (items.isEmpty() || iconRect.isEmpty) { close(); return false }
         val at = Pt(x, y)
+        if (dwellMode) return dwellStep(at, still, dtMs)
         return when (val ev = engine.step(at, hitRect(), config())) {
             is SweepEvent.Entered -> {
                 if (ev.side == Side.Left || ev.side == Side.Right) openPane()
@@ -89,6 +107,65 @@ class DropdownControl(
             is SweepEvent.Released -> { release(ev.side); true }
             SweepEvent.Idle -> open
         }
+    }
+
+    /**
+     * Dwell twin of the sweep step above: dwell the whole icon rect to
+     * open, dwell a row to commit, leave to cancel. Returns true while
+     * open or filling (owns the frame, same contract as sweep).
+     */
+    private var dwellFill = 0f
+
+    private fun dwellStep(at: Pt, still: Boolean, dtMs: Long): Boolean {
+        if (!open) {
+            if (!iconRect.contains(at)) {
+                if (dwellFill > 0f) onTrace?.invoke("dwell exit reset")
+                dwellFill = 0f
+                dwellProgress = 0f
+                return false
+            }
+            if (still) dwellFill = minOf(1f, dwellFill + dtMs.toFloat() / dwellMs.coerceAtLeast(1L))
+            else dwellFill = maxOf(0f, dwellFill - dtMs / 600f)
+            dwellProgress = dwellFill
+            if (dwellFill >= 1f) {
+                dwellFill = 0f
+                openPane()
+            }
+            return dwellFill > 0f || open
+        }
+        // Open: cursor tracks free (arrows scroll on hover, as in sweep).
+        val before = cursor
+        move(at, dtMs)
+        if (cursor != before) dwellFill = 0f
+        val p = pane
+        // The icon rect is home base: resting on it after opening holds the
+        // pane with no progress either way. Only leaving BOTH icon and pane
+        // (past the leeway) cancels - the pane hangs a gap below the icon,
+        // so testing the pane alone cancelled on the opening frame itself
+        // and the list flashed up and vanished.
+        if (p == null || (!p.contains(at, leeway) && !iconRect.contains(at, leeway))) {
+            dwellProgress = 0f
+            onTrace?.invoke("dwell cancel")
+            close()
+            return true
+        }
+        // On the icon, an arrow, or between rows: hold, no progress.
+        if (!p.contains(at) || arrow != 0 || cursor !in items.indices) {
+            dwellFill = 0f
+            dwellProgress = 0f
+            return true
+        }
+        if (still) dwellFill = minOf(1f, dwellFill + dtMs.toFloat() / dwellMs.coerceAtLeast(1L))
+        else dwellFill = maxOf(0f, dwellFill - dtMs / 600f)
+        dwellProgress = dwellFill
+        if (dwellFill >= 1f) {
+            val pick = items[cursor]
+            onTrace?.invoke("dwell commit cursor=$cursor ${pick.value}")
+            close()
+            dwellProgress = 0f
+            onCommit?.invoke(pick)
+        }
+        return true
     }
 
     /** Recompute and expose the visible window for the renderer. */
@@ -194,6 +271,8 @@ class DropdownControl(
         scroll = 0
         arrow = 0
         reached = false
+        dwellFill = 0f
+        dwellProgress = 0f
         engine.reset()
     }
 }

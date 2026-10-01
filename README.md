@@ -1,20 +1,17 @@
 # SweepVR
 
-Native Cardboard VR web browser and video player for Android using sweep controls
+Native Cardboard VR environment for Android. A proof-of-concept app exploring
+the practicality of using head sweep actions instead of reticle dwell actions.
+It implements a basic web browser, keyboard, file manager and video player, with
+support for SMB browsing and streaming.
 
-- In-headset SMB (SMB2/3) direct streaming.
-- Phone + Cardboard stereo rendering
-- Browse servers, folders, and files without leaving VR
-- Projections: Flat 2D/imax, SBS/TB, 180/220/270/360 domes, fisheye
+Sweep actions are determined by where you enter and leave a control, rather than
+by dwelling on it. Entry points on sweep controls are marked with indentations.
+In most cases, the sweep exits perpendicular to the entry point, although this
+varies slightly between control types.
 
-This is a work in progress. The web browser is not fully functional.
-
-Sweep controls are faster and more natural than reticle dwell-to-trigger type
-controls. Sweep control activation and actions are determined by where on the
-control you enter and leave and do not require dwelling on the control. Entry
-locations on a control are marked with indentations, and usually the exit
-direction is perpendicular to that, but this varies slightly with different
-control types.
+More details on using sweep are available in the web browser,
+or [here](https://scratchingmyhead.github.io/SweepVR/).
 
 ## Download
 
@@ -24,7 +21,7 @@ All releases: [releases page](https://github.com/ScratchingMyHead/SweepVR/releas
 
 ## Sensors
 
-Head tracking needs a gyroscope (same as Cardboard itself).
+Requires a gyroscope (same as Cardboard itself).
 
 ## Build
 

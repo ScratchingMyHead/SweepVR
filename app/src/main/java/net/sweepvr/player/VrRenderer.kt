@@ -1368,8 +1368,12 @@ void main(){
         // pinned to 0: the reticle would otherwise shrink as if arming, which
         // reads as a broken affordance rather than a cursor.
         val bookGaze = panelGaze && webBookIconRow >= 0 && bookActive
-        val prog = if (bookGaze) 0f else if (screenSweep) screenSweepProg() else
-            if (panelGaze) browserDwellProg() else
+        // Dwell fills shrink the reticle (icon fill before open, row fill
+        // after); sweep keeps the pinned 0 while the flyout owns the gaze.
+        val flyoutProg =
+            if (panelGaze && webBookIconRow >= 0 && !sweepEnabled) bookControl.dwellProgress else 0f
+        val prog = if (bookGaze && sweepEnabled) 0f else if (screenSweep) screenSweepProg() else
+            if (panelGaze) maxOf(browserDwellProg(), flyoutProg) else
             if (cur == Mode.WEB) maxOf(webDwellProg(), toolbarDwellProg) else
             if (cur == Mode.BROWSER) browserDwellProg() else menuDwellProg()
         // The reticle is ALWAYS up in web mode: the page is the pointer.
@@ -1675,7 +1679,7 @@ void main(){
      * things that genuinely need a Canvas: the label measurement that sets
      * the pane width, and the tracing.
      */
-    private fun bookFlyout(bx: Float, by: Float, onPanel: Boolean, dtMs: Long): Boolean {
+    private fun bookFlyout(bx: Float, by: Float, onPanel: Boolean, dtMs: Long, still: Boolean = true): Boolean {
         val icon = bookIconRect()
         if (icon[2] <= icon[0]) return false
         val c = bookControl
@@ -1703,7 +1707,9 @@ void main(){
         bookScroll = c.scroll
         bookArrow = c.arrow
         bookActive = c.open
-        return c.step(bx, by, dtMs).also { bookOpen = c.open; bookActive = c.open }
+        c.dwellMode = !sweepEnabled
+        c.dwellMs = dwellMs
+        return c.step(bx, by, dtMs, still).also { bookOpen = c.open; bookActive = c.open }
     }
 
     /**
@@ -1821,7 +1827,7 @@ void main(){
                 alongUp >= hh - 2 * hhc && alongUp <= hh
             if (webBookIconRow >= 0) {
                 // The flyout owns the frame while it is up, on or off panel.
-                if (bookFlyout(bxAll, byAll, onPanelRect, dtMs)) return
+                if (bookFlyout(bxAll, byAll, onPanelRect, dtMs, still)) return
                 // The icon owns its own rect even when the flyout does not
                 // engage: on the open web panel it overlaps live rows, so a
                 // rest on it - or a refused top/bottom approach - must go
@@ -3751,11 +3757,21 @@ void main(){
         tbBack.reset(); tbFwd.reset(); tbReload.reset()
         tbHome.reset(); tbMenu.reset()
         zoomOutCtl.reset(); zoomInCtl.reset()
-        bookBarCtl.close()
-        bookBarOpen = false
         toolbarAddrFocused =
             u >= TB_ADDR_U0 && u <= TB_ADDR_U1 && v >= TB_V0 && v <= TB_V1
         val y = 1f - v
+        // Bar-space bookmarks pane, second dwell (first is the panel icon):
+        // dwell the slot opens it, dwell a row commits. Same ownership rule
+        // as sweep: an open pane owns the frame outright.
+        cfgBookBar()
+        bookBarCtl.dwellMode = true
+        bookBarCtl.dwellMs = dwellMs
+        bookBarCtl.step(u, y, dtMs, still)
+        bookBarOpen = bookBarCtl.open
+        if (bookBarOpen) {
+            toolbarDwellProg = bookBarCtl.dwellProgress
+            return true
+        }
         fun cfgDwell(c: net.sweepvr.player.sweep.DwellButton,
                      u0: Float, u1: Float, tag: String, fire: () -> Unit): Float {
             c.rect = net.sweepvr.player.sweep.Rect(u0, TB_Y0, u1, TB_Y1)
@@ -3777,6 +3793,8 @@ void main(){
         prog = maxOf(prog, cfgDwell(dwMenu, 1f - TB_BTN, 1f, "menu") { onWebEvent(WebEvent.OpenMenu) })
         prog = maxOf(prog, cfgDwell(dwZoomOut, 1f - TB_BTN * 3, 1f - TB_BTN * 2, "zoomout") { onWebEvent(WebEvent.TextZoom(-1)) })
         prog = maxOf(prog, cfgDwell(dwZoomIn, 1f - TB_BTN * 2, 1f - TB_BTN, "zoomin") { onWebEvent(WebEvent.TextZoom(1)) })
+        // Icon fill counts too, so the reticle shrinks while opening.
+        prog = maxOf(prog, bookBarCtl.dwellProgress)
         toolbarDwellProg = prog
         return prog > 0f
     }
@@ -4682,16 +4700,23 @@ void main(){
      *  with triangular dips cut into the left and right edges pointing
      *  inward. The dips ARE the instruction - they mark the edges you are
      *  meant to arrive from - so it reads without a label, and it is
-     *  reusable for any future hover control. */
+     *  reusable for any future hover control. With sweep disabled the dips
+     *  are not drawn (plain rounded square, same rect). */
     private fun drawSideEntryButton(c: Canvas, p: Paint, x0: Float, y0: Float, hot: Boolean) {
         val b = BOOK_BTN
-        c.drawPath(sideEntryPath(x0, y0, b), p.apply {
-            color = if (hot) Color.rgb(30, 58, 95) else Color.rgb(21, 32, 45)
-        })
+        if (sweepEnabled) {
+            c.drawPath(sideEntryPath(x0, y0, b), p.apply {
+                color = if (hot) Color.rgb(30, 58, 95) else Color.rgb(21, 32, 45)
+            })
+        } else {
+            p.color = if (hot) Color.rgb(30, 58, 95) else Color.rgb(21, 32, 45)
+            c.drawRoundRect(x0, y0, x0 + b, y0 + b, BOOK_BTN_R, BOOK_BTN_R, p)
+        }
         p.style = Paint.Style.STROKE
         p.strokeWidth = 2f
         p.color = if (hot) Color.rgb(8, 145, 178) else Color.rgb(71, 85, 105)
-        c.drawPath(sideEntryPath(x0, y0, b), p)
+        if (sweepEnabled) c.drawPath(sideEntryPath(x0, y0, b), p)
+        else c.drawRoundRect(x0, y0, x0 + b, y0 + b, BOOK_BTN_R, BOOK_BTN_R, p)
         p.style = Paint.Style.FILL
         drawBookmarksGlyph(c, p, x0 + b * 0.5f, y0 + b * 0.5f, if (hot) Color.WHITE else Color.rgb(203, 213, 225))
     }
@@ -4758,7 +4783,8 @@ void main(){
     private fun drawBookFlyout(c: Canvas, p: Paint, rows: List<BrowserRow>) {
         val icon = bookIconRect()
         if (icon[2] > icon[0]) {
-            drawSideEntryButton(c, p, icon[0], icon[1], bookActive)
+            drawSideEntryButton(c, p, icon[0], icon[1],
+                bookActive || bookControl.dwellProgress > 0f)
         }
         if (!bookOpen) return
         // Read the pane from the control, not from a second layout pass: the
