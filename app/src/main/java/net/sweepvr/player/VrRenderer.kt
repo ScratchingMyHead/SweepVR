@@ -709,9 +709,13 @@ class VrRenderer(
         const val MENU_MARGIN_DEG = 6.7f
         /** Reticle diameter angle (rad): world half-size = sin(0.03)·R. */
         private const val RETICLE_ANG = 0.03f
-        /** Gaze tooltip pill, half-extents at panel depth (design units). */
-        const val TIP_HALF_W = 1.28f
-        const val TIP_HALF_H = 0.24f
+        /** Gaze tooltip pill, half-extents at panel depth (design units) —
+         *  aspect-matched to the 512×96 texture, small enough to float over
+         *  a button without burying the row behind it. */
+        const val TIP_HALF_W = 0.96f
+        const val TIP_HALF_H = 0.18f
+        /** Clear air between a control's top-right corner and the pill's. */
+        const val TIP_GAP = 0.1f
         /** Toast pill at panel depth (design units), aspect-matched to the
          *  512×112 texture; ~62%×14% of the view, like the old NDC quad. */
         const val TOAST_HALF_W = 4.3f
@@ -1542,17 +1546,77 @@ void main(){
     }
 
 
-    /** Gaze tooltip pill, just under the reticle. Half-extents and offset
-     *  are design units × menuScale() so the pill keeps its apparent size
-     *  at every panel distance (same rule as the menu rect). */
+    /** The pill's centre in PANEL design space when it is anchored to a
+     *  control (above and to the right of it); otherwise the old head-locked
+     *  spot under the reticle. Set with the text, read by the draw. */
+    private var tipAnchored = false
+    private var tipU = 0f
+    private var tipV = 0f
+
+    /** Gaze tooltip pill. A button's pill floats in the panel's own plane,
+     *  just above and to the right of the control being held, so it sits
+     *  WITH the control instead of riding the gaze — looking at the control
+     *  and finding the pill somewhere else below it is the whole complaint.
+     *  The seek bar keeps the head-locked spot under the reticle: it stands
+     *  in for the time readout there and has to follow the scrub point.
+     *  Half-extents are design units × menuScale(), so the pill keeps its
+     *  apparent size at every panel distance (same rule as the menu rect). */
     private fun drawTooltip() {
         maybeUploadTooltip()
         if (!tooltipVisible) return
         val k = menuScale()
+        if (tipAnchored) {
+            panelQuad(tipU - TIP_HALF_W, tipV - TIP_HALF_H,
+                      tipU + TIP_HALF_W, tipV + TIP_HALF_H)
+            drawQuadTex(tipTexId, ovM, menuAlpha)
+            return
+        }
         putQuad(ptrVerts, ptrTex, -TIP_HALF_W * k, -TIP_HALF_H * k, TIP_HALF_W * k, TIP_HALF_H * k)
         headLockedAt(tmpA, 0f, -1.0f * k, -panelDistM)
         Matrix.multiplyMM(mvpM, 0, ovM, 0, tmpB, 0)
         drawQuadTex(tipTexId, mvpM, menuAlpha)
+    }
+
+    /** One vertex of a design-space rect into ptrVerts: the panel's own
+     *  centre + (right·u + up·v)·menuScale(). The panel's right axis is
+     *  (1,0,0), so its contribution is just u·k. Member (not local) so the
+     *  per-frame path allocates nothing. Vertex and texel order match
+     *  [putQuad]. */
+    private fun panelVert(u: Float, v: Float, cy: Float, cz: Float,
+                          uy: Float, uz: Float, k: Float) {
+        ptrVerts.put(u * k)
+        ptrVerts.put(cy + uy * v * k)
+        ptrVerts.put(cz + uz * v * k)
+    }
+
+    /** Fill ptrVerts/ptrTex with the design-space rect [u0,u1]×[v0,v1]
+     *  lying in the panel's plane — the same centre/normal/up the menu grid
+     *  is built from in drawMenuPanel — so the quad shares the panel's
+     *  orientation exactly. */
+    private fun panelQuad(u0: Float, v0: Float, u1: Float, v1: Float) {
+        val d = panelDistM
+        val el = Math.toRadians(menuElevCurrent().toDouble()).toFloat()
+        val k = menuScale()
+        val cx = 0f
+        val cy = kotlin.math.sin(el) * d
+        val cz = -kotlin.math.cos(el) * d
+        var nx = -cx; var ny = -cy; var nz = -cz
+        val nl = kotlin.math.sqrt(nx * nx + ny * ny + nz * nz).coerceAtLeast(1e-6f)
+        ny /= nl; nz /= nl
+        // up = n × (1,0,0) = (0, nz, -ny)
+        val uy = nz; val uz = -ny
+        ptrVerts.clear()
+        panelVert(u0, v1, cy, cz, uy, uz, k)   // top-left
+        panelVert(u0, v0, cy, cz, uy, uz, k)   // bottom-left
+        panelVert(u1, v1, cy, cz, uy, uz, k)   // top-right
+        panelVert(u1, v0, cy, cz, uy, uz, k)   // bottom-right
+        ptrVerts.position(0)
+        ptrTex.clear()
+        ptrTex.put(0f); ptrTex.put(0f)
+        ptrTex.put(0f); ptrTex.put(1f)
+        ptrTex.put(1f); ptrTex.put(0f)
+        ptrTex.put(1f); ptrTex.put(1f)
+        ptrTex.position(0)
     }
 
     /** 512×96 pill bearing the current tooltip text; re-uploaded only when
@@ -1572,9 +1636,9 @@ void main(){
         p.style = Paint.Style.STROKE; p.strokeWidth = 3f
         c.drawRoundRect(2f, 2f, (W - 2).toFloat(), (H - 2).toFloat(), 20f, 20f, p)
         p.style = Paint.Style.FILL
-        p.color = Color.WHITE; p.textSize = 44f; p.textAlign = Paint.Align.CENTER
+        p.color = Color.WHITE; p.textSize = 56f; p.textAlign = Paint.Align.CENTER
         val t = txt.take(28)
-        var ts = 44f
+        var ts = 56f
         while (ts > 16f && p.measureText(t) > W - 40f) { ts -= 2f; p.textSize = ts }
         c.drawText(t, W / 2f, H / 2f + ts * 0.35f, p)
         p.textAlign = Paint.Align.LEFT
@@ -2483,6 +2547,7 @@ void main(){
         .filter { it.id in SWEEP_MENU_IDS }
         .map { SweepMenuBtn(it) }
     private fun sweepBtn(id: Int) = sweepBtns.firstOrNull { it.id == id }
+    private fun menuButton(id: Int) = menuButtons.firstOrNull { it.id == id }
 
     private fun resetSweeps() {
         for (s in sweepBtns) {
@@ -2719,8 +2784,21 @@ void main(){
             id in MENU_NAMES.indices -> MENU_NAMES[id]
             else -> ""
         }
+        val prev = tooltipText
         tooltipText = txt
         tooltipVisible = txt.isNotEmpty()
+        if (txt != prev) FileLog.i("SweepVR-menu", "tip '${txt}' id=$id")
+        if (!tooltipVisible) return
+        // Float just above and to the right of the control: the pill's
+        // bottom-left corner clears the control's top-right corner. Fixed
+        // relative to the control, so it never slides around while the
+        // gaze creeps across the button. id -1 (seek bar) stays head-locked.
+        val b = if (id == -1) null else menuButton(id)
+        tipAnchored = b != null
+        if (b != null) {
+            tipU = b.x + b.hw + TIP_GAP + TIP_HALF_W
+            tipV = b.y + b.hh + TIP_GAP + TIP_HALF_H
+        }
     }
 
     // ---------- drawing ----------
