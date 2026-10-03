@@ -3,10 +3,10 @@
     xmlns:app="http://schemas.android.com/apk/res-auto">
     <item android:id="@+id/action_web"
         android:title="@string/enter_web"
-        android:icon="@drawable/ic_browser"
+        android:icon="@drawable/ic_toolbar_web"
         app:showAsAction="always" />
     <item android:id="@+id/action_vr"
         android:title="@string/enter_vr"
-        android:icon="@drawable/ic_folder"
+        android:icon="@drawable/ic_toolbar_files"
         app:showAsAction="always" />
 </menu>
