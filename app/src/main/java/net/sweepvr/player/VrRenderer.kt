@@ -449,8 +449,9 @@ class VrRenderer(
 
     private var progOes = 0; private var prog2d = 0; private var progWeb = 0
     /** Method-doc video program (§§3-7): homogeneous texcoords, projective
-     *  divide + vertical crop in-shader, stereo halves in texcoord buffers,
-     *  zoom in the zoomPan matrix. Replaces the old per-eye-half shader. */
+     *  divide in-shader (vertical crop uploads 0), stereo halves in
+     *  texcoord buffers, zoom as a Z translate in the zoomPan matrix.
+     *  Replaces the old per-eye-half shader. */
     private var progVideo = 0
     private var aPositionVid = 0; private var aTexCoordVid = 0
     private var uMvpVid = 0; private var uVideoTexVid = 0; private var uCropVid = 0
@@ -798,9 +799,12 @@ void main(){
         // highp UVs when available: mediump quantizes texture coordinates
         // to ~1024 steps, i.e. 8-texel blocks on 8K video ("lego").
         // Video program (method doc §§3-7): homogeneous texcoords with the
-        // projective divide in-shader (§6.3), symmetric vertical crop (§7.2).
-        // Stereo halves live in texcoord buffers (§6.1), zoom in the zoomPan
-        // matrix (§7.2) - the fragment shader selects nothing per eye.
+        // projective divide in-shader (§6.3). Stereo halves live in texcoord
+        // buffers (§6.1) - the fragment shader selects nothing per eye.
+        // Zoom is a model-space Z translate in the zoomPan matrix, so on
+        // this shader u_verticalCrop is always 0 (it is kept as a uniform
+        // only so the fisheye path can share the crop plumbing, and the
+        // fisheye shader never reads it).
         private const val VERT_VIDEO = """
 attribute vec4 a_position;
 attribute vec4 a_texCoord;
@@ -2591,8 +2595,9 @@ void main(){
 
     // ---------- drawing ----------
     /** One video eye, method doc §7.1: one strip, homogeneous texcoords,
-     *  projective divide + crop in-shader, stereo halves in the buffers,
-     *  zoom in the zoomPan matrix. */
+     *  projective divide in-shader (u_verticalCrop uploads 0 for this
+     *  path), stereo halves in the buffers, zoom as a model-space Z
+     *  translate in the zoomPan matrix. */
     private fun drawVideo(eye: Int) {
         val g = videoGeom ?: return
         // Texcoord buffer by layout and eye (§6.1); uEye already accounts
@@ -4412,8 +4417,9 @@ void main(){
      *  > 0, the bent cap whose world size is baked into the mesh, so only
      *  the eye-height lift remains; every other projection = a plain
      *  screen-size scale of the unit sphere. modelM carries screen size
-     *  and nothing else; zoom lives in the zoomPan matrix (§7.2) and is a
-     *  texture-space crop on every path. */
+     *  and nothing else; zoom lives in the zoomPan matrix (§7.2) as a
+     *  model-space Z translate - texture-space only on the fisheye path
+     *  (see buildZoomPan). */
     private fun buildVideoModel() {
         Matrix.setIdentityM(modelM, 0)
         if (effProj() == Projection.FLAT) {
@@ -4440,18 +4446,23 @@ void main(){
         }
     }
 
-    /** Zoom state for the drawing eye: the zoomPan matrix Z (§7.2) plus the
-     *  vertical crop. Z is required to be the identity - zoom changes only
-     *  how much of the video's height is sampled (u_verticalCrop), never
-     *  the geometry. zoomM stays in the multiply chain so that invariant
-     *  is structural, not a comment. */
+    /** Zoom state for the drawing eye. Dome/Flat: zoom is a model-space Z
+     *  translate of (zoom - 1), identity at 1.0, clamped [0, 2], delivered
+     *  through zoomM in the existing multiply chain - texcoords never
+     *  change, so the shader's vertical crop stays 0 and no sample can
+     *  leave the frame (a negative crop used to pull v near 0 and 1
+     *  outside [0,1] and punch a hole/curl at both dome poles). Fisheye:
+     *  no model slide (its fragment derives the sample from the
+     *  model-space view direction, so a slide would not zoom it); its zoom
+     *  is texture-space and is returned here as the crop, consumed as
+     *  uZoomOutFish = 1/(1-crop). */
     private val zoomM = FloatArray(16)
     private fun buildZoomPan(): Float {
         Matrix.setIdentityM(zoomM, 0)
-        // Unclamped crop from a range-limited zoom: crop 1 (fully degenerate
-        // - one texel row) is zoom 6, so the range stops at 5 (5x) with
-        // crop 0.8. The clamp is on the range, never on the crop.
-        return (zoom.coerceIn(0.1f, 5.0f) - 1f) * 0.2f
+        val z = zoom.coerceIn(0f, 2f)
+        if (effProj() == Projection.FISHEYE) return (z - 1f) * 0.2f
+        if (z != 1f) Matrix.translateM(zoomM, 0, 0f, 0f, z - 1f)
+        return 0f
     }
 
     /** Fisheye video path (§8): same mesh/basis/projection/zoom as the
@@ -4467,9 +4478,11 @@ void main(){
         GLES20.glUniform1i(uEyeFish, eye)
         GLES20.glUniformMatrix4fv(uTexMatFish, 1, false, texMat, 0)
         // FRAG_OES_FISH does t = zc + (t - zc)/uZoomOut about the half's
-        // centre, so 1/(1-crop) magnifies about that centre by exactly the
-        // factor the equirect's visible range shrinks - same direction,
-        // same strength. crop <= 0.8 at the 5.0 zoom cap keeps it finite.
+        // centre, so 1/(1-crop) magnifies about that centre. Fisheye's zoom
+        // is texture-space only (no model slide - see buildZoomPan): with
+        // the [0, 2] zoom range |crop| <= 0.2, so the divisor stays in
+        // [0.8, 1.2] and never flips. Zoom-out leaves the half and the
+        // shader's oob check writes black there - expected for fisheye.
         GLES20.glUniform1f(uZoomOutFish, 1f / (1f - crop))
         GLES20.glUniformMatrix4fv(uMvpFish, 1, false, mvpM, 0)
         // Active circle: per-layout defaults (§8: half-image center, radius

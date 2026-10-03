@@ -147,11 +147,10 @@ class SettingsStore(ctx: Context) {
     var panelDistM: Float
         get() = p.getFloat("panel_d", 2.4f).coerceIn(1.2f, 5f)
         set(v) { p.edit().putFloat("panel_d", v).apply() }
-    /** Video scale / zoom number z: drives the vertical crop
-     *  ((z-1)*0.2, capped by the 0.1-6 range so the remap never mirrors).
-     *  Baseline forces 1. */
+    /** Video zoom: model-space Z translate of (z - 1) over [0, 2]
+     *  (identity at 1). Texture-space only for fisheye. Baseline forces 1. */
     var videoZoom: Float
-        get() = p.getFloat("zoom", 1f).coerceIn(0.1f, 5.0f)
+        get() = p.getFloat("zoom", 1f).coerceIn(0f, 2f)
         set(v) { p.edit().putFloat("zoom", v).apply() }
     /** Gaze dwell-to-select in ms. */
     var dwellMs: Long
