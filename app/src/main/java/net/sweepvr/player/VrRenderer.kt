@@ -496,9 +496,6 @@ class VrRenderer(
      *  the image across the seam and shifts the poles per eye. Stereo on
      *  the dome comes solely from the asymmetric per-eye projection). */
     private val headViewNM = FloatArray(16)
-    /** Per-eye render-target size for the zoomPan aspect (§7.2). */
-    private val eyeVpW = IntArray(2)
-    private val eyeVpH = IntArray(2)
     private val ovM = FloatArray(16)
     private val ptrTmp3 = FloatArray(3)
     private val projDomeM = FloatArray(16)
@@ -631,8 +628,6 @@ class VrRenderer(
      *  actual lens pass runs inside the GVR native renderer. */
     @Volatile var lensK1 = 0.34f
     @Volatile var lensK2 = 0.55f
-    /** Master strength for the lens pass (1 = physical, 0 = off). */
-    @Volatile var lensStrength = 1f
     private val mvpM = FloatArray(16)
     private val tmpM = FloatArray(16)
 
@@ -1292,8 +1287,6 @@ void main(){
 
         Matrix.multiplyMM(eyeViewNM, 0, eye.eyeView, 0, basisShiftM, 0)
         Matrix.multiplyMM(headViewNM, 0, headViewM, 0, basisShiftM, 0)
-        eyeVpW[physEye] = eye.viewport.width
-        eyeVpH[physEye] = eye.viewport.height
         if (pinVideo && mode == Mode.VIDEO) {
             if (projection == Projection.FLAT) {
                 // Pinned flat screen keeps only the parallel eye shift:
@@ -2629,7 +2622,7 @@ void main(){
             count = g.domeCount
         }
         buildVideoModel()
-        val crop = buildZoomPan(eye)
+        val crop = buildZoomPan()
         Matrix.multiplyMM(tmpB, 0, modelM, 0, zoomM, 0)
         // Panoramic video rides the FOV-scaled projection; the FLAT screen
         // shares the unscaled one with every panel (§6.3).
@@ -4417,9 +4410,9 @@ void main(){
     /** Model matrix for the video: FLAT = aspect-correct plane of world
      *  width 8.5·screenSize (unit quad scaled, §5) — or, when screenCurve
      *  > 0, the bent cap whose world size is baked into the mesh, so only
-     *  the eye-height lift remains; domes = identity (unit sphere at the
-     *  origin — zoom lives in the zoomPan matrix, §7.2, never in a model
-     *  slide). */
+     *  the eye-height lift remains; domes = unit sphere at the origin plus
+     *  the screenSize ride below. Zoom lives in the zoomPan matrix (§7.2),
+     *  never in a model slide. */
     private fun buildVideoModel() {
         Matrix.setIdentityM(modelM, 0)
         if (effProj() == Projection.FLAT) {
@@ -4431,24 +4424,36 @@ void main(){
                 Matrix.translateM(modelM, 0, 0f, 0.25f, -FLAT_DIST)
                 Matrix.scaleM(modelM, 0, w / 2f, h / 2f, 1f)
             }
+        } else {
+            // screenSize on the dome: ride the unit sphere toward the viewer
+            // by (size − 1), so 1.0 is exactly identity and changes are
+            // monotonic. A viewer-centred sphere answers a Z ride
+            // differently from a distant plane, so the range feel is
+            // confirmed by eye (screenshot comparison in testing).
+            //
+            // Fisheye keeps the old model slide for zoom: its fragment
+            // shader has no vertical-crop uniform, so without the slide its
+            // zoom controls would go dead. (Zoom is crop-only everywhere
+            // else.)
+            if (effProj() == Projection.FISHEYE) {
+                Matrix.translateM(modelM, 0, 0f, 0f, zoom.coerceIn(0.1f, 6.0f) - 1f)
+            } else {
+                Matrix.translateM(modelM, 0, 0f, 0f, screenSize.coerceIn(0.5f, 10f) - 1f)
+            }
         }
     }
 
-    /** Zoom/pan matrix Z (§7.2) for the drawing eye, plus the vertical crop.
-     *  The scale is deliberately anisotropic (z stays 1): on a viewer-centred
-     *  sphere a uniform scale would change nothing, and the anisotropy is
-     *  what narrows the apparent field of view. Aspect is the single eye's
-     *  render-target aspect. No pan UI exists, so pan stays zero. */
+    /** Zoom state for the drawing eye: the zoomPan matrix Z (§7.2) plus the
+     *  vertical crop. Z is required to be the identity - zoom changes only
+     *  how much of the video's height is sampled (u_verticalCrop), never
+     *  the geometry. zoomM stays in the multiply chain so that invariant
+     *  is structural, not a comment. */
     private val zoomM = FloatArray(16)
-    private fun buildZoomPan(eye: Int): Float {
-        val aspect = (eyeVpW[eye].toFloat() / eyeVpH[eye].coerceAtLeast(1).toFloat())
-            .coerceIn(0.25f, 4f)
-        val z = zoom.coerceIn(0.1f, 20f)
+    private fun buildZoomPan(): Float {
         Matrix.setIdentityM(zoomM, 0)
-        Matrix.scaleM(zoomM, 0, z, z / aspect, 1f)
-        // Symmetric vertical crop about mid-frame (§7.2). Clamped above:
-        // past 1 the remap mirrors instead of narrowing.
-        return minOf(0.9f, (z - 1f) * 0.2f)
+        // Unclamped crop from a range-limited zoom: mirroring starts past
+        // crop 1 (zoom 6), so the range ends there instead of clamping.
+        return (zoom.coerceIn(0.1f, 6.0f) - 1f) * 0.2f
     }
 
     /** Fisheye video path (§8): same mesh/basis/projection/zoom as the

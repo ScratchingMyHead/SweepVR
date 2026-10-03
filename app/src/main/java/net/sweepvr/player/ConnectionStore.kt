@@ -104,6 +104,15 @@ class SettingsStore(ctx: Context) {
     var screenSize: Float
         get() = p.getFloat("screen_size", 1f).coerceIn(0.5f, 10f)
         set(v) { p.edit().putFloat("screen_size", v).apply() }
+    /** Viewer screen-to-lens distance, mm (SDK default 39). The aperture
+     *  control: smaller value → wider aperture. */
+    var screenToLensDistance: Float
+        get() = p.getFloat("screen_to_lens", 39f).coerceIn(25f, 60f)
+        set(v) { p.edit().putFloat("screen_to_lens", v).apply() }
+    /** Viewer vertical distance to lens centre, mm (SDK default 35). */
+    var verticalDistanceToLensCenter: Float
+        get() = p.getFloat("lens_vertical", 35f).coerceIn(20f, 50f)
+        set(v) { p.edit().putFloat("lens_vertical", v).apply() }
     /** Browser text zoom, percent. 100 = the browser default; independent
      *  of screenSize (our zoom) and of the display density. */
     var textZoom: Int
@@ -138,11 +147,11 @@ class SettingsStore(ctx: Context) {
     var panelDistM: Float
         get() = p.getFloat("panel_d", 2.4f).coerceIn(1.2f, 5f)
         set(v) { p.edit().putFloat("panel_d", v).apply() }
-    /** Video scale / zoom number z: domes slide the sphere toward the viewer
-     *  (§5), the FLAT quad minifies its texture window. Range 0.1-20
-     *  both directions; baseline forces 1. */
+    /** Video scale / zoom number z: drives the vertical crop
+     *  ((z-1)*0.2, capped by the 0.1-6 range so the remap never mirrors).
+     *  Baseline forces 1. */
     var videoZoom: Float
-        get() = p.getFloat("zoom", 1f).coerceIn(0.1f, 20f)
+        get() = p.getFloat("zoom", 1f).coerceIn(0.1f, 6.0f)
         set(v) { p.edit().putFloat("zoom", v).apply() }
     /** Gaze dwell-to-select in ms. */
     var dwellMs: Long
@@ -193,12 +202,6 @@ class SettingsStore(ctx: Context) {
     var lensK2: Float
         get() = p.getFloat("lens_k2", 0.55f).coerceIn(0f, 1f)
         set(v) { p.edit().putFloat("lens_k2", v).apply() }
-    /** Master strength for the whole pre-warp (1 = physical, 0 = off).
-     *  Absorbs viewer profile error, eye-to-screen error and xdpi skew
-     *  in one knob: f = 1 + S*(K1*r^2 + K2*r^4). */
-    var lensStrength: Float
-        get() = p.getFloat("lens_strength", 1f).coerceIn(0f, 3f)
-        set(v) { p.edit().putFloat("lens_strength", v).apply() }
     /** Fisheye circle radius multiplier (1 = spec default: quarter frame
      *  width). Calibration per camera rig. */
     var fisheyeRadius: Float

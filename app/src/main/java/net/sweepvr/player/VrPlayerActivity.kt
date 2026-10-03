@@ -575,7 +575,6 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.testSweep = settings.testSweep
         renderer.lensK1 = settings.lensK1
         renderer.lensK2 = settings.lensK2
-        renderer.lensStrength = settings.lensStrength
         renderer.fisheyeRadiusScale = settings.fisheyeRadius
         renderer.fisheyeMirrorR = settings.fisheyeMirrorR
         renderer.menuAngleUp = settings.menuAngleUp
@@ -603,13 +602,15 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             g.setDistortionCorrectionEnabled(!settings.disableDist)
             val vp = g.gvrViewerParams
             vp.interLensDistance = renderer.ipdM
-            vp.distortion.setCoefficients(floatArrayOf(
-                settings.lensK1 * settings.lensStrength,
-                settings.lensK2 * settings.lensStrength
-            ))
+            // Distortion coefficients apply raw: no multiplier. A multiplier
+            // shrinks the render radius (image stops short of the lens rim).
+            vp.distortion.setCoefficients(floatArrayOf(settings.lensK1, settings.lensK2))
+            vp.setScreenToLensDistance(settings.screenToLensDistance / 1000f)
+            vp.setVerticalDistanceToLensCenter(settings.verticalDistanceToLensCenter / 1000f)
             g.updateGvrViewerParams(vp)
             FileLog.i(TAG, "syncGvr ipd=${renderer.ipdM} dist=${!settings.disableDist} " +
-                "k=(${settings.lensK1 * settings.lensStrength},${settings.lensK2 * settings.lensStrength}) " +
+                "k=(${settings.lensK1},${settings.lensK2}) " +
+                "stl=${settings.screenToLensDistance} vlc=${settings.verticalDistanceToLensCenter} " +
                 "neck=${renderer.projection == Projection.FLAT}")
         }.onFailure { FileLog.i(TAG, "syncGvr failed: $it") }
     }
@@ -1103,11 +1104,11 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
 
             slide("FOV scale", "${String.format("%.2f", settings.fovScale)}×", "fov", 0.5f, 1.5f, settings.fovScale,
                 VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
-            slide("Screen size (Flat only)", "${String.format("%.2f", settings.screenSize)}×", "screensize", 0.5f, 10f, settings.screenSize,
+            slide("Screen size", "${String.format("%.2f", settings.screenSize)}×", "screensize", 0.5f, 10f, settings.screenSize,
                 VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.25f)),
             slide("Screen curve (Flat only)", "${(settings.screenCurve * 100).toInt()}%", "curve", 0f, 1f, settings.screenCurve,
                 VrRenderer.SlideFormat("%", 0, 100f, 0f, 0.05f)),
-            slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.1f, 20f, settings.videoZoom,
+            slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.1f, 6f, settings.videoZoom,
                 VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
             Row("", "", VrRenderer.BrowserRow.FILE, dead = true),
             slide("Eye separation", "${settings.ipdMm.toInt()} mm", "ipd", 40f, 80f, settings.ipdMm,
@@ -1140,8 +1141,10 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             VrRenderer.SlideFormat("", 2, 1f, 0f, 0.01f))
         r += slide("Lens k2", String.format("%.2f", settings.lensK2), "lensK2", 0f, 1f, settings.lensK2,
             VrRenderer.SlideFormat("", 2, 1f, 0f, 0.01f))
-        r += slide("Lens strength", String.format("%.2f×", settings.lensStrength), "lensStrength", 0f, 3f, settings.lensStrength,
-            VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f))
+        r += slide("Screen to lens", "${settings.screenToLensDistance.toInt()} mm", "screenToLens", 25f, 60f, settings.screenToLensDistance,
+            VrRenderer.SlideFormat(" mm", 0, 1f, 0f, 1f))
+        r += slide("Lens centre height", "${settings.verticalDistanceToLensCenter.toInt()} mm", "lensVertical", 20f, 50f, settings.verticalDistanceToLensCenter,
+            VrRenderer.SlideFormat(" mm", 0, 1f, 0f, 1f))
         // Combined preview of the averaged transform (not actionable).
         val avg = averagedShapeOffsets()
         if (avg != null) {
@@ -2519,14 +2522,15 @@ try {
             "fov" -> settings.fovScale = ((0.5f + f * 1f) * 20f).roundToInt() / 20f
             "screensize" -> settings.screenSize = ((0.5f + f * 9.5f) * 4f).roundToInt() / 4f
             "curve" -> settings.screenCurve = ((f * 20f).roundToInt() / 20f).coerceIn(0f, 1f)
-            "zoom" -> settings.videoZoom = ((0.1f + f * 19.9f) * 20f).roundToInt() / 20f
+            "zoom" -> settings.videoZoom = ((0.1f + f * 5.9f) * 20f).roundToInt() / 20f
             "ipd" -> settings.ipdMm = (40f + f * 40f).roundToInt().toFloat().coerceIn(40f, 80f)
             "convtrim" -> settings.convTrim = (((f * 0.3f - 0.15f) / 0.005f).roundToInt() * 0.005f).coerceIn(-0.15f, 0.15f)
             "panel" -> settings.panelDistM = ((1.2f + f * 3.8f) * 10f).roundToInt() / 10f
             "lensK1" -> settings.lensK1 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
             "lensK2" -> settings.lensK2 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
             "fishR" -> settings.fisheyeRadius = ((0.5f + f * 1f) * 100f).roundToInt() / 100f
-            "lensStrength" -> settings.lensStrength = ((f * 3f * 20f).roundToInt() / 20f).coerceIn(0f, 3f)
+            "screenToLens" -> settings.screenToLensDistance = (25f + f * 35f).roundToInt().toFloat().coerceIn(25f, 60f)
+            "lensVertical" -> settings.verticalDistanceToLensCenter = (20f + f * 30f).roundToInt().toFloat().coerceIn(20f, 50f)
 
             "dwell" -> settings.dwellMs = ((400f + f * 3600f) / 100f).roundToInt() * 100L
             else -> {
@@ -2665,14 +2669,15 @@ try {
                     "screensize" -> settings.screenSize = (settings.screenSize + dir * 0.25f).coerceIn(0.5f, 10f)
                     "curve" -> settings.screenCurve = (settings.screenCurve + dir * 0.05f).coerceIn(0f, 1f)
                     "ipd" -> settings.ipdMm = (settings.ipdMm + dir * 1f).coerceIn(40f, 80f)
-                    "zoom" -> settings.videoZoom = (settings.videoZoom * if (dir > 0) 1.25f else 0.8f).coerceIn(0.1f, 20f)
+                    "zoom" -> settings.videoZoom = (settings.videoZoom * if (dir > 0) 1.25f else 0.8f).coerceIn(0.1f, 6.0f)
                     "convtrim" -> settings.convTrim = (settings.convTrim + dir * 0.005f).coerceIn(-0.15f, 0.15f)
 
                     "panel" -> settings.panelDistM = (settings.panelDistM + dir * 0.2f).coerceIn(1.2f, 5f)
                     "lensK1" -> settings.lensK1 = (settings.lensK1 + dir * 0.02f).coerceIn(0f, 1f)
                     "lensK2" -> settings.lensK2 = (settings.lensK2 + dir * 0.02f).coerceIn(0f, 1f)
                     "fishR" -> settings.fisheyeRadius = (settings.fisheyeRadius + dir * 0.01f).coerceIn(0.5f, 1.5f)
-                    "lensStrength" -> settings.lensStrength = (settings.lensStrength + dir * 0.1f).coerceIn(0f, 3f)
+                    "screenToLens" -> settings.screenToLensDistance = (settings.screenToLensDistance + dir * 1f).coerceIn(25f, 60f)
+                    "lensVertical" -> settings.verticalDistanceToLensCenter = (settings.verticalDistanceToLensCenter + dir * 1f).coerceIn(20f, 50f)
                     "dwell" -> settings.dwellMs = (settings.dwellMs + dir * 250).coerceIn(400L, 4000L)
                     else -> {
                         if (key.startsWith("shapeWeight-")) {
@@ -2824,7 +2829,7 @@ try {
         val z = settings.videoZoom
         val t = if (dir > 0) (z + zoomOff) * zoomK - zoomOff
                 else (z + zoomOff) / zoomK - zoomOff
-        val target = t.coerceIn(0.1f, 20f)
+        val target = t.coerceIn(0.1f, 6.0f)
         if (Math.abs(target - z) < 1e-4f) {
             renderer.flashMenu(if (dir > 0) "Zoom max" else "Zoom min")
             return

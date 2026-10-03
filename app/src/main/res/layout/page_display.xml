@@ -109,13 +109,22 @@
         android:valueFrom="0" android:valueTo="1" android:stepSize="0.01"
         app:labelBehavior="floating" />
 
-    <TextView android:id="@+id/lblLensStrength" android:text="Lens strength"
+    <TextView android:id="@+id/lblScreenToLens" android:text="Screen to lens distance"
         android:textAppearance="?attr/textAppearanceTitleSmall"
         android:layout_width="wrap_content" android:layout_height="wrap_content"
         android:paddingTop="12dp" />
-    <com.google.android.material.slider.Slider android:id="@+id/sliderLensStrength"
+    <com.google.android.material.slider.Slider android:id="@+id/sliderScreenToLens"
         android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:valueFrom="0" android:valueTo="3" android:stepSize="0.05"
+        android:valueFrom="25" android:valueTo="60" android:stepSize="1"
+        app:labelBehavior="floating" />
+
+    <TextView android:id="@+id/lblLensVertical" android:text="Lens centre height"
+        android:textAppearance="?attr/textAppearanceTitleSmall"
+        android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:paddingTop="12dp" />
+    <com.google.android.material.slider.Slider android:id="@+id/sliderLensVertical"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:valueFrom="20" android:valueTo="50" android:stepSize="1"
         app:labelBehavior="floating" />
 
     <TextView android:id="@+id/lblMenuAngleUp" android:text="Play-menu look-up angle"
@@ -181,7 +190,7 @@
         android:layout_width="wrap_content" android:layout_height="wrap_content" />
     <com.google.android.material.slider.Slider android:id="@+id/sliderZoom"
         android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:valueFrom="0.1" android:valueTo="20" android:stepSize="0.05"
+        android:valueFrom="0.1" android:valueTo="6" android:stepSize="0.05"
         app:labelBehavior="floating" />
 
     <TextView android:id="@+id/lblSkip" android:text="Skip forward/back (seconds)"

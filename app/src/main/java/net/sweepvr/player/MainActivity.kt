@@ -900,14 +900,15 @@ class MainActivity : AppCompatActivity() {
             }
         }
         bindSlider(v, R.id.sliderFov, R.id.lblFov, settings.fovScale, "FOV scale", "×") { settings.fovScale = it }
-        bindSlider(v, R.id.sliderScreenSize, R.id.lblScreenSize, settings.screenSize, "Screen size (Flat only)", "×") { settings.screenSize = it }
+        bindSlider(v, R.id.sliderScreenSize, R.id.lblScreenSize, settings.screenSize, "Screen size", "×") { settings.screenSize = it }
         bindSlider(v, R.id.sliderCurve, R.id.lblScreenCurve, settings.screenCurve * 100f, "Screen curve (Flat only)", "%") { settings.screenCurve = it / 100f }
         bindSlider(v, R.id.sliderIpd, R.id.lblIpd, settings.ipdMm, "Eye separation (IPD)", "mm") { settings.ipdMm = it }
         bindSlider(v, R.id.sliderZoom, R.id.lblZoom, settings.videoZoom, "Video size (zoom)", "×") { settings.videoZoom = it }
         bindSlider(v, R.id.sliderSkip, R.id.lblSkip, settings.skipSecs.toFloat(), "Skip forward/back", "s") { settings.skipSecs = it.toInt() }
         bindSlider(v, R.id.sliderLensK1, R.id.lblLensK1, settings.lensK1, "Lens distortion k1", "") { settings.lensK1 = it }
         bindSlider(v, R.id.sliderLensK2, R.id.lblLensK2, settings.lensK2, "Lens distortion k2", "") { settings.lensK2 = it }
-        bindSlider(v, R.id.sliderLensStrength, R.id.lblLensStrength, settings.lensStrength, "Lens strength", "×") { settings.lensStrength = it }
+        bindSlider(v, R.id.sliderScreenToLens, R.id.lblScreenToLens, settings.screenToLensDistance, "Screen to lens", "mm") { settings.screenToLensDistance = it }
+        bindSlider(v, R.id.sliderLensVertical, R.id.lblLensVertical, settings.verticalDistanceToLensCenter, "Lens centre height", "mm") { settings.verticalDistanceToLensCenter = it }
         bindSlider(v, R.id.sliderMenuAngleUp, R.id.lblMenuAngleUp, settings.menuAngleUp, "Play-menu look-up angle", "°") { settings.menuAngleUp = it }
         bindSlider(v, R.id.sliderMenuAngleDown, R.id.lblMenuAngleDown, -settings.menuAngleDown, "Play-menu look-down angle", "°") { settings.menuAngleDown = -it }
         bindSlider(v, R.id.sliderPanel, R.id.lblPanel, settings.panelDistM, "Browser panel distance", "m") { settings.panelDistM = it }
