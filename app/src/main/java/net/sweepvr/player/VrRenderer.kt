@@ -117,7 +117,8 @@ class VrRenderer(
     /** Play-menu actions. Press(idx) index map (menuButtons ids):
      *  0 settings, 1 shape, 2 files, 3 prev, 4 rew, 5 play, 6 ff, 7 next,
      *  8 zoom+, 9 zoom-, 10 vol+, 11 vol-, 12 flip, 13 recenter,
-     *  14 fov-, 15 fov+. 16 (A/V sync) and 17 (screenpos) have no button
+     *  14 fov-, 15 fov+, 18 web, 19 cue toggle (repeat <-> autocue).
+     *  16 (A/V sync) and 17 (screenpos) have no button
      *  any more, so Press(16)/Press(17) never fire.
      *  Seek(frac): jump to fraction. */
     sealed class MenuEvent {
@@ -604,8 +605,12 @@ class VrRenderer(
     @Volatile var menuTitle = ""
     /** Rewind/fast-forward jump, seconds (2D setting). */
     @Volatile var skipSecs = 10
+    /** End-of-media mode behind the cue toggle (id [MENU_CUE_ID]): false =
+     *  repeat the same video, true = autocue the next one in the queue.
+     *  Activity-owned: it reads settings and applies it to the player. */
+    @Volatile var autoCue = false
     // menu gaze state (GL thread)
-    private var menuHighlight = -2 // -1 = seek bar, 0..17 buttons, -2 = decorative
+    private var menuHighlight = -2 // -1 = seek bar, 0..19 buttons, -2 = decorative
     private var menuDwellFiredFor = -3
     private var menuHitValid = false
     // hovered seek fraction (panel design x) for the live time tooltip; -1 = none
@@ -660,6 +665,16 @@ class VrRenderer(
          *  across at pitch 0.75 m on a panel of radius panelDistM. */
         const val MENU_BTN_HALF = 0.3f
         const val MENU_PITCH = 0.75f
+        /** Cue toggle (repeat / autocue): this panel's first sweep control,
+         *  a small square under the settings button (id [MENU_CUE_ID]). */
+        const val MENU_CUE_ID = 19
+        const val MENU_CUE_X = -4.50f
+        const val MENU_CUE_Y = -0.70f
+        const val MENU_CUE_HALF = 0.25f
+        /** Drawn corner radius as a FRACTION of the face — and the sweep's
+         *  corner refusal, so the refused corners are the drawn rounding
+         *  rather than a second, disagreeing number. */
+        const val MENU_CUE_CORNER_FRAC = 0.10f
         /** Panel texture covers x ∈ [MENU_X0, MENU_X1], y ∈ [MENU_Y0, MENU_Y1]
          *  in panel space (y up), 1024 texels wide. */
         const val MENU_X0 = -5.3f
@@ -2170,12 +2185,17 @@ void main(){
     // leaky dwell integrators: progress grows while still on target and
     // drains slowly otherwise. Resets can never win against tremor or
     // target churn — flicker only dents progress instead of zeroing it.
-    private val menuProg = FloatArray(19)
+    // Slots are menuSlot(id): ids 0..19 plus the seek bar folded onto 18.
+    private val menuProg = FloatArray(20)
     private var menuProgT = 0L
     private var browProgF = 0f
     private var browProgT = 0L
     private fun menuSlot(id: Int) = if (id == -1) 18 else id
-    private fun menuUsable(id: Int) = id != -2
+    /** Whether [id] may fill a dwell and fire it. The cue toggle opts out
+     *  while sweep is on: its gesture is the sweep's, and a dwell filling
+     *  underneath would commit the toggle while the user is mid-sweep. */
+    private fun menuUsable(id: Int) =
+        id != -2 && !(id == MENU_CUE_ID && sweepEnabled)
 
     /** A gaze target on the play-menu panel, in DESIGN panel space (the
      *  layout authored for a MENU_DESIGN_R viewing distance; menuScale()
@@ -2199,7 +2219,8 @@ void main(){
      *  columns at the right (+ just above −, both on the seek-bar band),
      *  recenter top left and flip top right (both level with the title
      *  strip; the pane's top edge hugs them so the top band stays tight).
-     *  Title and backdrop are decorative. */
+     *  The cue toggle sits under settings, clear of the backdrop and of the
+     *  seek bar's left end. Title and backdrop are decorative. */
     private val menuButtons = arrayOf(
     // Transport row runs one pitch further left now that web sits beside
     // the files button (9 buttons, still clear of the zoom/fov/vol columns).
@@ -2222,7 +2243,10 @@ void main(){
         MenuBtn(10, 4.65f, -0.25f, 0.05f, 0.05f),  // vol+
         MenuBtn(11, 4.65f, -0.75f, 0.05f, 0.05f), // vol−
         MenuBtn(12, 4.65f, 0.70f),  // flip: ⇅ top right, atop vol+ column
-        MenuBtn(13, -4.50f, 0.70f)                // recenter, top left
+        MenuBtn(13, -4.50f, 0.70f), // recenter, top left
+        // cue toggle: repeat <-> autocue, under settings. Small square, not
+        // the 0.6 default — it is a switch, not a transport button.
+        MenuBtn(MENU_CUE_ID, MENU_CUE_X, MENU_CUE_Y, MENU_CUE_HALF, MENU_CUE_HALF)
     )
     /** Seek bar (id -1), decorative title and backdrop, all design units.
      *  The bar sits left of centre so the − row of the ± columns has its
@@ -2422,6 +2446,63 @@ void main(){
     private val winX = FloatArray(160)
     private val winY = FloatArray(160)
 
+    /** The cue toggle's sweep engine (id [MENU_CUE_ID]) — this panel's one
+     *  sweep control. Constant rect: it never moves, so it is built once. */
+    private val cueCtl = net.sweepvr.player.sweep.MomentaryControl()
+    private val cueRect = net.sweepvr.player.sweep.Rect(
+        MENU_CUE_X - MENU_CUE_HALF, -MENU_CUE_Y - MENU_CUE_HALF,
+        MENU_CUE_X + MENU_CUE_HALF, -MENU_CUE_Y + MENU_CUE_HALF
+    )
+    /** True while the sweep holds the toggle: the face is drawn from this,
+     *  so the picture cannot disagree with the gesture (GL thread only). */
+    private var cueArmed = false
+    private var cueCfg = false
+    private var cueLastT = 0L
+
+    /** Step the cue toggle's sweep for this frame. Called once per open
+     *  menu frame, hit or not, so a release is resolved exactly once.
+     *
+     *  The gesture is [net.sweepvr.player.sweep.MomentaryControl]'s own:
+     *  enter through the left or the right edge (the two the dips are drawn
+     *  on) arms it, leaving through the top or the bottom commits, leaving
+     *  sideways cancels, and parking on it does nothing. Coordinates are
+     *  panel design space with y flipped to the engine's y-down rule.
+     *
+     *  Off the panel there is no surface to release against, so a held
+     *  gesture is cancelled (reset never fires). An idle engine is left
+     *  alone instead: its last on-panel position is a real approach, and
+     *  clearing it would make the engine invent one.
+     *
+     *  With sweep disabled this never runs at all — the panel's own dwell
+     *  fires id [MENU_CUE_ID] instead, and no sweep logic is altered. */
+    private fun stepMenuCue(nowMs: Long, hit: Boolean) {
+        if (!sweepEnabled) {
+            if (cueArmed) { cueCtl.reset(); cueArmed = false }
+            return
+        }
+        val c = cueCtl
+        // A frame gap means the menu stopped being stepped mid-hold: the
+        // mode changed under it (the non-VIDEO branch clears menuOpen but
+        // not the fresh-open flags). The gesture is over then — resolving
+        // it against this frame's position would commit a move the user
+        // never made.
+        if (c.active && nowMs - cueLastT > 100L) { c.reset(); cueArmed = false }
+        if (!hit) {
+            if (c.active) { c.reset(); cueArmed = false }
+            return
+        }
+        if (!cueCfg) {
+            cueCfg = true
+            c.onFire = { onMenuEvent(MenuEvent.Press(MENU_CUE_ID)) }
+        }
+        c.onTrace = if (bookDbg) ({ FileLog.i("SweepVR-menu", "cue $it") }) else null
+        c.rect = cueRect
+        c.cornerFraction = MENU_CUE_CORNER_FRAC
+        val dt = (nowMs - cueLastT).coerceIn(0L, 250L)
+        cueLastT = nowMs
+        cueArmed = c.step(menuHitU, -menuHitV, dt)
+    }
+
     private fun updateMenu() {
         // recenter aim flow: consume the UI-thread request, close the menu,
         // arm the big blue pointer (suppresses the open logic below)
@@ -2496,6 +2577,9 @@ void main(){
             menuProgFresh = false
             for (i in menuProg.indices) menuProg[i] = 0f
             menuProgT = now()
+            // ...and a sweep held across the close dies with the panel:
+            // reopening must not inherit an arm the user never completed.
+            cueCtl.reset(); cueArmed = false
         }
         // Windowed stillness: displacement over 250ms, immune to the
         // per-frame sensor jitter that trips instant gates ~30×/s.
@@ -2504,7 +2588,9 @@ void main(){
         // World-locked panel (no yaw following): the head-forward ray meets
         // its plane and the button table says what was hit. Uses the
         // animated elevation so the pointer tracks the ⇅ flip.
-        if (menuHitTest()) {
+        val hit = menuHitTest()
+        stepMenuCue(nowMs, hit)
+        if (hit) {
             menuHitValid = true
             val id = menuHitId
             menuSeekHoverU = if (id == -1) seekFrac(menuHitU) else -1f
@@ -2520,6 +2606,10 @@ void main(){
                 FileLog.i("SweepVR-menu", "dwell start: id=$id tilt=${tilt.toInt()}°")
             }
             val slot = menuSlot(id)
+            // Sweep owns the cue toggle, so its slot is forced empty every
+            // frame: a fill banked before sweep was switched on would
+            // otherwise sit there un-drained and dim it forever.
+            if (id == MENU_CUE_ID && sweepEnabled) menuProg[slot] = 0f
             val dtMs = (nowMs - menuProgT).coerceIn(0L, 500L)
             menuProgT = nowMs
             for (i in menuProg.indices)
@@ -2592,6 +2682,8 @@ void main(){
             !enableTooltip -> ""
             id == -1 && menuDurMs > 0 && menuSeekHoverU >= 0f ->
                 fmtTime((menuSeekHoverU.coerceIn(0f, 1f) * menuDurMs).toLong())
+            // The cue toggle's name is its state, so it is read live.
+            id == MENU_CUE_ID -> if (autoCue) "autocue" else "repeat"
             id in MENU_NAMES.indices -> MENU_NAMES[id]
             else -> ""
         }
@@ -5237,7 +5329,11 @@ void main(){
         val h = menuHighlight * 31 + posSec * 131 + durSec * 17 +
             (if (menuPlaying) 1 else 0) + (if (flashing) 1009 else 0) + menuFlash.hashCode() +
             (if (menuSeekHoverU >= 0f) (menuSeekHoverU * 128).toInt() else 0) +
-            menuTitle.hashCode() * 7 + skipSecs + dwellSum
+            menuTitle.hashCode() * 7 + skipSecs + dwellSum +
+            // cue toggle: its icon, its armed state and the drawn dips are
+            // all part of the picture, so all three are part of the key.
+            (if (autoCue) 8191 else 0) + (if (cueArmed) 65537 else 0) +
+            (if (sweepEnabled) 262147 else 0)
         if (h == lastMenuHash && menuBitmap != null) return
         lastMenuHash = h
         val W = MENU_TEX_W; val H = MENU_TEX_H
@@ -5298,7 +5394,10 @@ void main(){
         for (b in menuButtons) {
             val a = alphaOf(b.id)
             val cx = tx(b.x); val cy = ty(b.y)
-            highlightBox(b, a)
+            // The cue toggle draws its own face (always on screen, and it
+            // carries the entry dips), so the plain hover rect is skipped
+            // for it — two boxes behind one button would read as a mistake.
+            if (b.id != MENU_CUE_ID) highlightBox(b, a)
             when (b.id) {
                 // transport / utility row: emoji-ish text glyphs
                 5 -> text(if (menuPlaying) "⏸" else "▶", cx, cy, 44f, a)
@@ -5310,6 +5409,7 @@ void main(){
                 15 -> fovGlyph(c, p, cx, cy, 40f, a, true)
                 13 -> crosshairGlyph(c, p, cx, cy, 40f, a)
                 12 -> flipGlyph(c, p, cx, cy, 40f, a)
+                MENU_CUE_ID -> cueGlyph(c, p, box(b), a)
                 else -> text(b.glyph, cx, cy, 44f, a)
             }
         }
@@ -5407,6 +5507,113 @@ void main(){
         c.drawPath(Path().apply {
             moveTo(cx - w, cy + gap); lineTo(cx + w, cy + gap); lineTo(cx, cy + gap + h); close()
         }, p)
+    }
+
+    /** The cue toggle's face (id [MENU_CUE_ID]): a small square with a
+     *  triangular dip cut into each SIDE edge — the two edges the sweep may
+     *  be entered through — in the same language as the toolbar buttons and
+     *  the bookmarks square. Top and bottom are the committing edges, so
+     *  they stay un-notched.
+     *
+     *  With sweep off the dips are not drawn (plain rounded square, same
+     *  rect): an entry notch must never advertise a gesture that is turned
+     *  off. Coordinates are texel-space edges — left, top, right, bottom. */
+    private fun cueFacePath(l: Float, t: Float, r: Float, b: Float): Path {
+        val rad = MENU_CUE_CORNER_FRAC * (r - l)
+        val dip = if (sweepEnabled) (r - l) * 0.09f else 0f
+        val dh = (r - l) * 0.24f
+        val my = (t + b) * 0.5f
+        return Path().apply {
+            moveTo(l + rad, t)
+            lineTo(r - rad, t)
+            quadTo(r, t, r, t + rad)
+            if (dip > 0f) {
+                lineTo(r, my - dh)
+                lineTo(r - dip, my)      // right dip
+                lineTo(r, my + dh)
+            }
+            lineTo(r, b - rad)
+            quadTo(r, b, r - rad, b)
+            lineTo(l + rad, b)
+            quadTo(l, b, l, b - rad)
+            if (dip > 0f) {
+                lineTo(l, my + dh)
+                lineTo(l + dip, my)      // left dip
+                lineTo(l, my - dh)
+            }
+            lineTo(l, t + rad)
+            quadTo(l, t, l + rad, t)
+            close()
+        }
+    }
+
+    /** The cue toggle's icon: an oval loop with an arrowhead when the same
+     *  video repeats (the default), a straight arrow pointing right when
+     *  autocue is set. White over the face, drawn in the bitmap's own
+     *  texel space like every other glyph on this panel. */
+    private fun cueGlyph(c: Canvas, p: Paint, box: FloatArray, a: Int) {
+        val l = box[0]; val t = box[1]; val r = box[2]; val b = box[3]
+        val s = r - l
+        val cx = (l + r) * 0.5f
+        val cy = (t + b) * 0.5f
+        val hot = menuHighlight == MENU_CUE_ID || cueArmed
+        val face = cueFacePath(l, t, r, b)
+        p.style = Paint.Style.FILL
+        p.color = if (hot) Color.argb(a, 30, 58, 95) else Color.argb(a, 21, 32, 45)
+        c.drawPath(face, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = (s * 0.08f).coerceAtLeast(3f)
+        p.color = if (cueArmed) Color.argb(a, 56, 189, 248)
+                  else Color.argb(a, 71, 85, 105)
+        c.drawPath(face, p)
+
+        // ---- icon ----
+        p.color = Color.argb(a, 255, 255, 255)
+        p.strokeWidth = (s * 0.075f).coerceAtLeast(3f)
+        p.strokeCap = Paint.Cap.ROUND
+        if (autoCue) {
+            // straight arrow, point to the right
+            val y = cy
+            val x0 = cx - s * 0.30f
+            val tip = cx + s * 0.30f
+            val head = s * 0.13f
+            p.style = Paint.Style.STROKE
+            c.drawLine(x0, y, tip - head * 0.8f, y, p)
+            p.style = Paint.Style.FILL
+            c.drawPath(Path().apply {
+                moveTo(tip, y)
+                lineTo(tip - head * 1.5f, y - head)
+                lineTo(tip - head * 1.5f, y + head)
+                close()
+            }, p)
+        } else {
+            // oval loop: 300°..600° clockwise leaves the gap at the top,
+            // and the head sits where the loop ends, pointing into it.
+            val rx = s * 0.30f
+            val ry = s * 0.22f
+            p.style = Paint.Style.STROKE
+            c.drawArc(cx - rx, cy - ry, cx + rx, cy + ry, 300f, 300f, false, p)
+            val th = Math.toRadians(240.0)
+            val px = (cx + rx * kotlin.math.cos(th)).toFloat()
+            val py = (cy + ry * kotlin.math.sin(th)).toFloat()
+            var dx = (-rx * kotlin.math.sin(th)).toFloat()   // ellipse tangent
+            var dy = (ry * kotlin.math.cos(th)).toFloat()
+            val dl = kotlin.math.sqrt(dx * dx + dy * dy).coerceAtLeast(1e-6f)
+            dx /= dl; dy /= dl
+            val head = s * 0.12f
+            val nx = -dy; val ny = dx
+            p.style = Paint.Style.FILL
+            c.drawPath(Path().apply {
+                moveTo(px + dx * head, py + dy * head)
+                lineTo(px - dx * head * 0.5f + nx * head * 0.9f,
+                       py - dy * head * 0.5f + ny * head * 0.9f)
+                lineTo(px - dx * head * 0.5f - nx * head * 0.9f,
+                       py - dy * head * 0.5f - ny * head * 0.9f)
+                close()
+            }, p)
+        }
+        p.style = Paint.Style.FILL
+        p.strokeCap = Paint.Cap.BUTT
     }
 
 

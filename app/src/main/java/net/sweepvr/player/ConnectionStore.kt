@@ -284,4 +284,10 @@ class SettingsStore(ctx: Context) {
     var circleRecenter: Boolean
         get() = p.getBoolean("circle_recenter", true)
         set(v) { p.edit().putBoolean("circle_recenter", v).apply() }
+    /** End-of-media behaviour, flipped by the play-menu cue toggle:
+     *  false (default) = repeat the same video, true = autocue — play the
+     *  next video in the folder queue. */
+    var autoCue: Boolean
+        get() = p.getBoolean("auto_cue", false)
+        set(v) { p.edit().putBoolean("auto_cue", v).apply() }
 }

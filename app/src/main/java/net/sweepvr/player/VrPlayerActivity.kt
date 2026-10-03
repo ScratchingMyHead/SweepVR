@@ -582,6 +582,12 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.menuAngleDown = settings.menuAngleDown
         renderer.menuSideUp = settings.menuTop
         renderer.circleGestureEnabled = settings.circleRecenter
+        // End-of-media, behind the play-menu cue toggle: repeat loops inside
+        // the player (it never reaches ENDED); autocue runs with REPEAT_MODE_
+        // OFF so onPlaybackStateChanged sees ENDED and cues the next file.
+        renderer.autoCue = settings.autoCue
+        player?.repeatMode = if (settings.autoCue)
+            Player.REPEAT_MODE_OFF else Player.REPEAT_MODE_ONE
         // Fisheye circle calibration needs the decoded frame's aspect.
         try {
             player?.videoFormat?.let { vf ->
@@ -2882,6 +2888,12 @@ try {
                     settings.fovScale = (settings.fovScale + 0.05f).coerceIn(0.5f, 1.5f)
                     applyOptics()
                 }
+                19 -> {
+                    // Cue toggle (sweep or dwell on its square): repeat the
+                    // video that is playing <-> autocue the next one.
+                    settings.autoCue = !settings.autoCue
+                    applyOptics()
+                }
             }
             is VrRenderer.MenuEvent.Seek -> {
                 val d = p.duration.coerceAtLeast(0)
@@ -2897,6 +2909,24 @@ try {
 
     private fun audioManager(): android.media.AudioManager =
         getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+
+    /** End of media. With autocue on, cue the next file in the folder
+     *  queue — wrapping at the end exactly like the ⏭ button, so an
+     *  unattended playlist runs on. With repeat on this never fires (the
+     *  player loops inside itself), and autocue with nothing to advance to
+     *  — a file opened on its own — falls back to the loop rather than
+     *  freezing on the last frame. */
+    private fun onMediaEnded() {
+        val p = player ?: return
+        if (settings.autoCue && playQueue.size > 1 && playIndex in playQueue.indices) {
+            FileLog.i(TAG, "autocue ${playIndex + 1}/${playQueue.size}")
+            stepQueue(1)
+        } else {
+            FileLog.i(TAG, "media ended -> loop")
+            p.seekTo(0)
+            p.play()
+        }
+    }
 
     private fun stepQueue(dir: Int) {
         if (playQueue.isEmpty() || playIndex < 0) {
@@ -2965,10 +2995,16 @@ try {
                 .setLoadControl(loadControl)
                 .build().also { exo ->
                 exo.playWhenReady = true
+                exo.repeatMode = if (settings.autoCue)
+                    Player.REPEAT_MODE_OFF else Player.REPEAT_MODE_ONE
                 // Engine-verbose internals to logcat (pull with logcat -d):
                 // decoder init/release, formats, rendered/dropped counters.
                 exo.addAnalyticsListener(androidx.media3.exoplayer.util.EventLogger())
                 exo.addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(state: Int) {
+                        // REPEAT_MODE_ONE never gets here; autocue does.
+                        if (state == Player.STATE_ENDED) onMediaEnded()
+                    }
                     override fun onPlayerError(error: PlaybackException) {
                         FileLog.e(TAG, "player error: ${error.message}", error)
                         txtStatus.text = "Playback error: ${error.errorCodeName} — ${error.message?.take(120)}"
