@@ -665,16 +665,18 @@ class VrRenderer(
          *  across at pitch 0.75 m on a panel of radius panelDistM. */
         const val MENU_BTN_HALF = 0.3f
         const val MENU_PITCH = 0.75f
-        /** Cue toggle (repeat / autocue): this panel's first sweep control,
-         *  a small square under the settings button (id [MENU_CUE_ID]). */
+        /** The left column — recenter (top), settings, cue toggle (bottom)
+         *  — is a stack of small squares: 0.5 design units across, not the
+         *  0.6 default, all sharing one x. */
+        const val MENU_COL_X = -4.50f
+        const val MENU_COL_HALF = 0.25f
+        /** Cue toggle (repeat / autocue), the bottom of that column. */
         const val MENU_CUE_ID = 19
-        const val MENU_CUE_X = -4.50f
         const val MENU_CUE_Y = -0.70f
-        const val MENU_CUE_HALF = 0.25f
         /** Drawn corner radius as a FRACTION of the face — and the sweep's
          *  corner refusal, so the refused corners are the drawn rounding
          *  rather than a second, disagreeing number. */
-        const val MENU_CUE_CORNER_FRAC = 0.10f
+        const val MENU_COL_CORNER_FRAC = 0.10f
         /** Panel texture covers x ∈ [MENU_X0, MENU_X1], y ∈ [MENU_Y0, MENU_Y1]
          *  in panel space (y up), 1024 texels wide. */
         const val MENU_X0 = -5.3f
@@ -2197,6 +2199,15 @@ void main(){
     private fun menuUsable(id: Int) =
         id != -2 && !(sweepEnabled && id in SWEEP_MENU_IDS)
 
+    /** Whether [id] should read as "on" right now: gaze, for an ordinary
+     *  button, but for the swept left column only while the sweep holds it.
+     *  The dips mark the entry sides, so an approach from any other
+     *  direction is as invisible as no approach at all — no highlight, no
+     *  tooltip, no dwell, no activation. */
+    private fun menuHot(id: Int): Boolean =
+        if (sweepEnabled && id in SWEEP_MENU_IDS) sweepBtn(id)?.armed == true
+        else id == menuHighlight
+
     /** A gaze target on the play-menu panel, in DESIGN panel space (the
      *  layout authored for a MENU_DESIGN_R viewing distance; menuScale()
      *  maps it onto the live panel distance). id: the MenuEvent.Press idx
@@ -2226,12 +2237,13 @@ void main(){
      *  columns at the right (+ just above −, both on the seek-bar band),
      *  recenter top left and flip top right (both level with the title
      *  strip; the pane's top edge hugs them so the top band stays tight).
-     *  The cue toggle sits under settings, clear of the backdrop and of the
-     *  seek bar's left end. Title and backdrop are decorative. */
+     *  The left column is three small swept squares — recenter, settings,
+     *  cue toggle — clear of the backdrop and of the seek bar's left end.
+     *  Title and backdrop are decorative. */
     private val menuButtons = arrayOf(
     // Transport row runs one pitch further left now that web sits beside
     // the files button (9 buttons, still clear of the zoom/fov/vol columns).
-    MenuBtn(0, -4.50f, 0f, glyph = "⚙"),   // settings, ahead of shape
+    MenuBtn(0, MENU_COL_X, 0f, MENU_COL_HALF, MENU_COL_HALF, glyph = "⚙"), // settings
     MenuBtn(1, -3.75f, 0f, glyph = "⧗"),
     MenuBtn(2, -3.00f, 0f, glyph = "📁"),
     MenuBtn(18, -2.25f, 0f, glyph = "🌐"),  // web, beside files
@@ -2250,10 +2262,9 @@ void main(){
         MenuBtn(10, 4.65f, -0.25f, 0.05f, 0.05f),  // vol+
         MenuBtn(11, 4.65f, -0.75f, 0.05f, 0.05f), // vol−
         MenuBtn(12, 4.65f, 0.70f),  // flip: ⇅ top right, atop vol+ column
-        MenuBtn(13, -4.50f, 0.70f), // recenter, top left
-        // cue toggle: repeat <-> autocue, under settings. Small square, not
-        // the 0.6 default — it is a switch, not a transport button.
-        MenuBtn(MENU_CUE_ID, MENU_CUE_X, MENU_CUE_Y, MENU_CUE_HALF, MENU_CUE_HALF)
+        MenuBtn(13, MENU_COL_X, 0.70f, MENU_COL_HALF, MENU_COL_HALF), // recenter
+        // cue toggle: repeat <-> autocue, the column's bottom square
+        MenuBtn(MENU_CUE_ID, MENU_COL_X, MENU_CUE_Y, MENU_COL_HALF, MENU_COL_HALF)
     )
     /** Seek bar (id -1), decorative title and backdrop, all design units.
      *  The bar sits left of centre so the − row of the ± columns has its
@@ -2513,7 +2524,7 @@ void main(){
             if (!s.cfg) { s.cfg = true; c.onFire = { onMenuEvent(MenuEvent.Press(id)) } }
             c.onTrace = if (bookDbg) ({ FileLog.i("SweepVR-menu", "sweep $id $it") }) else null
             c.rect = s.rect
-            c.cornerFraction = MENU_CUE_CORNER_FRAC
+            c.cornerFraction = MENU_COL_CORNER_FRAC
             val dt = (nowMs - s.lastT).coerceIn(0L, 250L)
             s.lastT = nowMs
             s.armed = c.step(menuHitU, -menuHitV, dt)
@@ -2611,7 +2622,6 @@ void main(){
             menuHitValid = true
             val id = menuHitId
             menuSeekHoverU = if (id == -1) seekFrac(menuHitU) else -1f
-            updateTooltip(id)
             // Leaky dwell: adopt immediately; progress grows while still
             // on target and drains slowly otherwise. Churn and motion
             // only dent progress instead of zeroing the timer.
@@ -2622,6 +2632,9 @@ void main(){
                 if (menuUsable(id)) menuProg[menuSlot(id)] = minOf(menuProg[menuSlot(id)], 0.3f)
                 FileLog.i("SweepVR-menu", "dwell start: id=$id tilt=${tilt.toInt()}°")
             }
+            // After the highlight, so menuHot() sees this frame's hover.
+            // The swept column stays anonymous until its sweep holds it.
+            updateTooltip(id)
             val slot = menuSlot(id)
             // Sweep owns the left column, so its slots are forced empty
             // every frame: a fill banked before sweep was switched on would
@@ -2693,10 +2706,12 @@ void main(){
     }
 
     /** Tooltip pill text for whatever the gaze is on: the button's name, or
-     *  the time a seek-bar hover would jump to. */
+     *  the time a seek-bar hover would jump to. A swept button only gets
+     *  named while the sweep holds it — entry to exit, never sooner. */
     private fun updateTooltip(id: Int) {
         val txt = when {
             !enableTooltip -> ""
+            !menuHot(id) -> ""
             id == -1 && menuDurMs > 0 && menuSeekHoverU >= 0f ->
                 fmtTime((menuSeekHoverU.coerceIn(0f, 1f) * menuDurMs).toLong())
             // The cue toggle's name is its state, so it is read live.
@@ -5371,7 +5386,7 @@ void main(){
         fun white(a: Int) = Color.argb(a, 255, 255, 255)
         /** §7.4 alpha: gazed 1.0, idle 0.9, times (1 − 0.5·dwell). */
         fun alphaOf(id: Int): Int {
-            val base = if (id == menuHighlight) 1f else 0.9f
+            val base = if (menuHot(id)) 1f else 0.9f
             val focus = if (id != -2) menuProg[menuSlot(id)].coerceIn(0f, 1f) else 0f
             return (255f * base * (1f - 0.5f * focus)).toInt().coerceIn(0, 255)
         }
@@ -5412,13 +5427,12 @@ void main(){
         for (b in menuButtons) {
             val a = alphaOf(b.id)
             val cx = tx(b.x); val cy = ty(b.y)
-            // A swept button draws its own face — it carries the entry dips —
+            // The left column draws its own face — it carries the entry dips —
             // so the plain hover rect is skipped for it: two boxes behind one
-            // button would read as a mistake. The cue toggle always has its
-            // face (it is a state switch); the two above it only get one while
-            // the gesture is on, since a notch must never advertise a gesture
-            // that is turned off.
-            val face = b.id == MENU_CUE_ID || (sweepEnabled && b.id in SWEEP_MENU_IDS)
+            // button would read as a mistake. The face is always there, like
+            // the cue toggle's; only the dips wait for sweep, since a notch
+            // must never advertise a gesture that is turned off.
+            val face = b.id in SWEEP_MENU_IDS
             if (!face) highlightBox(b, a)
             when (b.id) {
                 // transport / utility row: emoji-ish text glyphs
@@ -5431,14 +5445,14 @@ void main(){
                 15 -> fovGlyph(c, p, cx, cy, 40f, a, true)
                 12 -> flipGlyph(c, p, cx, cy, 40f, a)
                 MENU_CUE_ID -> cueGlyph(c, p, box(b), a)
-                // the two swept action buttons: face first, glyph over it
+                // the two swept action buttons: the cue's face, their glyph
                 13, 0 -> {
-                    if (sweepEnabled) sweepFace(c, p, box(b), a,
-                        hot = menuHighlight == b.id,
+                    sweepFace(c, p, box(b), a,
+                        hot = menuHot(b.id),
                         armed = sweepBtn(b.id)?.armed == true,
-                        filled = false)
+                        filled = true)
                     if (b.id == 13) crosshairGlyph(c, p, cx, cy, 40f, a)
-                    else text(b.glyph, cx, cy, 44f, a)
+                    else text(b.glyph, cx, cy, 36f, a)
                 }
                 else -> text(b.glyph, cx, cy, 44f, a)
             }
@@ -5549,7 +5563,7 @@ void main(){
      *  rect): an entry notch must never advertise a gesture that is turned
      *  off. Coordinates are texel-space edges — left, top, right, bottom. */
     private fun sweepFacePath(l: Float, t: Float, r: Float, b: Float): Path {
-        val rad = MENU_CUE_CORNER_FRAC * (r - l)
+        val rad = MENU_COL_CORNER_FRAC * (r - l)
         val dip = if (sweepEnabled) (r - l) * 0.09f else 0f
         val dh = (r - l) * 0.24f
         val my = (t + b) * 0.5f
@@ -5577,11 +5591,12 @@ void main(){
         }
     }
 
-    /** Fill and stroke that face. [filled] keeps the cue toggle solid — it
-     *  is a state switch, always on screen — while the action buttons fill
-     *  only when hot, the way the plain hover rect did, and carry the dips
-     *  on a bare outline. The border goes blue only while the sweep holds
-     *  the button, so the picture cannot disagree with the gesture. */
+    /** Fill and stroke that face. All three left-column buttons are solid
+     *  dark squares with a white glyph over them — the dips are the only
+     *  thing that comes and goes with sweep, since a notch must never
+     *  advertise a gesture that is turned off. The fill brightens and the
+     *  border goes blue only while the sweep holds the button, so the
+     *  picture cannot disagree with the gesture. */
     private fun sweepFace(c: Canvas, p: Paint, box: FloatArray, a: Int,
                           hot: Boolean, armed: Boolean, filled: Boolean) {
         val l = box[0]; val t = box[1]; val r = box[2]; val b = box[3]
@@ -5610,7 +5625,7 @@ void main(){
         val cy = (t + b) * 0.5f
         val armed = sweepBtn(MENU_CUE_ID)?.armed == true
         sweepFace(c, p, box, a,
-            hot = menuHighlight == MENU_CUE_ID || armed, armed = armed, filled = true)
+            hot = menuHot(MENU_CUE_ID), armed = armed, filled = true)
 
         // ---- icon ----
         p.color = Color.argb(a, 255, 255, 255)
