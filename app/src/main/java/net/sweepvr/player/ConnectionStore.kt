@@ -100,10 +100,17 @@ class SettingsStore(ctx: Context) {
     var fovScale: Float
         get() = p.getFloat("fov_scale", 1f).coerceIn(0.5f, 1.5f)
         set(v) { p.edit().putFloat("fov_scale", v).apply() }
-    /** Flat screen size multiplier, 0.5-10 (1 = default). */
+    /** Video screen size multiplier, 0.5-10 (1 = default). The picture's
+     *  own size; the browser has its own. */
     var screenSize: Float
         get() = p.getFloat("screen_size", 1f).coerceIn(0.5f, 10f)
         set(v) { p.edit().putFloat("screen_size", v).apply() }
+    /** Web browser screen size multiplier, 0.5-10 (1 = default). Set only
+     *  from the browser's own Size +/- panel, so resizing the page never
+     *  touches the video and vice versa. */
+    var webScreenSize: Float
+        get() = p.getFloat("web_size", 1f).coerceIn(0.5f, 10f)
+        set(v) { p.edit().putFloat("web_size", v).apply() }
     /** Viewer screen-to-lens distance, mm (SDK default 39). The aperture
      *  control: smaller value → wider aperture. */
     var screenToLensDistance: Float
@@ -234,6 +241,7 @@ class SettingsStore(ctx: Context) {
         videoZoom = 1f
         fovScale = 1f
         screenSize = 1f
+        webScreenSize = 1f
         screenCurve = 0f
         panoQuality = "vertex"
         disableDist = false

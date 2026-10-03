@@ -554,6 +554,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         // the flat model matrix; IPD/lens coefficients go to the SDK.
         renderer.fovScale = settings.fovScale
         renderer.screenSize = settings.screenSize
+        renderer.webScreenSize = settings.webScreenSize
         renderer.screenCurve = settings.screenCurve
         renderer.panoQuality = settings.panoQuality
         renderer.disableDist = settings.disableDist
@@ -1104,7 +1105,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
 
             slide("FOV scale", "${String.format("%.2f", settings.fovScale)}×", "fov", 0.5f, 1.5f, settings.fovScale,
                 VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
-            slide("Screen size", "${String.format("%.2f", settings.screenSize)}×", "screensize", 0.5f, 10f, settings.screenSize,
+            slide("Video screen size", "${String.format("%.2f", settings.screenSize)}×", "screensize", 0.5f, 10f, settings.screenSize,
                 VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.25f)),
             slide("Screen curve (Flat only)", "${(settings.screenCurve * 100).toInt()}%", "curve", 0f, 1f, settings.screenCurve,
                 VrRenderer.SlideFormat("%", 0, 100f, 0f, 0.05f)),
@@ -2387,8 +2388,8 @@ try {
             if (player != null) "Resume playback" else "No video playing",
             VrRenderer.BrowserRow.ACTION, action = "webvideo"
         )
-        r += Row("Size +", "${"%.2f".format(settings.screenSize)}×", VrRenderer.BrowserRow.ACTION, action = "webzoom+")
-        r += Row("Size -", "${"%.2f".format(settings.screenSize)}×", VrRenderer.BrowserRow.ACTION, action = "webzoom-")
+        r += Row("Size +", "${"%.2f".format(settings.webScreenSize)}×", VrRenderer.BrowserRow.ACTION, action = "webzoom+")
+        r += Row("Size -", "${"%.2f".format(settings.webScreenSize)}×", VrRenderer.BrowserRow.ACTION, action = "webzoom-")
         // Debug gaze crosshair. Toggleable: it is burned into the page
         // bitmap, so it sits on the page surface and can be mistaken for a
         // convergence problem (or cause one) while judging depth.
@@ -2414,20 +2415,25 @@ try {
         renderer.webPanelOpen = false
     }
 
-    /** Zoom the page by changing the screen size.
+    /** Zoom the page by changing the browser's own screen size.
      *
      *  The capture is 16:9 and the screen is built 16:9 for it, so the
      *  texture always covers the surface and there is nothing to crop: the
      *  screen's extent IS the magnification. A larger screen shows the same
      *  whole page, bigger, which is what zooming in should mean here.
      *
-     *  This used to write settings.videoZoom - the shared 2D video zoom - so
-     *  the web panel silently changed the video's zoom. Video keeps its own
-     *  zoom, which is right for a frame. */
+     *  This writes settings.webScreenSize - the browser's own size, not the
+     *  video's. It used to write settings.videoZoom, then settings.screenSize
+     *  (the shared 2D video zoom, then the shared screen size), so the web
+     *  panel changed the picture behind the video's back both times. The two
+     *  are separate preferences now; Size +/- moves only the page. */
     private fun webZoom(dir: Int) {
         val f = if (dir > 0) 1.25f else 0.8f
-        settings.screenSize = (settings.screenSize * f).coerceIn(0.5f, 10f)
+        settings.webScreenSize = (settings.webScreenSize * f).coerceIn(0.5f, 10f)
         applyOptics()
+        // Reopen so the row's size readout updates in place (same trick as
+        // the crosshair toggle above) - rows are built once on open.
+        openWebPanel()
     }
 
     /** Browser text zoom step, applied live: setTextZoom re-lays the page

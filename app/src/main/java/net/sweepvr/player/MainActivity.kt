@@ -900,7 +900,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         bindSlider(v, R.id.sliderFov, R.id.lblFov, settings.fovScale, "FOV scale", "×") { settings.fovScale = it }
-        bindSlider(v, R.id.sliderScreenSize, R.id.lblScreenSize, settings.screenSize, "Screen size", "×") { settings.screenSize = it }
+        bindSlider(v, R.id.sliderScreenSize, R.id.lblScreenSize, settings.screenSize, "Video screen size", "×") { settings.screenSize = it }
         bindSlider(v, R.id.sliderCurve, R.id.lblScreenCurve, settings.screenCurve * 100f, "Screen curve (Flat only)", "%") { settings.screenCurve = it / 100f }
         bindSlider(v, R.id.sliderIpd, R.id.lblIpd, settings.ipdMm, "Eye separation (IPD)", "mm") { settings.ipdMm = it }
         bindSlider(v, R.id.sliderZoom, R.id.lblZoom, settings.videoZoom, "Video size (zoom)", "×") { settings.videoZoom = it }

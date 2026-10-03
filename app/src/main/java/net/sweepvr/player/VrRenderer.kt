@@ -130,8 +130,13 @@ class VrRenderer(
     @Volatile var stereo: Stereo = Stereo.SBS
     /** Scales the Cardboard eye field of view (0.5..1.5, 1 = profile FOV). */
     @Volatile var fovScale: Float = 1f
-    /** Flat-screen size multiplier (0.5..5, 1 = default). */
+    /** Screen size multiplier (0.5..10, 1 = default). The video picture's
+     *  own size; the browser has its own field below. */
     @Volatile var screenSize: Float = 1f
+    /** Web page size multiplier (0.5..10, 1 = default), read only while
+     *  mode == WEB. Separate from screenSize so Size +/- on the browser
+     *  panel never moves the video. */
+    @Volatile var webScreenSize: Float = 1f
     /** Flat-screen curvature (0 = plane, 1 = full cap bent around the
      *  viewer). Lives only in the FLAT projection; 0 keeps the old path. */
     @Volatile var screenCurve: Float = 0f
@@ -1607,12 +1612,13 @@ void main(){
      *
      *  The page capture is 16:9 and screenDims() builds a 16:9 screen for
      *  it, so the texture covers the surface exactly - there is never
-     *  anything to crop, and magnifying the page is what screenSize does:
-     *  the capture is stretched across the screen, so a larger screen
-     *  shows the SAME whole page, bigger. Cropping is therefore redundant
-     *  for the page, and it is the video's own control (settings.videoZoom)
-     *  which the web panel used to overwrite, changing the 2D video zoom
-     *  behind the user's back. */
+     *  anything to crop, and magnifying the page is what webScreenSize
+     *  does: the capture is stretched across the screen, so a larger
+     *  screen shows the SAME whole page, bigger. Cropping is therefore
+     *  redundant for the page. The page is sized by its own preference,
+     *  never by the video's (settings.screenSize / settings.videoZoom) -
+     *  the web panel used to write the video's control and changed the
+     *  picture behind the user's back. */
     private fun webZoomF(): Float = 1f
 
     // ---------- gaze ----------
@@ -3694,7 +3700,7 @@ void main(){
      *  to the right edge of the (possibly curved) screen. */
     private fun drawWebBar() {
         if (!webScrollable) return
-        val key = screenCurve.toString() + "|" + screenSize.toString() + "|" +
+        val key = screenCurve.toString() + "|" + webScreenSize.toString() + "|" +
             webPageW + "x" + webPageH
         if (webBarMesh == null || webBarMeshKey != key) {
             webBarMesh = webBarMeshBuild()
@@ -3945,7 +3951,7 @@ void main(){
         // pane hangs below the strip, so the surface has to cover it. Key
         // carries the pane bottom, so a static strip never rebuilds.
         val paneV0 = if (bookBarOpen) bookBarCtl.pane?.let { 1f - it.bottom } else null
-        val key = screenCurve.toString() + "|" + screenSize.toString() + "|" +
+        val key = screenCurve.toString() + "|" + webScreenSize.toString() + "|" +
             (paneV0?.let { "%.3f".format(it) } ?: "strip")
         if (toolbarMesh == null || toolbarMeshKey != key) {
             toolbarMesh = toolbarMeshBuild(paneV0 ?: TB_V0)
@@ -4393,14 +4399,19 @@ void main(){
      *  SBS/TB frame, so the aspect is the per-eye content aspect, not the
      *  full frame. Shared by buildVideoModel() and the curved-cap mesh.
      *  WEB borrows this path with the page's own aspect (and no stereo
-     *  split) so the browser sits on exactly the same screen as a video. */
+     *  split) so the browser sits on exactly the same screen as a video -
+     *  same geometry, but sized by its own webScreenSize, so the two
+     *  pictures keep independent sizes. Mode decides which: this is the
+     *  single choke point every consumer goes through (drawWeb, the gaze
+     *  hit-test, both meshes), so they can never disagree. */
     private fun screenDims(): Pair<Float, Float> {
         val full = if (mode == Mode.WEB) webPageAspect() else videoAspect
         val a = when (if (mode == Mode.WEB) Stereo.MONO else stereo) {
             Stereo.SBS -> full / 2f; Stereo.TB -> full * 2f; else -> full
         }
             .coerceIn(0.25f, 4f)
-        val base = 8.5f * screenSize.coerceIn(0.5f, 10f)
+        val size = if (mode == Mode.WEB) webScreenSize else screenSize
+        val base = 8.5f * size.coerceIn(0.5f, 10f)
         val w = if (a >= 1.7777778f) base else base / 1.7777778f * a
         return w to (w / a)
     }
@@ -4440,8 +4451,12 @@ void main(){
             // near plane past ~1.15 and leaves the sphere behind the viewer
             // at >= 2). vDir = aPos.xyz is model-space and untransformed,
             // so fisheye's circle scales with it and its content follows.
-            // FLAT already takes screenSize through screenDims() - not here.
-            val s = screenSize.coerceIn(0.5f, 10f)
+            // FLAT already takes its size through screenDims() - not here.
+            // WEB is always FLAT (effProj), so this is the video picture
+            // and screenSize is its own field; the mode check is only to
+            // keep the same rule as screenDims() if that ever changes.
+            val size = if (mode == Mode.WEB) webScreenSize else screenSize
+            val s = size.coerceIn(0.5f, 10f)
             Matrix.scaleM(modelM, 0, s, s, 1f)
         }
     }
