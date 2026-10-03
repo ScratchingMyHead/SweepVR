@@ -139,7 +139,8 @@ class VrRenderer(
     @Volatile var disableDist: Boolean = false
     /** Show the gaze tooltip pill above the reticle. */
     @Volatile var enableTooltip: Boolean = true
-    /** Dome mesh density: "vertex" (60x48) or "vertexhq" (72x60). */
+    /** Dome mesh density: standard 30x7, high 60x15 (method doc §5.1:
+     *  latitude is longitude / 4 exactly). */
     @Volatile var panoQuality: String = "vertex"
     @Volatile var swapEyes: Boolean = false
     @Volatile var zoom: Float = 1f
@@ -447,9 +448,13 @@ class VrRenderer(
     @Volatile private var inputGraceUntil = 0L
 
     private var progOes = 0; private var prog2d = 0; private var progWeb = 0
-    private var aPosOes = 0; private var aTexOes = 0; private var uMvpOes = 0
-    private var uTexOes = 0; private var uStereoOes = 0; private var uEyeOes = 0
-    private var uTexMatOes = 0; private var uZoomOutOes = 0
+    /** Method-doc video program (§§3-7): homogeneous texcoords, projective
+     *  divide + vertical crop in-shader, stereo halves in texcoord buffers,
+     *  zoom in the zoomPan matrix. Replaces the old per-eye-half shader. */
+    private var progVideo = 0
+    private var aPositionVid = 0; private var aTexCoordVid = 0
+    private var uMvpVid = 0; private var uVideoTexVid = 0; private var uCropVid = 0
+    private var uTexMatVid = 0; private var uTexTransVid = 0
     // Fisheye circle-sampling path (§8): same vertex shader, dedicated frag.
     private var progFish = 0
     private var aPosFish = 0; private var aTexFish = 0; private var uMvpFish = 0
@@ -457,14 +462,21 @@ class VrRenderer(
     private var uTexFish = 0; private var uStereoFish = 0; private var uEyeFish = 0
     private var uTexMatFish = 0; private var uZoomOutFish = 0
     private var uFishC = 0; private var uFishR = 0; private var uFishMirror = 0
-    private var uWarpOnOes = 0; private var uWarpCxOes = 0; private var uWarpK1Oes = 0; private var uWarpK2Oes = 0; private var uWarpAspectOes = 0
     private var aPos2d = 0; private var aTex2d = 0; private var uMvp2d = 0; private var uTex2d = 0
     private var uAlpha2d = 0
     private var aPosWeb = 0; private var aTexWeb = 0
     private var uMvpWeb = 0; private var uTexWeb = 0; private var uZoomWeb = 0
 
-    private var mesh: Mesh? = null
-    private var meshKey: String = ""
+    /** Video geometry set (method doc §§5-6): strip positions plus five
+     *  baked texcoord buffers each (2-D, SBS eye 1/2, TB eye 1/2). Rebuilt
+     *  when density, curve dims or shaping change - all small, all rare. */
+    private var videoGeom: VideoGeom? = null
+    private var videoGeomKey = ""
+    /** Web screen mesh: today's plain indexed grid (unshaped), shared by
+     *  drawWeb and the gaze mesh lookup. Separate object from the video
+     *  geometry above, so neither path can disturb the other. */
+    private var webMesh: Mesh? = null
+    private var webMeshKey = ""
     private var browserTexId = -1
     private var browserBitmap: Bitmap? = null
     private var lastPanelHash = 0
@@ -479,6 +491,14 @@ class VrRenderer(
      *  projection — and feeds the dome/fisheye video only (§6.3). */
     private val projM = FloatArray(16)
     private val eyeViewNM = FloatArray(16)
+    /** Head-based view O = headView·N for the dome (§4.3: the sphere
+     *  surrounds the viewer, so the eye offset must NOT apply - it tears
+     *  the image across the seam and shifts the poles per eye. Stereo on
+     *  the dome comes solely from the asymmetric per-eye projection). */
+    private val headViewNM = FloatArray(16)
+    /** Per-eye render-target size for the zoomPan aspect (§7.2). */
+    private val eyeVpW = IntArray(2)
+    private val eyeVpH = IntArray(2)
     private val ovM = FloatArray(16)
     private val ptrTmp3 = FloatArray(3)
     private val projDomeM = FloatArray(16)
@@ -782,56 +802,49 @@ void main(){
 """
         // highp UVs when available: mediump quantizes texture coordinates
         // to ~1024 steps, i.e. 8-texel blocks on 8K video ("lego").
-        // Equirectangular dome sampling (§2, §4): the mesh vertex UV already
-        // maps yaw/pitch linearly across the span; the stereo half is
-        // selected here and the decoder transform honored. Zoom-in is the
-        // dome model sliding toward the viewer (§5) — never the frustum;
-        // only zoom-out touches UVs, minifying about the half-image center
-        // so the sampled range never widens.
-        private const val FRAG_OES = """
+        // Video program (method doc §§3-7): homogeneous texcoords with the
+        // projective divide in-shader (§6.3), symmetric vertical crop (§7.2).
+        // Stereo halves live in texcoord buffers (§6.1), zoom in the zoomPan
+        // matrix (§7.2) - the fragment shader selects nothing per eye.
+        private const val VERT_VIDEO = """
+attribute vec4 a_position;
+attribute vec4 a_texCoord;
+uniform mat4 u_mvpMatrix;
+uniform mat4 u_textureTransform;
+uniform mat4 u_texMat;
+varying vec4 v_texCoord;
+void main() {
+    gl_Position = u_mvpMatrix * a_position;
+    v_texCoord = a_texCoord;
+}
+"""
+        // u_textureTransform is declared and uploaded per §7.3 but
+        // deliberately never sampled. u_texMat carries the live decoder
+        // flip/rotation instead (§7.3 sanctions applying the matrix when the
+        // source needs it - dropping it flips every clip, which the old
+        // path's identical handling proves ours do). It applies in the
+        // fragment AFTER the projective divide: the decoder matrix carries
+        // a w-term translation, which would corrupt v_texCoord.y if folded
+        // in up here (only x is divided back out).
+        private const val FRAG_VIDEO = """
 #extension GL_OES_EGL_image_external : require
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
 #else
 precision mediump float;
 #endif
-varying vec2 vTex;
-varying vec3 vDir;
-uniform samplerExternalOES uTex; uniform int uStereo; uniform int uEye;
-uniform mat4 uTexMat; uniform float uZoomOut;
-void main(){
-  vec2 t = vTex;
-  if (uStereo == 1) { t.x = (t.x + float(uEye)) * 0.5; }
-  else if (uStereo == 2) { t.y = (t.y + float(uEye)) * 0.5; }
-  // Zoom-out minifies in texture space about the half-image center (§5).
-  // uZoomOut is 1 for zoom >= 1 (the dome model / FLAT window owns that
-  // range); below
-  // 1 the sampled range EXPANDS (divide), so the picture shrinks toward
-  // the half center instead of widening the frustum into the rim zone.
-  // The half-bounds check below clamps the uncovered margin to black, so
-  // one eye never bleeds into the other's.
-  vec2 c = vec2(0.5);
-  if (uStereo == 1) { c = vec2(float(uEye) * 0.5 + 0.25, 0.5); }
-  else if (uStereo == 2) { c = vec2(0.5, float(uEye) * 0.5 + 0.25); }
-  t = c + (t - c) / uZoomOut;
-  // Bounds check per half-image (not full [0,1]): each eye only sees its
-  // half. A full-range check lets zoom-out bleed the other eye's half in
-  // at the extremes.
-  bool oob = false;
-  if (uStereo == 1) {
-    float halfMin = float(uEye) * 0.5;
-    float halfMax = halfMin + 0.5;
-    oob = (t.x < halfMin || t.x > halfMax || t.y < 0.0 || t.y > 1.0);
-  } else if (uStereo == 2) {
-    float halfMin = float(uEye) * 0.5;
-    float halfMax = halfMin + 0.5;
-    oob = (t.y < halfMin || t.y > halfMax || t.x < 0.0 || t.x > 1.0);
-  } else {
-    oob = (t.x < 0.0 || t.x > 1.0 || t.y < 0.0 || t.y > 1.0);
-  }
-  if (oob) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
-  vec4 st = uTexMat * vec4(t, 0.0, 1.0);
-  gl_FragColor = texture2D(uTex, st.xy);
+varying vec4 v_texCoord;
+uniform samplerExternalOES u_video;
+uniform float u_verticalCrop;
+uniform mat4 u_texMat;
+void main() {
+    vec2 uv = vec2(
+        v_texCoord.x / v_texCoord.w,
+        v_texCoord.y * (1.0 - u_verticalCrop)
+                       + u_verticalCrop * 0.5
+    );
+    vec4 st = u_texMat * vec4(uv, 0.0, 1.0);
+    gl_FragColor = texture2D(u_video, st.xy);
 }
 """
         // Fisheye circle sampling (§8): each pixel's view direction is
@@ -945,15 +958,14 @@ void main(){
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
         GLES20.glDisable(GLES20.GL_CULL_FACE)
-        progOes = buildProgram(VERT, FRAG_OES)
-        aPosOes = GLES20.glGetAttribLocation(progOes, "aPos")
-        aTexOes = GLES20.glGetAttribLocation(progOes, "aTex")
-        uMvpOes = GLES20.glGetUniformLocation(progOes, "uMvp")
-        uTexOes = GLES20.glGetUniformLocation(progOes, "uTex")
-        uStereoOes = GLES20.glGetUniformLocation(progOes, "uStereo")
-        uEyeOes = GLES20.glGetUniformLocation(progOes, "uEye")
-        uTexMatOes = GLES20.glGetUniformLocation(progOes, "uTexMat")
-        uZoomOutOes = GLES20.glGetUniformLocation(progOes, "uZoomOut")
+        progVideo = buildProgram(VERT_VIDEO, FRAG_VIDEO)
+        aPositionVid = GLES20.glGetAttribLocation(progVideo, "a_position")
+        aTexCoordVid = GLES20.glGetAttribLocation(progVideo, "a_texCoord")
+        uMvpVid = GLES20.glGetUniformLocation(progVideo, "u_mvpMatrix")
+        uVideoTexVid = GLES20.glGetUniformLocation(progVideo, "u_video")
+        uCropVid = GLES20.glGetUniformLocation(progVideo, "u_verticalCrop")
+        uTexMatVid = GLES20.glGetUniformLocation(progVideo, "u_texMat")
+        uTexTransVid = GLES20.glGetUniformLocation(progVideo, "u_textureTransform")
         progFish = buildProgram(VERT, FRAG_OES_FISH)
         aPosFish = GLES20.glGetAttribLocation(progFish, "aPos")
         aTexFish = GLES20.glGetAttribLocation(progFish, "aTex")
@@ -967,11 +979,6 @@ void main(){
         uFishC = GLES20.glGetUniformLocation(progFish, "uFishC")
         uFishR = GLES20.glGetUniformLocation(progFish, "uFishR")
         uFishMirror = GLES20.glGetUniformLocation(progFish, "uFishMirror")
-        uWarpOnOes = GLES20.glGetUniformLocation(progOes, "uWarpOn")
-        uWarpCxOes = GLES20.glGetUniformLocation(progOes, "uWarpCx")
-        uWarpK1Oes = GLES20.glGetUniformLocation(progOes, "uWarpK1")
-        uWarpK2Oes = GLES20.glGetUniformLocation(progOes, "uWarpK2")
-        uWarpAspectOes = GLES20.glGetUniformLocation(progOes, "uWarpAspect")
         prog2d = buildProgram(VERT, FRAG_2D)
         aPos2d = GLES20.glGetAttribLocation(prog2d, "aPos")
         aTex2d = GLES20.glGetAttribLocation(prog2d, "aTex")
@@ -1047,7 +1054,7 @@ void main(){
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
 
-        meshKey = "" // meshes survive, but rebuild against the new session
+        videoGeomKey = ""; webMeshKey = "" // meshes survive, but rebuild against the new session
         browserGrid = null
         menuGrid = null
         webBarMesh = null
@@ -1232,18 +1239,10 @@ void main(){
         browAlpha = fadeAlpha(cur == Mode.BROWSER || (cur == Mode.WEB && webPanelOpen), true)
         menuAlpha = fadeAlpha(cur == Mode.VIDEO && menuOpen, false)
 
-        // The curved cap bakes world size into the mesh, so curve/w/h join
-        // the key while bent — curve 0 keeps the old unit-quad key (no churn
-        // from size/aspect changes on the plain plane).
-        val wantMeshKey = effProj().name + "|sh=" + shapingRevision.toString() + "|q=" + panoQuality +
-            (if (mode == Mode.WEB) "|web=" + webPageW + "x" + webPageH else "") +
-            if (effProj() == Projection.FLAT && screenCurve > 0f) {
-                val (w, h) = screenDims()
-                "|c=" + ((screenCurve * 100f) + 0.5f).toInt() +
-                    "|w=" + ((w * 1000f) + 0.5f).toInt() + "|h=" + ((h * 1000f) + 0.5f).toInt()
-            } else ""
-        if (meshKey != wantMeshKey) { mesh = buildMesh(effProj()); meshKey = wantMeshKey
-            FileLog.i("SweepVR-mesh", "rebuild key=$wantMeshKey shaping=${shapingActive.size}") }
+        // Video geometry: the web screen gets its own plain mesh, video gets
+        // the method-doc set (§§5-6). Rebuilds are rare (density / curve /
+        // layout / shaping changes only).
+        ensureMeshes()
     }
 
     private var browAlpha = 0f
@@ -1259,9 +1258,9 @@ void main(){
      *  Two projections, never mixed: projM is the UNSCALED eye frustum and
      *  drives every panel, the reticle/tooltip and the FLAT screen — fov+/-
      *  must not resize the UI. projDomeM is the panoramic projection and
-     *  carries the FOV scale (§6.3); domeOvM = projDomeM·O feeds the dome
-     *  and fisheye video only, with the same convergence trim so video and
-     *  UI still fuse at one disparity. */
+     *  carries the FOV scale (§6.3); domeOvM = projDomeM·(headView·N) feeds
+     *  the dome and fisheye video only, with the same convergence trim so
+     *  video and UI still fuse at one disparity. */
     private fun buildEyeMatrices(eye: Eye, physEye: Int) {
         System.arraycopy(eye.getPerspective(0.1f, 100f), 0, projM, 0, 16)
         // Convergence trim (§10): uniform clip-space offset per eye; polarity
@@ -1292,6 +1291,9 @@ void main(){
         }
 
         Matrix.multiplyMM(eyeViewNM, 0, eye.eyeView, 0, basisShiftM, 0)
+        Matrix.multiplyMM(headViewNM, 0, headViewM, 0, basisShiftM, 0)
+        eyeVpW[physEye] = eye.viewport.width
+        eyeVpH[physEye] = eye.viewport.height
         if (pinVideo && mode == Mode.VIDEO) {
             if (projection == Projection.FLAT) {
                 // Pinned flat screen keeps only the parallel eye shift:
@@ -1310,7 +1312,11 @@ void main(){
             }
         } else {
             Matrix.multiplyMM(ovM, 0, projM, 0, eyeViewNM, 0)
-            Matrix.multiplyMM(domeOvM, 0, projDomeM, 0, eyeViewNM, 0)
+            // Dome (and fisheye) ride headView, never eyeView (§4.3 above):
+            // the eye offset on a surrounding sphere shifts the seam and the
+            // poles per eye, which reads as perspective swim when the head
+            // turns. Flat keeps the eye offset (real parallaxy panel).
+            Matrix.multiplyMM(domeOvM, 0, projDomeM, 0, headViewNM, 0)
         }
     }
 
@@ -1599,7 +1605,6 @@ void main(){
     /** Zoom number z for the finite FLAT quad: texture magnification about
      *  the half-image center (the flat quad keeps texture zoom, §5). Domes
      *  slide their sphere toward the viewer instead and upload 1 here. */
-    private fun flatZoomF(): Float = zoom.coerceIn(0.1f, 20f)
 
     /** Texture zoom for the web page: always 1.
      *
@@ -2592,45 +2597,80 @@ void main(){
     }
 
     // ---------- drawing ----------
+    /** One video eye, method doc §7.1: one strip, homogeneous texcoords,
+     *  projective divide + crop in-shader, stereo halves in the buffers,
+     *  zoom in the zoomPan matrix. */
     private fun drawVideo(eye: Int) {
-        val m = mesh ?: return
+        val g = videoGeom ?: return
+        // Texcoord buffer by layout and eye (§6.1); uEye already accounts
+        // for swapEyes, so the pick is direct.
+        val li = when (stereo) {
+            Stereo.SBS -> 1 + eye
+            Stereo.TB -> 3 + eye
+            else -> 0
+        }
+        val proj = effProj()
+        val pos: FloatBuffer
+        val tex: FloatBuffer
+        val count: Int
+        if (proj == Projection.FLAT && g.capPos != null) {
+            pos = g.capPos; tex = g.capTex!![li]; count = g.capCount
+        } else if (proj == Projection.FLAT) {
+            pos = flatPosBuf; tex = g.flatTex[li]; count = 6
+        } else {
+            val span = when (proj) {
+                Projection.DEG220 -> 220f
+                Projection.DEG270 -> 270f
+                Projection.DEG360 -> 360f
+                else -> 180f
+            }
+            pos = g.domePos[span] ?: return
+            tex = g.domeTex[li]
+            count = g.domeCount
+        }
         buildVideoModel()
+        val crop = buildZoomPan(eye)
+        Matrix.multiplyMM(tmpB, 0, modelM, 0, zoomM, 0)
         // Panoramic video rides the FOV-scaled projection; the FLAT screen
         // shares the unscaled one with every panel (§6.3).
-        val projBase = if (effProj() == Projection.FLAT) ovM else domeOvM
-        Matrix.multiplyMM(mvpM, 0, projBase, 0, modelM, 0)
-        if (effProj() == Projection.FISHEYE) {
-            drawVideoFisheye(eye, m)
+        val projBase = if (proj == Projection.FLAT) ovM else domeOvM
+        Matrix.multiplyMM(mvpM, 0, projBase, 0, tmpB, 0)
+        if (proj == Projection.FISHEYE) {
+            drawVideoFisheye(eye, pos, count)
             return
         }
-        GLES20.glUseProgram(progOes)
+        // §7.4 state discipline: the overlay passes run premultiplied, so
+        // the video pass sets its own blend explicitly and restores it.
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        GLES20.glUseProgram(progVideo)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, videoTextureId)
-        GLES20.glUniform1i(uTexOes, 0)
-        GLES20.glUniform1i(uStereoOes, when (stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.TB -> 2 })
-        GLES20.glUniform1i(uEyeOes, eye)
-        GLES20.glUniformMatrix4fv(uTexMatOes, 1, false, texMat, 0)
-        // Texture zoom lives only on the finite FLAT quad (§5); domes keep
-        // the full sampled range here and slide the model instead.
-        GLES20.glUniform1f(uZoomOutOes, if (effProj() == Projection.FLAT) flatZoomF() else 1f)
-        GLES20.glUniformMatrix4fv(uMvpOes, 1, false, mvpM, 0)
-        GLES20.glEnableVertexAttribArray(aPosOes)
-        GLES20.glVertexAttribPointer(aPosOes, 3, GLES20.GL_FLOAT, false, 0, m.verts)
-        GLES20.glEnableVertexAttribArray(aTexOes)
-        GLES20.glVertexAttribPointer(aTexOes, 2, GLES20.GL_FLOAT, false, 0, m.tex)
-        GLES20.glDrawElements(GLES20.GL_TRIANGLES, m.indexCount, GLES20.GL_UNSIGNED_SHORT, m.indices)
-        GLES20.glDisableVertexAttribArray(aPosOes)
-        GLES20.glDisableVertexAttribArray(aTexOes)
+        GLES20.glUniform1i(uVideoTexVid, 0)
+        GLES20.glUniform1f(uCropVid, crop)
+        GLES20.glUniformMatrix4fv(uTexMatVid, 1, false, texMat, 0)
+        GLES20.glUniformMatrix4fv(uTexTransVid, 1, false, texMat, 0)
+        GLES20.glUniformMatrix4fv(uMvpVid, 1, false, mvpM, 0)
+        GLES20.glEnableVertexAttribArray(aPositionVid)
+        GLES20.glVertexAttribPointer(aPositionVid, 3, GLES20.GL_FLOAT, false, 0, pos)
+        GLES20.glEnableVertexAttribArray(aTexCoordVid)
+        GLES20.glVertexAttribPointer(aTexCoordVid, 4, GLES20.GL_FLOAT, false, 0, tex)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, count)
+        GLES20.glDisableVertexAttribArray(aPositionVid)
+        GLES20.glDisableVertexAttribArray(aTexCoordVid)
+        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
     }
 
     // ---------- web mode ----------
     private val IDENTITY16 = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
 
-    /** The page on the flat screen: same mesh, model, curve and zoom range
-     *  as the 2D video, but a plain 2D texture (the page is a capture, not
-     *  a decoder surface), so it needs its own tiny program for the zoom. */
+    /** The page on the flat screen: its own mesh, model, curve and zoom range
+     *  as the 2D video (same placement), but a plain 2D texture (the page is
+     *  a capture, not a decoder surface), so it needs its own tiny program
+     *  for the zoom. */
     private fun drawWeb(eye: Int) {
-        val m = mesh ?: return
+        val m = webMesh ?: return
         if (webTexId < 0 || webConsumedFrames == 0L) return
         buildVideoModel()
         Matrix.multiplyMM(mvpM, 0, ovM, 0, modelM, 0)
@@ -3296,7 +3336,7 @@ void main(){
      *  means this cannot disagree with the surface actually drawn.
      */
     private fun webPointOnMesh(u: Float, v: Float, out: FloatArray): Boolean {
-        val m = mesh ?: return false
+        val m = webMesh ?: return false
         val vs = m.tex; val ps = m.verts
         val nv = vs.capacity() / 2
         if (nv < 4 || ps.capacity() < nv * 3) return false
@@ -4377,8 +4417,9 @@ void main(){
     /** Model matrix for the video: FLAT = aspect-correct plane of world
      *  width 8.5·screenSize (unit quad scaled, §5) — or, when screenCurve
      *  > 0, the bent cap whose world size is baked into the mesh, so only
-     *  the eye-height lift remains; domes = unit sphere slid toward the
-     *  viewer by (zoom − 1). */
+     *  the eye-height lift remains; domes = identity (unit sphere at the
+     *  origin — zoom lives in the zoomPan matrix, §7.2, never in a model
+     *  slide). */
     private fun buildVideoModel() {
         Matrix.setIdentityM(modelM, 0)
         if (effProj() == Projection.FLAT) {
@@ -4390,15 +4431,30 @@ void main(){
                 Matrix.translateM(modelM, 0, 0f, 0.25f, -FLAT_DIST)
                 Matrix.scaleM(modelM, 0, w / 2f, h / 2f, 1f)
             }
-        } else {
-            Matrix.translateM(modelM, 0, 0f, 0f, zoom.coerceIn(0.1f, 20f) - 1f)
         }
+    }
+
+    /** Zoom/pan matrix Z (§7.2) for the drawing eye, plus the vertical crop.
+     *  The scale is deliberately anisotropic (z stays 1): on a viewer-centred
+     *  sphere a uniform scale would change nothing, and the anisotropy is
+     *  what narrows the apparent field of view. Aspect is the single eye's
+     *  render-target aspect. No pan UI exists, so pan stays zero. */
+    private val zoomM = FloatArray(16)
+    private fun buildZoomPan(eye: Int): Float {
+        val aspect = (eyeVpW[eye].toFloat() / eyeVpH[eye].coerceAtLeast(1).toFloat())
+            .coerceIn(0.25f, 4f)
+        val z = zoom.coerceIn(0.1f, 20f)
+        Matrix.setIdentityM(zoomM, 0)
+        Matrix.scaleM(zoomM, 0, z, z / aspect, 1f)
+        // Symmetric vertical crop about mid-frame (§7.2). Clamped above:
+        // past 1 the remap mirrors instead of narrowing.
+        return minOf(0.9f, (z - 1f) * 0.2f)
     }
 
     /** Fisheye video path (§8): same mesh/basis/projection/zoom as the
      *  equirect path — only the texture lookup differs (equidistant circle
      *  inversion from the per-fragment view direction). */
-    private fun drawVideoFisheye(eye: Int, m: Mesh) {
+    private fun drawVideoFisheye(eye: Int, pos: FloatBuffer, count: Int) {
         GLES20.glUseProgram(progFish)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, videoTextureId)
@@ -4435,20 +4491,18 @@ void main(){
         GLES20.glUniform2f(uFishR, ru, rv)
         GLES20.glUniform1f(uFishMirror, if ((eye == 0 && fisheyeMirrorL) || (eye == 1 && fisheyeMirrorR)) 1f else 0f)
         GLES20.glEnableVertexAttribArray(aPosFish)
-        GLES20.glVertexAttribPointer(aPosFish, 3, GLES20.GL_FLOAT, false, 0, m.verts)
-        GLES20.glEnableVertexAttribArray(aTexFish)
-        GLES20.glVertexAttribPointer(aTexFish, 2, GLES20.GL_FLOAT, false, 0, m.tex)
-        // Shaped delta for the fragment path above. Unshaped (or a driver
-        // that optimised the attribute out, location -1): leave disabled,
-        // which reads (0,0) - no-op.
-        val shape = meshShape
-        if (aShapeFish >= 0 && shape != null && shape.capacity() >= m.tex.capacity()) {
+        GLES20.glVertexAttribPointer(aPosFish, 3, GLES20.GL_FLOAT, false, 0, pos)
+        // Shaped delta for the fragment path above (same 180° strip order as
+        // pos). Unshaped: zeros, which leave the coords alone.
+        val g = videoGeom
+        val shape = g?.fishDelta?.getOrNull(eye)
+        if (aShapeFish >= 0 && shape != null && shape.capacity() == count * 2) {
             GLES20.glEnableVertexAttribArray(aShapeFish)
             GLES20.glVertexAttribPointer(aShapeFish, 2, GLES20.GL_FLOAT, false, 0, shape)
         } else if (aShapeFish >= 0) {
             GLES20.glDisableVertexAttribArray(aShapeFish)
         }
-        GLES20.glDrawElements(GLES20.GL_TRIANGLES, m.indexCount, GLES20.GL_UNSIGNED_SHORT, m.indices)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, count)
         GLES20.glDisableVertexAttribArray(aPosFish)
         GLES20.glDisableVertexAttribArray(aTexFish)
         if (aShapeFish >= 0) GLES20.glDisableVertexAttribArray(aShapeFish)
@@ -5385,66 +5439,355 @@ void main(){
         return Mesh(fb(verts), fb(texs), sb(idx.toShortArray()), idx.size)
     }
 
-    private fun buildMesh(proj: Projection): Mesh {
-        val m = when (proj) {
-            // FLAT: curve 0 = unit square at the origin — buildVideoModel()
-            // puts it in place — T(0, 0.25, −11.95) · S(w/2, h/2, 1) — so the
-            // mesh itself carries no size or aspect (§5: the plane's world
-            // width is 8.5·screenSize, aspect-corrected per eye). curve > 0
-            // bends it: see screenCapMesh(), whose vertices already carry
-            // world size, so the model matrix only lifts to eye height.
-            Projection.FLAT -> if (screenCurve > 0f) {
-                val (w, h) = screenDims()
-                screenCapMesh(screenCurve, w, h)
-            } else gridQuadP(
-                floatArrayOf(-1f, 1f, 0f), floatArrayOf(1f, 1f, 0f),
-                floatArrayOf(-1f, -1f, 0f), floatArrayOf(1f, -1f, 0f),
-                24, 12, flipV = true
-            )
-            // Fisheye uses the same 180° sphere mesh as the domes (§8: mesh,
-            // basis, projection and zoom identical — only sampling differs).
-            // Mirrored rigs are handled in the circle lookup, not the mesh.
-            Projection.FISHEYE -> sphereSegment(180f)
-            Projection.DEG180 -> sphereSegment(180f)
-            Projection.DEG220 -> sphereSegment(220f)
-            Projection.DEG270 -> sphereSegment(270f)
-            Projection.DEG360 -> sphereSegment(360f)
-        }
-        // No shaping on the web screen: dome-correction warps have no
-        // business denting a flat page (De-point carved its top and bottom
-        // edges). Video keeps it in every mode, including behind panels.
-        return if (mode == Mode.WEB) m else bakeShaping(m)
+    /** Video geometry set (method doc §§5-6): strip positions plus five
+     *  baked texcoord buffers each (2-D, SBS eye 1/2, TB eye 1/2 - §6.1
+     *  selection). Rebuilt when density, curve dims or shaping change. */
+    private class VideoGeom(
+        val flatTex: Array<FloatBuffer>,
+        val capPos: FloatBuffer?,
+        val capTex: Array<FloatBuffer>?,
+        val capCount: Int,
+        val domePos: Map<Float, FloatBuffer>,
+        val domeTex: Array<FloatBuffer>,
+        /** Shaped deltas over the 180° span per eye buffer, for fisheye. */
+        val fishDelta: Array<FloatBuffer>,
+        val domeCount: Int
+    )
+    /** Flat unit quad positions, §5.2 order (strip of six). Never changes. */
+    private val flatPosBuf: FloatBuffer by lazy {
+        fb(floatArrayOf(
+            -1f, 1f, 0f, -1f, -1f, 0f, 1f, 1f, 0f,
+            -1f, -1f, 0f, 1f, -1f, 0f, 1f, 1f, 0f))
     }
 
-    /** Per-vertex shaped delta (-dx, +dy, mesh UV space) from the last
-     *  [bakeShaping], for the fisheye path whose fragment shader computes
-     *  its own coords and never samples the shaped UVs. Null when shaping
-     *  is off (attribute left disabled reads zero: no-op). */
-    private var meshShape: java.nio.FloatBuffer? = null
+    /** Standard density: longitudeCount 30 (or 60 high), latitudeCount =
+     *  longitudeCount / 4 exactly (§5.1 - any other ratio changes the chord
+     *  weights and the curvature goes subtly wrong). */
+    private fun domeCounts(): Pair<Int, Int> {
+        val c = if (panoQuality == "vertexhq") 60 else 30
+        return c to c / 4
+    }
 
-    /** Bake the normalized weighted-average shaping grid into the video mesh
-     *  UVs (texture space, so head tracking via MVP is unaffected). Mesh UVs
-     *  are per-half-frame: u right, v up (GL origin). Grid offsets are
-     *  DISPLAY displacements (where content goes, y down) but sampling
-     *  needs the opposite: to move content toward center you sample from
-     *  outside, so the write NEGATES (Skinny authored narrower rendered
-     *  wider before this fix). Grid space is y down, so grid_v = 1 - v
-     *  and the y write is v + dy. No-op when nothing enabled. */
-    private fun bakeShaping(m: Mesh): Mesh {
+    private fun domeVertexCount(c: Int, r: Int) = 2 * (c * (r - 1) + (r - 2))
+
+    /** Dome positions on the UNIT sphere (§5.3 verbatim: latStep negative
+     *  top-to-bottom, lat0 exactly +90°, span centred on -Z; forward is -Z).
+     *  Unit radius: with the dome built from headView (§4.3) both eyes share
+     *  the geometry and stereo comes from the frusta alone, so radius is
+     *  irrelevant to parallax. Exact poles (degenerate tris, intended). */
+    private fun domePosStrip(angleDeg: Float, c: Int, r: Int): FloatArray {
+        val angle = Math.toRadians(angleDeg.toDouble()).toFloat()
+        val latStep = -(Math.PI / (r - 1)).toFloat()
+        val lat0 = (Math.PI / 2).toFloat()
+        val lon0 = (-Math.PI / 2).toFloat() - angle / 2f
+        val lonStep = angle / (c - 1)
+        val out = FloatArray(domeVertexCount(c, r) * 3)
+        var o = 0
+        fun emit(lat: Float, lon: Float) {
+            val lonD = lon.toDouble(); val latD = lat.toDouble()
+            out[o++] = (Math.cos(lonD) * Math.cos(latD)).toFloat()
+            out[o++] = Math.sin(latD).toFloat()
+            out[o++] = (Math.sin(lonD) * Math.cos(latD)).toFloat()
+        }
+        for (y in 0 until r - 1) {
+            val latTop = y * latStep + lat0
+            val latBot = (y + 1) * latStep + lat0
+            for (x in 0 until c) {
+                val lon = x * lonStep + lon0
+                emit(latTop, lon)
+                emit(latBot, lon)
+            }
+            if (y < r - 2) {
+                // Seam-wrapping degenerates: last vertex of this band, first
+                // of the next. All but the last band carry them.
+                emit(latBot, lon0 + angle)
+                emit(latBot, lon0)
+            }
+        }
+        return out
+    }
+
+    /** Per-band projective weights measured on the 360° span (§6.3): the
+     *  square-root form is kept verbatim for its guards (degenerate rows
+     *  fall back to 1, and pole rows MUST fall back - a horizontal chord
+     *  there is exactly zero). Only the chord ratio survives, so one span
+     *  serves all four. */
+    private fun domeBandWeights(c: Int, r: Int): Pair<FloatArray, FloatArray> {
+        val pos = domePosStrip(360f, c, r)
+        fun px(k: Int) = pos[k * 3].toDouble()
+        fun py(k: Int) = pos[k * 3 + 1].toDouble()
+        fun pz(k: Int) = pos[k * 3 + 2].toDouble()
+        fun dist(a: Int, b: Int): Double {
+            val dx = px(a) - px(b); val dy = py(a) - py(b); val dz = pz(a) - pz(b)
+            return Math.sqrt(dx * dx + dy * dy + dz * dz)
+        }
+        val topW = FloatArray(r - 1) { 1f }
+        val botW = FloatArray(r - 1) { 1f }
+        for (y in 0 until r - 1) {
+            // First column of band y in strip order (bands before it each
+            // contributed 2*C verts plus 2 wrap verts).
+            val b = y * 2 * (c + 1)
+            val topChord = dist(b + 2, b)
+            val bottomChord = dist(b + 3, b + 1)
+            val sideChord = dist(b + 1, b)
+            val halfDiff = (bottomChord - topChord) / 2.0
+            val aux = Math.sqrt(sideChord * sideChord - halfDiff * halfDiff)
+            val mean = (topChord + bottomChord) / 2.0
+            val denom = -2.0 * mean * aux
+            if (denom != 0.0) {
+                val t = (-mean * aux - aux * halfDiff) / denom
+                val bb = (-mean * aux + aux * halfDiff) / denom
+                if (t > 0.0 && t < 1.0 && bb > 0.0 && bb < 1.0) {
+                    topW[y] = (1.0 / (1.0 - bb)).toFloat()
+                    botW[y] = (1.0 / bb).toFloat()
+                }
+            }
+        }
+        return topW to botW
+    }
+
+    /** Dome texcoords for one layout (0 = 2-D, 1/2 = SBS eye 1/2, 3/4 = TB
+     *  eye 1/2): §6.2 windows with §6.3 weights, §6.3 emission order. v = 0
+     *  is the top band, exactly like the old linear UVs, so orientation is
+     *  unchanged - only the interpolation is now projective. Span-independent
+     *  (u normalises over whatever longitudes), so one set serves all spans.
+     *  Wrap verts stay plain w = 1: degenerate steering tris whose texcoords
+     *  never shade a pixel. */
+    private fun domeTexStrip(layout: Int, c: Int, r: Int, wTop: FloatArray, wBot: FloatArray): FloatArray {
+        val (uStep, vStep, uBase, vBase) = when (layout) {
+            // 2-D
+            0 -> Quad(1f / (c - 1), 1f / (r - 1), 0f, 0f)
+            // side-by-side (vStep unchanged)
+            1 -> Quad(0.5f / (c - 1), 1f / (r - 1), 0f, 0f)
+            2 -> Quad(0.5f / (c - 1), 1f / (r - 1), 0.5f, 0f)
+            // top/bottom
+            3 -> Quad(1f / (c - 1), 0.5f / (r - 1), 0f, 0f)
+            else -> Quad(1f / (c - 1), 0.5f / (r - 1), 0f, 0.5f)
+        }
+        val out = FloatArray(domeVertexCount(c, r) * 4)
+        var o = 0
+        fun emit(u: Float, v: Float, w: Float) {
+            out[o++] = u * w; out[o++] = v; out[o++] = 0f; out[o++] = w
+        }
+        for (y in 0 until r - 1) {
+            val vTop = y * vStep + vBase
+            val vBot = (y + 1) * vStep + vBase
+            val tw = wTop[y]; val bw = wBot[y]
+            for (x in 0 until c) {
+                val u = x * uStep + uBase
+                emit(u, vTop, tw)
+                emit(u, vBot, bw)
+            }
+            if (y < r - 2) {
+                emit((c - 1) * uStep + uBase, vBot, 1f)
+                emit(uBase, vBot, 1f)
+            }
+        }
+        return out
+    }
+
+    private data class Quad(val a: Float, val b: Float, val c: Float, val d: Float)
+
+    /** Flat texcoords: §5.2 rectangles in the pipeline's v-up convention
+     *  (top verts carry v = 1, exactly like the old flipV quad), so 2-D
+     *  orientation and the per-eye halves sample identically to before -
+     *  only the attribute grows a projective w = 1. Vertex order §5.2. */
+    private fun flatRectTex(u0: Float, vTop: Float, u1: Float, vBot: Float): FloatArray {
+        val us = floatArrayOf(u0, u0, u1, u0, u1, u1)
+        val vs = floatArrayOf(vTop, vBot, vTop, vBot, vBot, vTop)
+        return FloatArray(24).also { o ->
+            for (i in 0..5) { o[i * 4] = us[i]; o[i * 4 + 1] = vs[i]; o[i * 4 + 2] = 0f; o[i * 4 + 3] = 1f }
+        }
+    }
+
+    /** Curved-cap strip for video (curve > 0 only): same math as
+     *  screenCapMesh (kept for the web mesh), re-emitted in strip order
+     *  with vec4 texcoords (w = 1: caps were never projectively corrected).
+     *  Layout windows map onto the cap's full-frame UVs exactly like flat. */
+    private fun capStripTex(layout: Int, cols: Int, rows: Int): FloatArray {
+        val (u0, vTop, u1, vBot) = when (layout) {
+            1 -> Quad(0f, 1f, 0.5f, 0f)
+            2 -> Quad(0.5f, 1f, 1f, 0f)
+            3 -> Quad(0f, 0.5f, 1f, 0f)
+            4 -> Quad(0f, 1f, 1f, 0.5f)
+            else -> Quad(0f, 1f, 1f, 0f)
+        }
+        // Base cap UVs are full-frame (u, 1-v); window them per layout.
+        val out = FloatArray(2 * ((cols + 1) * rows + (rows - 1)) * 4)
+        var o = 0
+        fun emit(bu: Float, bv: Float) {
+            out[o++] = u0 + bu * (u1 - u0)
+            out[o++] = vBot + bv * (vTop - vBot)
+            out[o++] = 0f; out[o++] = 1f
+        }
+        for (iy in 0 until rows) {
+            for (ix in 0..cols) {
+                val u = ix.toFloat() / cols
+                emit(u, 1f - iy.toFloat() / rows)
+                emit(u, 1f - (iy + 1).toFloat() / rows)
+            }
+            if (iy < rows - 1) {
+                emit(1f, 1f - (iy + 1).toFloat() / rows)
+                emit(0f, 1f - (iy + 1).toFloat() / rows)
+            }
+        }
+        return out
+    }
+
+    private fun capStripPos(w: Float, h: Float, curve: Float): FloatArray {
+        val c = curve.coerceIn(0f, 1f)
+        val arcMax = Math.toRadians(SCREEN_ARC_MAX_DEG.toDouble()).toFloat()
+        val rt = maxOf(SCREEN_R_MIN, w / arcMax)
+        val cols = 48; val rows = 24
+        val out = FloatArray(2 * ((cols + 1) * rows + (rows - 1)) * 3)
+        var o = 0
+        fun emit(u: Float, v: Float) {
+            val by = (0.5f - v) * h / rt
+            val cy = kotlin.math.cos(by); val sy = kotlin.math.sin(by)
+            val fy = (0.5f - v) * h
+            val ax = (u - 0.5f) * w / rt
+            val fx = (u - 0.5f) * w
+            val cx = rt * cy * kotlin.math.sin(ax)
+            val ry = rt * sy
+            val cz = -rt * cy * kotlin.math.cos(ax)
+            out[o++] = fx + (cx - fx) * c
+            out[o++] = fy + (ry - fy) * c
+            out[o++] = -FLAT_DIST + (cz + FLAT_DIST) * c
+        }
+        for (iy in 0 until rows) {
+            for (ix in 0..cols) {
+                val u = ix.toFloat() / cols
+                emit(u, 1f - iy.toFloat() / rows)
+                emit(u, 1f - (iy + 1).toFloat() / rows)
+            }
+            if (iy < rows - 1) {
+                emit(1f, 1f - (iy + 1).toFloat() / rows)
+                emit(0f, 1f - (iy + 1).toFloat() / rows)
+            }
+        }
+        return out
+    }
+
+    /** Web screen mesh: today's plain indexed grid (unshaped), shared by
+     *  drawWeb and the gaze mesh lookup. Shaping never touches it. */
+    private fun buildWebMesh(): Mesh {
+        if (screenCurve > 0f) {
+            val (w, h) = screenDims()
+            return screenCapMesh(screenCurve, w, h)
+        }
+        return gridQuadP(
+            floatArrayOf(-1f, 1f, 0f), floatArrayOf(1f, 1f, 0f),
+            floatArrayOf(-1f, -1f, 0f), floatArrayOf(1f, -1f, 0f),
+            24, 12, flipV = true
+        )
+    }
+
+    /** Ensure the video geometry for the current density/layout/curve/
+     *  shaping, and the plain web mesh. Called every frame; rebuilds are
+     *  rare (settings edits, video changes). */
+    private fun ensureMeshes() {
+        val cur = mode
+        if (cur == Mode.WEB) {
+            var wk = "web=${webPageW}x$webPageH"
+            if (screenCurve > 0f) {
+                val (w, h) = screenDims()
+                wk += "|c=" + ((screenCurve * 100f) + 0.5f).toInt() +
+                    "|w=" + ((w * 1000f) + 0.5f).toInt() + "|h=" + ((h * 1000f) + 0.5f).toInt()
+            }
+            if (webMeshKey != wk) {
+                webMesh = buildWebMesh()
+                webMeshKey = wk
+            }
+            return
+        }
+        val (c, r) = domeCounts()
+        var key = "c=$c|st=${stereo.name}|sh=$shapingRevision|q=$panoQuality"
+        if (effProj() == Projection.FLAT && screenCurve > 0f) {
+            val (w, h) = screenDims()
+            key += "|c=" + ((screenCurve * 100f) + 0.5f).toInt() +
+                "|w=" + ((w * 1000f) + 0.5f).toInt() + "|h=" + ((h * 1000f) + 0.5f).toInt()
+        }
+        if (videoGeomKey == key) return
+        buildVideoGeom(key)
+    }
+
+    /** (Re)build the whole video geometry set: positions plus baked texcoord
+     *  buffers (shaping folded in) plus fisheye deltas. Keyed on density,
+     *  layout, curve dims and shaping revision; all small, all rare. */
+    private fun buildVideoGeom(key: String) {
+        val (c, r) = domeCounts()
+        val (wTop, wBot) = domeBandWeights(c, r)
+        // Flat rects (v-up): 2-D full, SBS halves, TB halves (eye 1 = v
+        // 0..0.5 exactly like the old shader-side windowing).
+        val flatBase = arrayOf(
+            flatRectTex(0f, 1f, 1f, 0f),
+            flatRectTex(0f, 1f, 0.5f, 0f),
+            flatRectTex(0.5f, 1f, 1f, 0f),
+            flatRectTex(0f, 0.5f, 1f, 0f),
+            flatRectTex(0f, 1f, 1f, 0.5f)
+        )
+        val flatTex = Array(5) { i -> fb(bakeVideoTex(flatBase[i]).first) }
+        val domePos = mapOf(
+            180f to fb(domePosStrip(180f, c, r)),
+            220f to fb(domePosStrip(220f, c, r)),
+            270f to fb(domePosStrip(270f, c, r)),
+            360f to fb(domePosStrip(360f, c, r))
+        )
+        val domeTex = Array(5) { i -> fb(bakeVideoTex(domeTexStrip(i, c, r, wTop, wBot)).first) }
+        // Fisheye deltas over the 180° span per eye buffer (same baked
+        // values the equirect path samples).
+        val fishDelta = Array(2) { e ->
+            val li = when (stereo) {
+                Stereo.SBS -> 1 + e
+                Stereo.TB -> 3 + e
+                else -> 0
+            }
+            fb(bakeVideoTex(domeTexStrip(li, c, r, wTop, wBot)).second)
+        }
+        var capPos: FloatBuffer? = null
+        var capTex: Array<FloatBuffer>? = null
+        var capCount = 0
+        // Curved cap (video FLAT with curve dialled): positions carry world
+        // size like screenCapMesh; texcoords are full-frame windows like
+        // flat, w = 1 (caps were never projectively corrected).
+        if (screenCurve > 0f) {
+            val (w, h) = screenDims()
+            capPos = fb(capStripPos(w, h, screenCurve))
+            capTex = Array(5) { i -> fb(bakeVideoTex(capStripTex(i, 48, 24)).first) }
+            capCount = 2 * (49 * 24 + 23)
+        }
+        // (Web builds its own from screenCapMesh; this set is video-only.)
+        videoGeom = VideoGeom(
+            flatTex = flatTex,
+            capPos = capPos, capTex = capTex, capCount = capCount,
+            domePos = domePos, domeTex = domeTex, fishDelta = fishDelta,
+            domeCount = domeVertexCount(c, r)
+        )
+        videoGeomKey = key
+        FileLog.i("SweepVR-mesh", "video geom built key=$key")
+    }
+
+    /** Bake the normalized weighted-average shaping grid into a vec4
+     *  texcoord array (texture space, so head tracking via MVP is
+     *  unaffected). Returns the shaped copy plus the per-vertex delta
+     *  (-dx, +dy) for paths that compute their own coords (fisheye);
+     *  inputs untouched. Combining (mean of weighted opacities), signs and
+     *  the (u, 1-v) grid sampling are unchanged from the Mesh version, so
+     *  existing shapes warp identically. */
+    private fun bakeVideoTex(src: FloatArray): Pair<FloatArray, FloatArray> {
+        val shaped = src.copyOf()
+        val delta = FloatArray(src.size / 2)
         val active = shapingActive
-        if (active.isEmpty()) { meshShape = null; return m }
-        val n = active[0].n
+        val n = if (active.isNotEmpty()) active[0].n else 0
         var wsum = 0f; var wcnt = 0
         for (a in active) if (a.n == n) { wsum += a.weight01; wcnt++ }
-        if (wsum <= 0f) { meshShape = null; return m }
-        // Combine on the fly per vertex (meshes are small: 61x49 sphere, 25x13 flat).
-        val count = m.tex.capacity() / 2
-        val out = FloatArray(m.tex.capacity())
-        val delta = FloatArray(m.tex.capacity())
-        m.tex.rewind()
+        if (active.isEmpty() || wsum <= 0f) return shaped to delta
+        // Combine on the fly per vertex (meshes are small: 1706 verts at
+        // 60x15, 6 on the flat quad).
+        val count = src.size / 4
         for (k in 0 until count) {
-            val u = m.tex.get()
-            val v = m.tex.get()
+            val u = src[k * 4]
+            val v = src[k * 4 + 1]
             // bilinear sample of averaged offsets at grid coords (u, 1-v)
             var dx = 0f; var dy = 0f
             val gx = (u.coerceIn(0f, 1f) * (n - 1)).coerceIn(0f, (n - 1).toFloat())
@@ -5465,65 +5808,13 @@ void main(){
                          (at(x0, y0 + 1, a.oy) * (1 - fx) + at(x0 + 1, y0 + 1, a.oy) * fx) * fy
                 dx += w * ox; dy += w * oy
             }
-            out[k * 2] = u - dx
-            out[k * 2 + 1] = v + dy
+            shaped[k * 4] = u - dx
+            shaped[k * 4 + 1] = v + dy
             // Same displacement, as a varying for the fisheye path.
             delta[k * 2] = -dx
             delta[k * 2 + 1] = dy
         }
-        m.tex.rewind()
-        meshShape = fb(delta)
-        return Mesh(m.verts, fb(out), m.indices, m.indexCount)
-    }
-
-    /** Sphere segment mesh (§2): a large-radius sphere (fixed 50 m — tens of
-     *  metres, so the inter-ocular offset is a negligible fraction of the
-     *  radius and stereo parallax artifacts are absent by construction).
-     *  Density follows panoQuality: 60×48 ("vertex") or 72×60 ("vertexhq").
-     *  U maps yaw linearly across the span, V maps pitch linearly; pole
-     *  rows are duplicated-vertex rings stopping just short of the poles
-     *  (no collapsed singularity point), leaving an invisible pinhole, so
-     *  V clamps at the poles via CLAMP_TO_EDGE. The yaw seam duplicates
-     *  vertices carrying U 0 and 1 so filtering never blends across the
-     *  cut. The frame's full width maps across the span's yaw range, so
-     *  intermediate spans are centred sub-windows clamping at the content
-     *  edge. */
-    private fun sphereSegment(deg: Float): Mesh {
-        val hq = panoQuality == "vertexhq"
-        val rows = if (hq) 72 else 60
-        val cols = if (hq) 60 else 48
-        val r = 50f
-        val yawMax = Math.toRadians((deg / 2).toDouble())
-        // Stop just short of the poles so the pole rows stay true rings of
-        // distinct vertices instead of collapsing onto one point.
-        val pitchMax = Math.PI / 2 - Math.toRadians(0.05)
-        val verts = mutableListOf<Float>(); val texs = mutableListOf<Float>()
-        for (iy in 0..rows) {
-            val v = iy.toFloat() / rows
-            // Linear pitch mapping (edge stretch removed: the Cardboard
-            // pre-warp now owns all edge geometry). Centre v=0.5 = pitch 0.
-            val pitch = (v - 0.5f) * 2f * pitchMax
-            for (ix in 0..cols) {
-                val u = ix.toFloat() / cols
-                val yaw = -yawMax + u * 2 * yawMax
-                val x = (r * Math.cos(pitch) * Math.sin(yaw)).toFloat()
-                val y = (r * Math.sin(pitch)).toFloat()
-                val z = (-r * Math.cos(pitch) * Math.cos(yaw)).toFloat()
-                verts += listOf(x, y, z)
-                // V in displayed-image space (v up): dome bottom samples the
-                // frame bottom. The decoder's own flip/rotation lives in
-                // uTexMat (§4) — baking a flip here too would mirror the
-                // picture top-to-bottom.
-                texs += listOf(u, v)
-            }
-        }
-        val idx = mutableListOf<Short>()
-        for (iy in 0 until rows) for (ix in 0 until cols) {
-            val a = (iy * (cols + 1) + ix).toShort()
-            val b = (a + 1).toShort(); val cc = ((iy + 1) * (cols + 1) + ix).toShort(); val d = (cc + 1).toShort()
-            idx += listOf(a, cc, b, b, cc, d)
-        }
-        return Mesh(fb(verts.toFloatArray()), fb(texs.toFloatArray()), sb(idx.toShortArray()), idx.size)
+        return shaped to delta
     }
 
     private fun fb(a: FloatArray): FloatBuffer =
