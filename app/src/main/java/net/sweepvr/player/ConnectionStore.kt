@@ -151,7 +151,7 @@ class SettingsStore(ctx: Context) {
      *  ((z-1)*0.2, capped by the 0.1-6 range so the remap never mirrors).
      *  Baseline forces 1. */
     var videoZoom: Float
-        get() = p.getFloat("zoom", 1f).coerceIn(0.1f, 6.0f)
+        get() = p.getFloat("zoom", 1f).coerceIn(0.1f, 5.0f)
         set(v) { p.edit().putFloat("zoom", v).apply() }
     /** Gaze dwell-to-select in ms. */
     var dwellMs: Long

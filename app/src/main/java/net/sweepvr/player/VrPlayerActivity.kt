@@ -1108,7 +1108,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.25f)),
             slide("Screen curve (Flat only)", "${(settings.screenCurve * 100).toInt()}%", "curve", 0f, 1f, settings.screenCurve,
                 VrRenderer.SlideFormat("%", 0, 100f, 0f, 0.05f)),
-            slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.1f, 6f, settings.videoZoom,
+            slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.1f, 5f, settings.videoZoom,
                 VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
             Row("", "", VrRenderer.BrowserRow.FILE, dead = true),
             slide("Eye separation", "${settings.ipdMm.toInt()} mm", "ipd", 40f, 80f, settings.ipdMm,
@@ -2522,7 +2522,7 @@ try {
             "fov" -> settings.fovScale = ((0.5f + f * 1f) * 20f).roundToInt() / 20f
             "screensize" -> settings.screenSize = ((0.5f + f * 9.5f) * 4f).roundToInt() / 4f
             "curve" -> settings.screenCurve = ((f * 20f).roundToInt() / 20f).coerceIn(0f, 1f)
-            "zoom" -> settings.videoZoom = ((0.1f + f * 5.9f) * 20f).roundToInt() / 20f
+            "zoom" -> settings.videoZoom = ((0.1f + f * 4.9f) * 20f).roundToInt() / 20f
             "ipd" -> settings.ipdMm = (40f + f * 40f).roundToInt().toFloat().coerceIn(40f, 80f)
             "convtrim" -> settings.convTrim = (((f * 0.3f - 0.15f) / 0.005f).roundToInt() * 0.005f).coerceIn(-0.15f, 0.15f)
             "panel" -> settings.panelDistM = ((1.2f + f * 3.8f) * 10f).roundToInt() / 10f
@@ -2669,7 +2669,7 @@ try {
                     "screensize" -> settings.screenSize = (settings.screenSize + dir * 0.25f).coerceIn(0.5f, 10f)
                     "curve" -> settings.screenCurve = (settings.screenCurve + dir * 0.05f).coerceIn(0f, 1f)
                     "ipd" -> settings.ipdMm = (settings.ipdMm + dir * 1f).coerceIn(40f, 80f)
-                    "zoom" -> settings.videoZoom = (settings.videoZoom * if (dir > 0) 1.25f else 0.8f).coerceIn(0.1f, 6.0f)
+                    "zoom" -> settings.videoZoom = (settings.videoZoom * if (dir > 0) 1.25f else 0.8f).coerceIn(0.1f, 5.0f)
                     "convtrim" -> settings.convTrim = (settings.convTrim + dir * 0.005f).coerceIn(-0.15f, 0.15f)
 
                     "panel" -> settings.panelDistM = (settings.panelDistM + dir * 0.2f).coerceIn(1.2f, 5f)
@@ -2829,7 +2829,7 @@ try {
         val z = settings.videoZoom
         val t = if (dir > 0) (z + zoomOff) * zoomK - zoomOff
                 else (z + zoomOff) / zoomK - zoomOff
-        val target = t.coerceIn(0.1f, 6.0f)
+        val target = t.coerceIn(0.1f, 5.0f)
         if (Math.abs(target - z) < 1e-4f) {
             renderer.flashMenu(if (dir > 0) "Zoom max" else "Zoom min")
             return

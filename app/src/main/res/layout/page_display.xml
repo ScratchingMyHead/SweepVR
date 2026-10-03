@@ -66,7 +66,7 @@
         android:valueFrom="0.5" android:valueTo="1.5" android:stepSize="0.05"
         app:labelBehavior="floating" />
 
-    <TextView android:id="@+id/lblScreenSize" android:text="Screen size (Flat only)"
+    <TextView android:id="@+id/lblScreenSize" android:text="Screen size"
         android:textAppearance="?attr/textAppearanceTitleSmall"
         android:layout_width="wrap_content" android:layout_height="wrap_content"
         android:paddingTop="12dp" />
@@ -190,7 +190,7 @@
         android:layout_width="wrap_content" android:layout_height="wrap_content" />
     <com.google.android.material.slider.Slider android:id="@+id/sliderZoom"
         android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:valueFrom="0.1" android:valueTo="6" android:stepSize="0.05"
+        android:valueFrom="0.1" android:valueTo="5" android:stepSize="0.05"
         app:labelBehavior="floating" />
 
     <TextView android:id="@+id/lblSkip" android:text="Skip forward/back (seconds)"

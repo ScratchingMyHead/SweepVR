@@ -2629,7 +2629,7 @@ void main(){
         val projBase = if (proj == Projection.FLAT) ovM else domeOvM
         Matrix.multiplyMM(mvpM, 0, projBase, 0, tmpB, 0)
         if (proj == Projection.FISHEYE) {
-            drawVideoFisheye(eye, pos, count)
+            drawVideoFisheye(eye, pos, count, crop)
             return
         }
         // §7.4 state discipline: the overlay passes run premultiplied, so
@@ -4410,9 +4410,10 @@ void main(){
     /** Model matrix for the video: FLAT = aspect-correct plane of world
      *  width 8.5·screenSize (unit quad scaled, §5) — or, when screenCurve
      *  > 0, the bent cap whose world size is baked into the mesh, so only
-     *  the eye-height lift remains; domes = unit sphere at the origin plus
-     *  the screenSize ride below. Zoom lives in the zoomPan matrix (§7.2),
-     *  never in a model slide. */
+     *  the eye-height lift remains; every other projection = a plain
+     *  screen-size scale of the unit sphere. modelM carries screen size
+     *  and nothing else; zoom lives in the zoomPan matrix (§7.2) and is a
+     *  texture-space crop on every path. */
     private fun buildVideoModel() {
         Matrix.setIdentityM(modelM, 0)
         if (effProj() == Projection.FLAT) {
@@ -4425,21 +4426,17 @@ void main(){
                 Matrix.scaleM(modelM, 0, w / 2f, h / 2f, 1f)
             }
         } else {
-            // screenSize on the dome: ride the unit sphere toward the viewer
-            // by (size − 1), so 1.0 is exactly identity and changes are
-            // monotonic. A viewer-centred sphere answers a Z ride
-            // differently from a distant plane, so the range feel is
-            // confirmed by eye (screenshot comparison in testing).
-            //
-            // Fisheye keeps the old model slide for zoom: its fragment
-            // shader has no vertical-crop uniform, so without the slide its
-            // zoom controls would go dead. (Zoom is crop-only everywhere
-            // else.)
-            if (effProj() == Projection.FISHEYE) {
-                Matrix.translateM(modelM, 0, 0f, 0f, zoom.coerceIn(0.1f, 6.0f) - 1f)
-            } else {
-                Matrix.translateM(modelM, 0, 0f, 0f, screenSize.coerceIn(0.5f, 10f) - 1f)
-            }
+            // screen_size on the dome/fisheye: anisotropic model scale of
+            // the unit sphere. Identity at 1.0, monotonic either way,
+            // bigger = larger picture, and the viewer stays inside the
+            // resulting ellipsoid at every setting in 0.5-10, so nothing
+            // is ever clipped or black (a Z ride, by contrast, crosses the
+            // near plane past ~1.15 and leaves the sphere behind the viewer
+            // at >= 2). vDir = aPos.xyz is model-space and untransformed,
+            // so fisheye's circle scales with it and its content follows.
+            // FLAT already takes screenSize through screenDims() - not here.
+            val s = screenSize.coerceIn(0.5f, 10f)
+            Matrix.scaleM(modelM, 0, s, s, 1f)
         }
     }
 
@@ -4451,15 +4448,16 @@ void main(){
     private val zoomM = FloatArray(16)
     private fun buildZoomPan(): Float {
         Matrix.setIdentityM(zoomM, 0)
-        // Unclamped crop from a range-limited zoom: mirroring starts past
-        // crop 1 (zoom 6), so the range ends there instead of clamping.
-        return (zoom.coerceIn(0.1f, 6.0f) - 1f) * 0.2f
+        // Unclamped crop from a range-limited zoom: crop 1 (fully degenerate
+        // - one texel row) is zoom 6, so the range stops at 5 (5x) with
+        // crop 0.8. The clamp is on the range, never on the crop.
+        return (zoom.coerceIn(0.1f, 5.0f) - 1f) * 0.2f
     }
 
     /** Fisheye video path (§8): same mesh/basis/projection/zoom as the
      *  equirect path — only the texture lookup differs (equidistant circle
      *  inversion from the per-fragment view direction). */
-    private fun drawVideoFisheye(eye: Int, pos: FloatBuffer, count: Int) {
+    private fun drawVideoFisheye(eye: Int, pos: FloatBuffer, count: Int, crop: Float) {
         GLES20.glUseProgram(progFish)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, videoTextureId)
@@ -4468,7 +4466,11 @@ void main(){
         GLES20.glUniform1i(uStereoFish, st)
         GLES20.glUniform1i(uEyeFish, eye)
         GLES20.glUniformMatrix4fv(uTexMatFish, 1, false, texMat, 0)
-        GLES20.glUniform1f(uZoomOutFish, 1f)
+        // FRAG_OES_FISH does t = zc + (t - zc)/uZoomOut about the half's
+        // centre, so 1/(1-crop) magnifies about that centre by exactly the
+        // factor the equirect's visible range shrinks - same direction,
+        // same strength. crop <= 0.8 at the 5.0 zoom cap keeps it finite.
+        GLES20.glUniform1f(uZoomOutFish, 1f / (1f - crop))
         GLES20.glUniformMatrix4fv(uMvpFish, 1, false, mvpM, 0)
         // Active circle: per-layout defaults (§8: half-image center, radius
         // of one quarter frame width) plus calibration offsets.
@@ -5552,9 +5554,10 @@ void main(){
     }
 
     /** Dome texcoords for one layout (0 = 2-D, 1/2 = SBS eye 1/2, 3/4 = TB
-     *  eye 1/2): §6.2 windows with §6.3 weights, §6.3 emission order. v = 0
-     *  is the top band, exactly like the old linear UVs, so orientation is
-     *  unchanged - only the interpolation is now projective. Span-independent
+     *  eye 1/2): §6.2 windows with §6.3 weights, §6.3 emission order. v is
+     *  v-up like every other path: the top band carries the LARGEST v of
+     *  its window (domePosStrip walks bands top-to-bottom, so the window is
+     *  mirrored onto the bands - bounds unchanged). Span-independent
      *  (u normalises over whatever longitudes), so one set serves all spans.
      *  Wrap verts stay plain w = 1: degenerate steering tris whose texcoords
      *  never shade a pixel. */
@@ -5574,9 +5577,16 @@ void main(){
         fun emit(u: Float, v: Float, w: Float) {
             out[o++] = u * w; out[o++] = v; out[o++] = 0f; out[o++] = w
         }
+        // v-up: the sphere's top band (band 0) carries the LARGEST v of the
+        // layout window. The window bounds are untouched - only which end
+        // of it sits at the top. v' = vBase + vSpan - (v - vBase); for the
+        // full window (vBase 0, vSpan 1) that is 1 - v, the same idiom
+        // capStripTex uses. Band weights stay with their positions.
+        val vSpan = (r - 1) * vStep
+        fun flip(v: Float) = vBase + vSpan - (v - vBase)
         for (y in 0 until r - 1) {
-            val vTop = y * vStep + vBase
-            val vBot = (y + 1) * vStep + vBase
+            val vTop = flip(y * vStep + vBase)
+            val vBot = flip((y + 1) * vStep + vBase)
             val tw = wTop[y]; val bw = wBot[y]
             for (x in 0 until c) {
                 val u = x * uStep + uBase
