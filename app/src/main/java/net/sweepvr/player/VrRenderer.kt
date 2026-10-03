@@ -2191,11 +2191,11 @@ void main(){
     private var browProgF = 0f
     private var browProgT = 0L
     private fun menuSlot(id: Int) = if (id == -1) 18 else id
-    /** Whether [id] may fill a dwell and fire it. The cue toggle opts out
+    /** Whether [id] may fill a dwell and fire it. The left column opts out
      *  while sweep is on: its gesture is the sweep's, and a dwell filling
-     *  underneath would commit the toggle while the user is mid-sweep. */
+     *  underneath would commit it while the user is mid-sweep. */
     private fun menuUsable(id: Int) =
-        id != -2 && !(id == MENU_CUE_ID && sweepEnabled)
+        id != -2 && !(sweepEnabled && id in SWEEP_MENU_IDS)
 
     /** A gaze target on the play-menu panel, in DESIGN panel space (the
      *  layout authored for a MENU_DESIGN_R viewing distance; menuScale()
@@ -2213,6 +2213,13 @@ void main(){
         "ff", "next", "zoom+", "zoom−", "vol+", "vol−",
         "flip", "recenter", "fov−", "fov+", "", ""
     )
+
+    /** The play-menu buttons that take the sweep gesture instead of the
+     *  dwell while sweep is on: the whole left column — recenter (top),
+     *  settings (middle), cue toggle (bottom) — one entry dip per side and
+     *  the same commit rules as the toolbar buttons. With sweep off they
+     *  are ordinary dwell buttons again. */
+    private val SWEEP_MENU_IDS = intArrayOf(13, 0, MENU_CUE_ID)
 
     /** The whole play menu: transport row on the bar's centreline, the seek
      *  bar under it (shifted left), the zoom/fov/volume pairs as three
@@ -2446,61 +2453,71 @@ void main(){
     private val winX = FloatArray(160)
     private val winY = FloatArray(160)
 
-    /** The cue toggle's sweep engine (id [MENU_CUE_ID]) — this panel's one
-     *  sweep control. Constant rect: it never moves, so it is built once. */
-    private val cueCtl = net.sweepvr.player.sweep.MomentaryControl()
-    private val cueRect = net.sweepvr.player.sweep.Rect(
-        MENU_CUE_X - MENU_CUE_HALF, -MENU_CUE_Y - MENU_CUE_HALF,
-        MENU_CUE_X + MENU_CUE_HALF, -MENU_CUE_Y + MENU_CUE_HALF
-    )
-    /** True while the sweep holds the toggle: the face is drawn from this,
-     *  so the picture cannot disagree with the gesture (GL thread only). */
-    private var cueArmed = false
-    private var cueCfg = false
-    private var cueLastT = 0L
+    /** One sweep engine per left-column button. The rect is built from the
+     *  MenuBtn itself, so the gesture, the hit test and the drawn face
+     *  can never disagree. Built once: the panel never moves. */
+    private class SweepMenuBtn(b: MenuBtn) {
+        val id = b.id
+        val rect = net.sweepvr.player.sweep.Rect(
+            b.x - b.hw, -b.y - b.hh, b.x + b.hw, -b.y + b.hh)
+        val ctl = net.sweepvr.player.sweep.MomentaryControl()
+        /** True while the sweep holds this button: the face is drawn from
+         *  it, so the picture cannot disagree with the gesture (GL only). */
+        var armed = false
+        var cfg = false
+        var lastT = 0L
+    }
 
-    /** Step the cue toggle's sweep for this frame. Called once per open
-     *  menu frame, hit or not, so a release is resolved exactly once.
+    private val sweepBtns: List<SweepMenuBtn> = menuButtons
+        .filter { it.id in SWEEP_MENU_IDS }
+        .map { SweepMenuBtn(it) }
+    private fun sweepBtn(id: Int) = sweepBtns.firstOrNull { it.id == id }
+
+    private fun resetSweeps() {
+        for (s in sweepBtns) {
+            if (s.ctl.active || s.armed) { s.ctl.reset(); s.armed = false }
+        }
+    }
+
+    /** Step every left-column sweep for this frame. Called once per open
+     *  menu frame, hit or not, so each release is resolved exactly once.
      *
-     *  The gesture is [net.sweepvr.player.sweep.MomentaryControl]'s own:
-     *  enter through the left or the right edge (the two the dips are drawn
-     *  on) arms it, leaving through the top or the bottom commits, leaving
-     *  sideways cancels, and parking on it does nothing. Coordinates are
-     *  panel design space with y flipped to the engine's y-down rule.
+     *  Each button gets the same gesture: enter through its left or right
+     *  edge (the two the dips are drawn on) arms it, leaving through the
+     *  top or the bottom commits, leaving sideways cancels, and parking on
+     *  it does nothing. Coordinates are panel design space with y flipped
+     *  to the engine's y-down rule.
      *
      *  Off the panel there is no surface to release against, so a held
      *  gesture is cancelled (reset never fires). An idle engine is left
      *  alone instead: its last on-panel position is a real approach, and
      *  clearing it would make the engine invent one.
      *
-     *  With sweep disabled this never runs at all — the panel's own dwell
-     *  fires id [MENU_CUE_ID] instead, and no sweep logic is altered. */
-    private fun stepMenuCue(nowMs: Long, hit: Boolean) {
-        if (!sweepEnabled) {
-            if (cueArmed) { cueCtl.reset(); cueArmed = false }
-            return
+     *  With sweep disabled nothing here runs at all — the panel's own dwell
+     *  fires these buttons instead, and no sweep logic is altered. */
+    private fun stepMenuSweeps(nowMs: Long, hit: Boolean) {
+        if (!sweepEnabled) { resetSweeps(); return }
+        for (s in sweepBtns) {
+            val c = s.ctl
+            // A frame gap means the menu stopped being stepped mid-hold: the
+            // mode changed under it (the non-VIDEO branch clears menuOpen but
+            // not the fresh-open flags). The gesture is over then — resolving
+            // it against this frame's position would commit a move the user
+            // never made.
+            if (c.active && nowMs - s.lastT > 100L) { c.reset(); s.armed = false }
+            if (!hit) {
+                if (c.active) { c.reset(); s.armed = false }
+                continue
+            }
+            val id = s.id
+            if (!s.cfg) { s.cfg = true; c.onFire = { onMenuEvent(MenuEvent.Press(id)) } }
+            c.onTrace = if (bookDbg) ({ FileLog.i("SweepVR-menu", "sweep $id $it") }) else null
+            c.rect = s.rect
+            c.cornerFraction = MENU_CUE_CORNER_FRAC
+            val dt = (nowMs - s.lastT).coerceIn(0L, 250L)
+            s.lastT = nowMs
+            s.armed = c.step(menuHitU, -menuHitV, dt)
         }
-        val c = cueCtl
-        // A frame gap means the menu stopped being stepped mid-hold: the
-        // mode changed under it (the non-VIDEO branch clears menuOpen but
-        // not the fresh-open flags). The gesture is over then — resolving
-        // it against this frame's position would commit a move the user
-        // never made.
-        if (c.active && nowMs - cueLastT > 100L) { c.reset(); cueArmed = false }
-        if (!hit) {
-            if (c.active) { c.reset(); cueArmed = false }
-            return
-        }
-        if (!cueCfg) {
-            cueCfg = true
-            c.onFire = { onMenuEvent(MenuEvent.Press(MENU_CUE_ID)) }
-        }
-        c.onTrace = if (bookDbg) ({ FileLog.i("SweepVR-menu", "cue $it") }) else null
-        c.rect = cueRect
-        c.cornerFraction = MENU_CUE_CORNER_FRAC
-        val dt = (nowMs - cueLastT).coerceIn(0L, 250L)
-        cueLastT = nowMs
-        cueArmed = c.step(menuHitU, -menuHitV, dt)
     }
 
     private fun updateMenu() {
@@ -2579,7 +2596,7 @@ void main(){
             menuProgT = now()
             // ...and a sweep held across the close dies with the panel:
             // reopening must not inherit an arm the user never completed.
-            cueCtl.reset(); cueArmed = false
+            resetSweeps()
         }
         // Windowed stillness: displacement over 250ms, immune to the
         // per-frame sensor jitter that trips instant gates ~30×/s.
@@ -2589,7 +2606,7 @@ void main(){
         // its plane and the button table says what was hit. Uses the
         // animated elevation so the pointer tracks the ⇅ flip.
         val hit = menuHitTest()
-        stepMenuCue(nowMs, hit)
+        stepMenuSweeps(nowMs, hit)
         if (hit) {
             menuHitValid = true
             val id = menuHitId
@@ -2606,10 +2623,10 @@ void main(){
                 FileLog.i("SweepVR-menu", "dwell start: id=$id tilt=${tilt.toInt()}°")
             }
             val slot = menuSlot(id)
-            // Sweep owns the cue toggle, so its slot is forced empty every
-            // frame: a fill banked before sweep was switched on would
-            // otherwise sit there un-drained and dim it forever.
-            if (id == MENU_CUE_ID && sweepEnabled) menuProg[slot] = 0f
+            // Sweep owns the left column, so its slots are forced empty
+            // every frame: a fill banked before sweep was switched on would
+            // otherwise sit there un-drained and dim those buttons forever.
+            if (sweepEnabled && id in SWEEP_MENU_IDS) menuProg[slot] = 0f
             val dtMs = (nowMs - menuProgT).coerceIn(0L, 500L)
             menuProgT = nowMs
             for (i in menuProg.indices)
@@ -5326,13 +5343,14 @@ void main(){
         // cache key (quantised: it moves every frame while a dwell runs).
         var dwellSum = 0
         for (i in menuProg.indices) dwellSum += (menuProg[i] * 64f).toInt()
+        // Armed sweep: the held button's face turns blue, and the dips come
+        // and go with sweep itself — all three are part of the picture.
+        val armedSweeps = sweepBtns.count { it.armed }
         val h = menuHighlight * 31 + posSec * 131 + durSec * 17 +
             (if (menuPlaying) 1 else 0) + (if (flashing) 1009 else 0) + menuFlash.hashCode() +
             (if (menuSeekHoverU >= 0f) (menuSeekHoverU * 128).toInt() else 0) +
             menuTitle.hashCode() * 7 + skipSecs + dwellSum +
-            // cue toggle: its icon, its armed state and the drawn dips are
-            // all part of the picture, so all three are part of the key.
-            (if (autoCue) 8191 else 0) + (if (cueArmed) 65537 else 0) +
+            (if (autoCue) 8191 else 0) + armedSweeps * 65537 +
             (if (sweepEnabled) 262147 else 0)
         if (h == lastMenuHash && menuBitmap != null) return
         lastMenuHash = h
@@ -5394,10 +5412,14 @@ void main(){
         for (b in menuButtons) {
             val a = alphaOf(b.id)
             val cx = tx(b.x); val cy = ty(b.y)
-            // The cue toggle draws its own face (always on screen, and it
-            // carries the entry dips), so the plain hover rect is skipped
-            // for it — two boxes behind one button would read as a mistake.
-            if (b.id != MENU_CUE_ID) highlightBox(b, a)
+            // A swept button draws its own face — it carries the entry dips —
+            // so the plain hover rect is skipped for it: two boxes behind one
+            // button would read as a mistake. The cue toggle always has its
+            // face (it is a state switch); the two above it only get one while
+            // the gesture is on, since a notch must never advertise a gesture
+            // that is turned off.
+            val face = b.id == MENU_CUE_ID || (sweepEnabled && b.id in SWEEP_MENU_IDS)
+            if (!face) highlightBox(b, a)
             when (b.id) {
                 // transport / utility row: emoji-ish text glyphs
                 5 -> text(if (menuPlaying) "⏸" else "▶", cx, cy, 44f, a)
@@ -5407,9 +5429,17 @@ void main(){
                 11 -> speakerGlyph(c, p, cx, cy, 13f, a, false)
                 14 -> fovGlyph(c, p, cx, cy, 40f, a, false)
                 15 -> fovGlyph(c, p, cx, cy, 40f, a, true)
-                13 -> crosshairGlyph(c, p, cx, cy, 40f, a)
                 12 -> flipGlyph(c, p, cx, cy, 40f, a)
                 MENU_CUE_ID -> cueGlyph(c, p, box(b), a)
+                // the two swept action buttons: face first, glyph over it
+                13, 0 -> {
+                    if (sweepEnabled) sweepFace(c, p, box(b), a,
+                        hot = menuHighlight == b.id,
+                        armed = sweepBtn(b.id)?.armed == true,
+                        filled = false)
+                    if (b.id == 13) crosshairGlyph(c, p, cx, cy, 40f, a)
+                    else text(b.glyph, cx, cy, 44f, a)
+                }
                 else -> text(b.glyph, cx, cy, 44f, a)
             }
         }
@@ -5509,16 +5539,16 @@ void main(){
         }, p)
     }
 
-    /** The cue toggle's face (id [MENU_CUE_ID]): a small square with a
-     *  triangular dip cut into each SIDE edge — the two edges the sweep may
-     *  be entered through — in the same language as the toolbar buttons and
-     *  the bookmarks square. Top and bottom are the committing edges, so
-     *  they stay un-notched.
+    /** A swept button's face: a rounded square with a triangular dip cut
+     *  into each SIDE edge — the two edges the sweep may be entered through
+     *  — in the same language as the toolbar buttons and the bookmarks
+     *  square. Top and bottom are the committing edges, so they stay
+     *  un-notched.
      *
      *  With sweep off the dips are not drawn (plain rounded square, same
      *  rect): an entry notch must never advertise a gesture that is turned
      *  off. Coordinates are texel-space edges — left, top, right, bottom. */
-    private fun cueFacePath(l: Float, t: Float, r: Float, b: Float): Path {
+    private fun sweepFacePath(l: Float, t: Float, r: Float, b: Float): Path {
         val rad = MENU_CUE_CORNER_FRAC * (r - l)
         val dip = if (sweepEnabled) (r - l) * 0.09f else 0f
         val dh = (r - l) * 0.24f
@@ -5547,6 +5577,28 @@ void main(){
         }
     }
 
+    /** Fill and stroke that face. [filled] keeps the cue toggle solid — it
+     *  is a state switch, always on screen — while the action buttons fill
+     *  only when hot, the way the plain hover rect did, and carry the dips
+     *  on a bare outline. The border goes blue only while the sweep holds
+     *  the button, so the picture cannot disagree with the gesture. */
+    private fun sweepFace(c: Canvas, p: Paint, box: FloatArray, a: Int,
+                          hot: Boolean, armed: Boolean, filled: Boolean) {
+        val l = box[0]; val t = box[1]; val r = box[2]; val b = box[3]
+        val path = sweepFacePath(l, t, r, b)
+        if (filled || hot) {
+            p.style = Paint.Style.FILL
+            p.color = if (hot) Color.argb(a, 30, 58, 95) else Color.argb(a, 21, 32, 45)
+            c.drawPath(path, p)
+        }
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = ((r - l) * 0.08f).coerceAtLeast(3f)
+        p.color = if (armed) Color.argb(a, 56, 189, 248)
+                  else Color.argb(a, 71, 85, 105)
+        c.drawPath(path, p)
+        p.style = Paint.Style.FILL
+    }
+
     /** The cue toggle's icon: an oval loop with an arrowhead when the same
      *  video repeats (the default), a straight arrow pointing right when
      *  autocue is set. White over the face, drawn in the bitmap's own
@@ -5556,16 +5608,9 @@ void main(){
         val s = r - l
         val cx = (l + r) * 0.5f
         val cy = (t + b) * 0.5f
-        val hot = menuHighlight == MENU_CUE_ID || cueArmed
-        val face = cueFacePath(l, t, r, b)
-        p.style = Paint.Style.FILL
-        p.color = if (hot) Color.argb(a, 30, 58, 95) else Color.argb(a, 21, 32, 45)
-        c.drawPath(face, p)
-        p.style = Paint.Style.STROKE
-        p.strokeWidth = (s * 0.08f).coerceAtLeast(3f)
-        p.color = if (cueArmed) Color.argb(a, 56, 189, 248)
-                  else Color.argb(a, 71, 85, 105)
-        c.drawPath(face, p)
+        val armed = sweepBtn(MENU_CUE_ID)?.armed == true
+        sweepFace(c, p, box, a,
+            hot = menuHighlight == MENU_CUE_ID || armed, armed = armed, filled = true)
 
         // ---- icon ----
         p.color = Color.argb(a, 255, 255, 255)
