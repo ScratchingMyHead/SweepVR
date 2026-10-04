@@ -33,8 +33,11 @@ package net.sweepvr.player
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RectF
+import android.graphics.Shader
 import java.util.Locale
 import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
@@ -675,8 +678,17 @@ class VrRenderer(
         const val MENU_CUE_Y = -0.70f
         /** Drawn corner radius as a FRACTION of the face — and the sweep's
          *  corner refusal, so the refused corners are the drawn rounding
-         *  rather than a second, disagreeing number. */
-        const val MENU_COL_CORNER_FRAC = 0.10f
+         *  rather than a second, disagreeing number. Every button face on
+         *  the panel draws with it now, not just the left column. */
+        const val MENU_CORNER_FRAC = 0.10f
+        /** The transport tile's blue, crown to foot, as the colour emoji
+         *  font on this device paints it: near-white cyan at the top
+         *  settling to a mid blue at the bottom. */
+        val TRACK_BLUE = intArrayOf(
+            0xFF9CE9FA.toInt(), 0xFF8AE0F8.toInt(), 0xFF68CFF1.toInt(),
+            0xFF48B3E3.toInt(), 0xFF2A98D4.toInt()
+        )
+        val TRACK_BLUE_POS = floatArrayOf(0f, 0.45f, 0.65f, 0.85f, 1f)
         /** Panel texture covers x ∈ [MENU_X0, MENU_X1], y ∈ [MENU_Y0, MENU_Y1]
          *  in panel space (y up), 1024 texels wide. */
         const val MENU_X0 = -5.3f
@@ -2257,14 +2269,14 @@ void main(){
     private var browProgF = 0f
     private var browProgT = 0L
     private fun menuSlot(id: Int) = if (id == -1) 18 else id
-    /** Whether [id] may fill a dwell and fire it. The left column opts out
+    /** Whether [id] may fill a dwell and fire it. A swept button opts out
      *  while sweep is on: its gesture is the sweep's, and a dwell filling
      *  underneath would commit it while the user is mid-sweep. */
     private fun menuUsable(id: Int) =
         id != -2 && !(sweepEnabled && id in SWEEP_MENU_IDS)
 
     /** Whether [id] should read as "on" right now: gaze, for an ordinary
-     *  button, but for the swept left column only while the sweep holds it.
+     *  button, but for a swept button only while the sweep holds it.
      *  The dips mark the entry sides, so an approach from any other
      *  direction is as invisible as no approach at all — no highlight, no
      *  tooltip, no dwell, no activation. */
@@ -2286,24 +2298,19 @@ void main(){
     private val MENU_NAMES = arrayOf(
         "settings", "shape", "files", "prev", "rew", "play",
         "ff", "next", "zoom+", "zoom−", "vol+", "vol−",
-        "flip", "recenter", "fov−", "fov+", "", ""
+        "flip", "recenter", "fov−", "fov+", "", "",
+        "web"   // 18, beside files; 19 (cue) reads its state instead
     )
-
-    /** The play-menu buttons that take the sweep gesture instead of the
-     *  dwell while sweep is on: the whole left column — recenter (top),
-     *  settings (middle), cue toggle (bottom) — one entry dip per side and
-     *  the same commit rules as the toolbar buttons. With sweep off they
-     *  are ordinary dwell buttons again. */
-    private val SWEEP_MENU_IDS = intArrayOf(13, 0, MENU_CUE_ID)
 
     /** The whole play menu: transport row on the bar's centreline, the seek
      *  bar under it (shifted left), the zoom/fov/volume pairs as three
      *  columns at the right (+ just above −, both on the seek-bar band),
      *  recenter top left and flip top right (both level with the title
      *  strip; the pane's top edge hugs them so the top band stays tight).
-     *  The left column is three small swept squares — recenter, settings,
-     *  cue toggle — clear of the backdrop and of the seek bar's left end.
-     *  Title and backdrop are decorative. */
+     *  The left column is three small squares — recenter, settings, cue
+     *  toggle — clear of the backdrop and of the seek bar's left end.
+     *  Title and backdrop are decorative. Every button here takes the
+     *  sweep gesture (see SWEEP_MENU_IDS); only the seek bar dwells. */
     private val menuButtons = arrayOf(
     // Transport row runs one pitch further left now that web sits beside
     // the files button (9 buttons, still clear of the zoom/fov/vol columns).
@@ -2311,25 +2318,38 @@ void main(){
     MenuBtn(1, -3.75f, 0f, glyph = "⧗"),
     MenuBtn(2, -3.00f, 0f, glyph = "📁"),
     MenuBtn(18, -2.25f, 0f, glyph = "🌐"),  // web, beside files
-    MenuBtn(3, -1.50f, 0f, glyph = "⏮"),
-        MenuBtn(4, -0.75f, 0f, glyph = "⏪"),
-        MenuBtn(5, 0.00f, 0f),   // play / pause drawn from menuPlaying
-        MenuBtn(6, 0.75f, 0f, glyph = "⏩"),
-        MenuBtn(7, 1.50f, 0f, glyph = "⏭"),
+    // The transport row is drawn as artwork (transportGlyph), not as text:
+    // the blue tiles and the play / pause state would otherwise come out of
+    // whichever fonts happen to be installed, and on this device that means
+    // Samsung's colour emoji font for some of them and a monochrome symbol
+    // font for the rest — the row then disagrees with itself.
+    MenuBtn(3, -1.50f, 0f),  // previous track
+        MenuBtn(4, -0.75f, 0f),
+        MenuBtn(5, 0.00f, 0f),   // play / pause, drawn from menuPlaying
+        MenuBtn(6, 0.75f, 0f),
+        MenuBtn(7, 1.50f, 0f),  // next track
         // adjustment columns down the right side, left to right
-        // zoom / fov / volume, + paired just above − on the seek-bar line;
-        // volume is a third the size of the others
-        MenuBtn(8, 3.15f, -0.25f, 0.15f, 0.15f),   // zoom+
-        MenuBtn(9, 3.15f, -0.75f, 0.15f, 0.15f),  // zoom−
-        MenuBtn(15, 3.90f, -0.25f, 0.15f, 0.15f),  // fov+
-        MenuBtn(14, 3.90f, -0.75f, 0.15f, 0.15f), // fov−
-        MenuBtn(10, 4.65f, -0.25f, 0.05f, 0.05f),  // vol+
-        MenuBtn(11, 4.65f, -0.75f, 0.05f, 0.05f), // vol−
+        // zoom / fov / volume, + paired just above − on the seek-bar line.
+        // All three now take the standard 0.6 face, so the + row moves up
+        // to keep the two rows apart (− stays on the seek-bar line).
+        MenuBtn(8, 3.15f, -0.05f),   // zoom+
+        MenuBtn(9, 3.15f, -0.75f),  // zoom−
+        MenuBtn(15, 3.90f, -0.05f),  // fov+
+        MenuBtn(14, 3.90f, -0.75f), // fov−
+        MenuBtn(10, 4.65f, -0.05f),  // vol+
+        MenuBtn(11, 4.65f, -0.75f), // vol−
         MenuBtn(12, 4.65f, 0.70f),  // flip: ⇅ top right, atop vol+ column
         MenuBtn(13, MENU_COL_X, 0.70f, MENU_COL_HALF, MENU_COL_HALF), // recenter
         // cue toggle: repeat <-> autocue, the column's bottom square
         MenuBtn(MENU_CUE_ID, MENU_COL_X, MENU_CUE_Y, MENU_COL_HALF, MENU_COL_HALF)
     )
+    /** Every play-menu button takes the sweep gesture instead of the dwell
+     *  while sweep is on — one entry dip per side and the same commit rules
+     *  as the toolbar buttons. Derived from the list above so a button
+     *  cannot be added without being swept (read after menuButtons for that
+     *  reason). With sweep off they are ordinary dwell buttons again; only
+     *  the seek bar (id -1) still dwells. */
+    private val SWEEP_MENU_IDS: IntArray = menuButtons.map { it.id }.toIntArray()
     /** Seek bar (id -1), decorative title and backdrop, all design units.
      *  The bar sits left of centre so the − row of the ± columns has its
      *  own lane at the right edge. */
@@ -2528,7 +2548,7 @@ void main(){
     private val winX = FloatArray(160)
     private val winY = FloatArray(160)
 
-    /** One sweep engine per left-column button. The rect is built from the
+    /** One sweep engine per swept button. The rect is built from the
      *  MenuBtn itself, so the gesture, the hit test and the drawn face
      *  can never disagree. Built once: the panel never moves. */
     private class SweepMenuBtn(b: MenuBtn) {
@@ -2555,7 +2575,7 @@ void main(){
         }
     }
 
-    /** Step every left-column sweep for this frame. Called once per open
+    /** Step every button's sweep for this frame. Called once per open
      *  menu frame, hit or not, so each release is resolved exactly once.
      *
      *  Each button gets the same gesture: enter through its left or right
@@ -2589,7 +2609,7 @@ void main(){
             if (!s.cfg) { s.cfg = true; c.onFire = { onMenuEvent(MenuEvent.Press(id)) } }
             c.onTrace = if (bookDbg) ({ FileLog.i("SweepVR-menu", "sweep $id $it") }) else null
             c.rect = s.rect
-            c.cornerFraction = MENU_COL_CORNER_FRAC
+            c.cornerFraction = MENU_CORNER_FRAC
             val dt = (nowMs - s.lastT).coerceIn(0L, 250L)
             s.lastT = nowMs
             s.armed = c.step(menuHitU, -menuHitV, dt)
@@ -2698,10 +2718,10 @@ void main(){
                 FileLog.i("SweepVR-menu", "dwell start: id=$id tilt=${tilt.toInt()}°")
             }
             // After the highlight, so menuHot() sees this frame's hover.
-            // The swept column stays anonymous until its sweep holds it.
+            // A swept button stays anonymous until its sweep holds it.
             updateTooltip(id)
             val slot = menuSlot(id)
-            // Sweep owns the left column, so its slots are forced empty
+            // Sweep owns every button now, so their slots are forced empty
             // every frame: a fill banked before sweep was switched on would
             // otherwise sit there un-drained and dim those buttons forever.
             if (sweepEnabled && id in SWEEP_MENU_IDS) menuProg[slot] = 0f
@@ -5496,42 +5516,38 @@ void main(){
         c.drawText(title, (tr[0] + tr[2]) / 2f, (tr[1] + tr[3]) / 2f + p.textSize * 0.35f, p)
         p.textAlign = Paint.Align.LEFT
         // ---- buttons ----
-        fun highlightBox(b: MenuBtn, a: Int) {
-            if (b.id != menuHighlight) return
-            val r = box(b)
-            p.color = Color.argb(a, 30, 58, 95)
-            c.drawRect(r[0], r[1], r[2], r[3], p)
-        }
         for (b in menuButtons) {
             val a = alphaOf(b.id)
             val cx = tx(b.x); val cy = ty(b.y)
-            // The left column draws its own face — it carries the entry dips —
-            // so the plain hover rect is skipped for it: two boxes behind one
-            // button would read as a mistake. The face is always there, like
-            // the cue toggle's; only the dips wait for sweep, since a notch
-            // must never advertise a gesture that is turned off.
-            val face = b.id in SWEEP_MENU_IDS
-            if (!face) highlightBox(b, a)
+            // Every button carries the same face — the entry dips ride on it —
+            // so the old hover rect has no job left and is gone: two boxes
+            // behind one button would read as a mistake. The face is always
+            // there; only the dips wait for sweep, since a notch must never
+            // advertise a gesture that is turned off. The fill brightens and
+            // the border goes blue only while the sweep holds the button.
+            sweepFace(c, p, box(b), a,
+                hot = menuHot(b.id),
+                armed = sweepBtn(b.id)?.armed == true)
             when (b.id) {
-                // transport / utility row: emoji-ish text glyphs
-                5 -> text(if (menuPlaying) "⏸" else "▶", cx, cy, 44f, a)
-                8 -> magnifierGlyph(c, p, cx, cy, 40f, a, true)
-                9 -> magnifierGlyph(c, p, cx, cy, 40f, a, false)
-                10 -> speakerGlyph(c, p, cx, cy, 13f, a, true)
-                11 -> speakerGlyph(c, p, cx, cy, 13f, a, false)
-                14 -> fovGlyph(c, p, cx, cy, 40f, a, false)
-                15 -> fovGlyph(c, p, cx, cy, 40f, a, true)
+                // transport row: our own artwork (blue tile, white shapes),
+                // never the fonts — see transportGlyph
+                3 -> transportGlyph(c, p, cx, cy, 44f, a, TransportArt.PREV)
+                4 -> transportGlyph(c, p, cx, cy, 44f, a, TransportArt.REW)
+                5 -> transportGlyph(c, p, cx, cy, 44f, a,
+                    if (menuPlaying) TransportArt.PAUSE else TransportArt.PLAY)
+                6 -> transportGlyph(c, p, cx, cy, 44f, a, TransportArt.FF)
+                7 -> transportGlyph(c, p, cx, cy, 44f, a, TransportArt.NEXT)
+                // the ± columns: glyphs sized to their 0.6-unit faces
+                8 -> magnifierGlyph(c, p, cx, cy, 50f, a, true)
+                9 -> magnifierGlyph(c, p, cx, cy, 50f, a, false)
+                10 -> speakerGlyph(c, p, cx, cy, 18f, a, true)
+                11 -> speakerGlyph(c, p, cx, cy, 18f, a, false)
+                14 -> fovGlyph(c, p, cx, cy, 44f, a, false)
+                15 -> fovGlyph(c, p, cx, cy, 44f, a, true)
                 12 -> flipGlyph(c, p, cx, cy, 40f, a)
-                MENU_CUE_ID -> cueGlyph(c, p, box(b), a)
-                // the two swept action buttons: the cue's face, their glyph
-                13, 0 -> {
-                    sweepFace(c, p, box(b), a,
-                        hot = menuHot(b.id),
-                        armed = sweepBtn(b.id)?.armed == true,
-                        filled = true)
-                    if (b.id == 13) crosshairGlyph(c, p, cx, cy, 40f, a)
-                    else text(b.glyph, cx, cy, 36f, a)
-                }
+                13 -> crosshairGlyph(c, p, cx, cy, 40f, a)
+                0 -> text(b.glyph, cx, cy, 36f, a)
+                MENU_CUE_ID -> cueIcon(c, p, box(b), a)
                 else -> text(b.glyph, cx, cy, 44f, a)
             }
         }
@@ -5631,6 +5647,81 @@ void main(){
         }, p)
     }
 
+    /** What a transport button draws (see transportGlyph): the blue tile
+     *  with its white shapes, or just the play triangle while paused. */
+    private enum class TransportArt { PREV, REW, PLAY, PAUSE, FF, NEXT }
+
+    /** The transport row's own artwork, drawn here rather than handed to the
+     *  text shaper: as text, this device painted ⏪ ⏩ ⏸ out of Samsung's
+     *  colour emoji font while ⏮ ⏭ ▶ fell through to a monochrome symbol
+     *  font listed ahead of the colour fonts, so the row's look depended on
+     *  which fonts happen to be installed. Same proportions as that
+     *  artwork — a rounded blue tile (TRACK_BLUE, the emoji font's own
+     *  gradient) carrying white shapes — and play draws no tile at all, so
+     *  the button still reads blue while it plays and dark while paused. */
+    private fun transportGlyph(c: Canvas, p: Paint, cx: Float, cy: Float,
+                               s: Float, a: Int, art: TransportArt) {
+        val t = s * 1.13f          // the emoji tile's own footprint
+        val l = cx - t * 0.5f
+        val tp = cy - t * 0.5f
+        fun ux(u: Float) = l + u * t
+        fun vy(v: Float) = tp + v * t
+        // the white band inside the tile, per art
+        var v0 = 0.235f; var v1 = 0.774f   // rewind / ff
+        when (art) {
+            TransportArt.PLAY -> { v0 = 0.192f; v1 = 0.817f }
+            TransportArt.PAUSE -> { v0 = 0.202f; v1 = 0.808f }
+            TransportArt.PREV, TransportArt.NEXT -> { v0 = 0.260f; v1 = 0.750f }
+            else -> {}
+        }
+        p.style = Paint.Style.FILL
+        if (art != TransportArt.PLAY) {
+            // alpha folded into the stops so the tile dims with the face
+            val cols = IntArray(TRACK_BLUE.size) { i ->
+                (TRACK_BLUE[i] and 0x00FFFFFF) or (a shl 24)
+            }
+            p.shader = LinearGradient(l, tp, l, tp + t, cols, TRACK_BLUE_POS,
+                Shader.TileMode.CLAMP)
+            val tile = Path()
+            tile.addRoundRect(RectF(l, tp, l + t, tp + t),
+                t * 0.04f, t * 0.04f, Path.Direction.CW)
+            c.drawPath(tile, p)
+            p.shader = null
+        }
+        p.color = Color.argb(a, 255, 255, 255)
+        fun bar(u0: Float, u1: Float) =
+            c.drawRect(ux(u0), vy(v0), ux(u1), vy(v1), p)
+        fun tri(u0: Float, u1: Float, right: Boolean) {
+            val base = if (right) ux(u0) else ux(u1)
+            val tip = if (right) ux(u1) else ux(u0)
+            c.drawPath(Path().apply {
+                moveTo(base, vy(v0)); lineTo(tip, vy((v0 + v1) * 0.5f))
+                lineTo(base, vy(v1)); close()
+            }, p)
+        }
+        when (art) {
+            // A pair overlaps slightly at the centre row the way the
+            // artwork does, so the notch between the two opens upward and
+            // downward instead of running the full height as a straight gap.
+            TransportArt.REW -> {
+                tri(0.144f, 0.500f, false); tri(0.450f, 0.808f, false)
+            }
+            TransportArt.FF -> {
+                tri(0.202f, 0.546f, true); tri(0.515f, 0.856f, true)
+            }
+            TransportArt.PREV -> {
+                bar(0.173f, 0.250f); tri(0.251f, 0.569f, false)
+                tri(0.527f, 0.836f, false)
+            }
+            TransportArt.NEXT -> {
+                tri(0.164f, 0.473f, true); tri(0.431f, 0.749f, true)
+                bar(0.750f, 0.827f)
+            }
+            TransportArt.PAUSE -> { bar(0.317f, 0.423f); bar(0.577f, 0.683f) }
+            TransportArt.PLAY -> tri(0.269f, 0.788f, true)
+        }
+    }
+
     /** A swept button's face: a rounded square with a triangular dip cut
      *  into each SIDE edge — the two edges the sweep may be entered through
      *  — in the same language as the toolbar buttons and the bookmarks
@@ -5641,7 +5732,7 @@ void main(){
      *  rect): an entry notch must never advertise a gesture that is turned
      *  off. Coordinates are texel-space edges — left, top, right, bottom. */
     private fun sweepFacePath(l: Float, t: Float, r: Float, b: Float): Path {
-        val rad = MENU_COL_CORNER_FRAC * (r - l)
+        val rad = MENU_CORNER_FRAC * (r - l)
         val dip = if (sweepEnabled) (r - l) * 0.09f else 0f
         val dh = (r - l) * 0.24f
         val my = (t + b) * 0.5f
@@ -5669,21 +5760,19 @@ void main(){
         }
     }
 
-    /** Fill and stroke that face. All three left-column buttons are solid
-     *  dark squares with a white glyph over them — the dips are the only
-     *  thing that comes and goes with sweep, since a notch must never
-     *  advertise a gesture that is turned off. The fill brightens and the
-     *  border goes blue only while the sweep holds the button, so the
-     *  picture cannot disagree with the gesture. */
+    /** Fill and stroke that face. Every button on the panel is a solid dark
+     *  square with a white glyph over it — the dips are the only thing that
+     *  comes and goes with sweep, since a notch must never advertise a
+     *  gesture that is turned off. The fill brightens and the border goes
+     *  blue only while the sweep holds the button, so the picture cannot
+     *  disagree with the gesture. */
     private fun sweepFace(c: Canvas, p: Paint, box: FloatArray, a: Int,
-                          hot: Boolean, armed: Boolean, filled: Boolean) {
+                          hot: Boolean, armed: Boolean) {
         val l = box[0]; val t = box[1]; val r = box[2]; val b = box[3]
         val path = sweepFacePath(l, t, r, b)
-        if (filled || hot) {
-            p.style = Paint.Style.FILL
-            p.color = if (hot) Color.argb(a, 30, 58, 95) else Color.argb(a, 21, 32, 45)
-            c.drawPath(path, p)
-        }
+        p.style = Paint.Style.FILL
+        p.color = if (hot) Color.argb(a, 30, 58, 95) else Color.argb(a, 21, 32, 45)
+        c.drawPath(path, p)
         p.style = Paint.Style.STROKE
         p.strokeWidth = ((r - l) * 0.08f).coerceAtLeast(3f)
         p.color = if (armed) Color.argb(a, 56, 189, 248)
@@ -5694,16 +5783,13 @@ void main(){
 
     /** The cue toggle's icon: an oval loop with an arrowhead when the same
      *  video repeats (the default), a straight arrow pointing right when
-     *  autocue is set. White over the face, drawn in the bitmap's own
-     *  texel space like every other glyph on this panel. */
-    private fun cueGlyph(c: Canvas, p: Paint, box: FloatArray, a: Int) {
+     *  autocue is set. White over the face the draw loop already laid down,
+     *  drawn in the bitmap's own texel space like every other glyph. */
+    private fun cueIcon(c: Canvas, p: Paint, box: FloatArray, a: Int) {
         val l = box[0]; val t = box[1]; val r = box[2]; val b = box[3]
         val s = r - l
         val cx = (l + r) * 0.5f
         val cy = (t + b) * 0.5f
-        val armed = sweepBtn(MENU_CUE_ID)?.armed == true
-        sweepFace(c, p, box, a,
-            hot = menuHot(MENU_CUE_ID), armed = armed, filled = true)
 
         // ---- icon ----
         p.color = Color.argb(a, 255, 255, 255)
