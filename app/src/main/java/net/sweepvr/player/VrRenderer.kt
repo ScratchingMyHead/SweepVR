@@ -681,6 +681,11 @@ class VrRenderer(
          *  rather than a second, disagreeing number. Every button face on
          *  the panel draws with it now, not just the left column. */
         const val MENU_CORNER_FRAC = 0.10f
+        /** Icon size for the transport row, files / web and the ± columns,
+         *  as a fraction of what they used to draw at: at full size the
+         *  glyphs came too close to the button edges. The faces themselves
+         *  are unchanged — only the icons inside them shrink. */
+        const val MENU_ICON_FRAC = 0.9f
         /** The transport tile's blue, crown to foot, as the colour emoji
          *  font on this device paints it: near-white cyan at the top
          *  settling to a mid blue at the bottom. */
@@ -5529,21 +5534,25 @@ void main(){
                 hot = menuHot(b.id),
                 armed = sweepBtn(b.id)?.armed == true)
             when (b.id) {
+                // Transport, files / web and the ± columns draw their icons
+                // at MENU_ICON_FRAC of the old size: at full size they came
+                // too close to the button edges. The faces don't move.
+                2, 18 -> text(b.glyph, cx, cy, 44f * MENU_ICON_FRAC, a)
                 // transport row: our own artwork (blue tile, white shapes),
                 // never the fonts — see transportGlyph
-                3 -> transportGlyph(c, p, cx, cy, 44f, a, TransportArt.PREV)
-                4 -> transportGlyph(c, p, cx, cy, 44f, a, TransportArt.REW)
-                5 -> transportGlyph(c, p, cx, cy, 44f, a,
+                3 -> transportGlyph(c, p, cx, cy, 44f * MENU_ICON_FRAC, a, TransportArt.PREV)
+                4 -> transportGlyph(c, p, cx, cy, 44f * MENU_ICON_FRAC, a, TransportArt.REW)
+                5 -> transportGlyph(c, p, cx, cy, 44f * MENU_ICON_FRAC, a,
                     if (menuPlaying) TransportArt.PAUSE else TransportArt.PLAY)
-                6 -> transportGlyph(c, p, cx, cy, 44f, a, TransportArt.FF)
-                7 -> transportGlyph(c, p, cx, cy, 44f, a, TransportArt.NEXT)
+                6 -> transportGlyph(c, p, cx, cy, 44f * MENU_ICON_FRAC, a, TransportArt.FF)
+                7 -> transportGlyph(c, p, cx, cy, 44f * MENU_ICON_FRAC, a, TransportArt.NEXT)
                 // the ± columns: glyphs sized to their 0.6-unit faces
-                8 -> magnifierGlyph(c, p, cx, cy, 50f, a, true)
-                9 -> magnifierGlyph(c, p, cx, cy, 50f, a, false)
-                10 -> speakerGlyph(c, p, cx, cy, 18f, a, true)
-                11 -> speakerGlyph(c, p, cx, cy, 18f, a, false)
-                14 -> fovGlyph(c, p, cx, cy, 44f, a, false)
-                15 -> fovGlyph(c, p, cx, cy, 44f, a, true)
+                8 -> magnifierGlyph(c, p, cx, cy, 50f * MENU_ICON_FRAC, a, true)
+                9 -> magnifierGlyph(c, p, cx, cy, 50f * MENU_ICON_FRAC, a, false)
+                10 -> speakerGlyph(c, p, cx, cy, 18f * MENU_ICON_FRAC, a, true)
+                11 -> speakerGlyph(c, p, cx, cy, 18f * MENU_ICON_FRAC, a, false)
+                14 -> fovGlyph(c, p, cx, cy, 44f * MENU_ICON_FRAC, a, false)
+                15 -> fovGlyph(c, p, cx, cy, 44f * MENU_ICON_FRAC, a, true)
                 12 -> flipGlyph(c, p, cx, cy, 40f, a)
                 13 -> crosshairGlyph(c, p, cx, cy, 40f, a)
                 0 -> text(b.glyph, cx, cy, 36f, a)
