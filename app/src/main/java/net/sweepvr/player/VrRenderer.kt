@@ -38,6 +38,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Shader
+import kotlin.math.roundToInt
 import java.util.Locale
 import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
@@ -48,6 +49,8 @@ import com.google.vr.sdk.base.Eye
 import com.google.vr.sdk.base.GvrView
 import com.google.vr.sdk.base.HeadTransform
 import com.google.vr.sdk.base.Viewport
+import net.sweepvr.player.thumbs.FramePixels
+import net.sweepvr.player.thumbs.ThumbStrip
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -627,6 +630,473 @@ class VrRenderer(
      *  instead of sitting head-locked, because what it reads is the position
      *  the drop commits to. See updateTooltip. */
     private var seekTipOnThumb = false
+
+    /** ---------- seek preview card (the thumbnail under the slider) ----------
+     *
+     *  The grip drags a small card under the slider: the time it will seek
+     *  to on top, the frame from that moment below. It replaces the floating
+     *  pill on the seek bar while a drag is held (a bare hover still gets the
+     *  pill), because the whole point here is that the pill's number and the
+     *  picture beside it must be read together, and the pill has nowhere to
+     *  put a picture.
+     *
+     *  Frames are decoded in the background (see the thumbs package) and
+     *  handed over the same way a web page capture is: a volatile pending
+     *  reference, uploaded on the GL thread. Only one frame is ever live.
+     */
+    private var thumbTexId = 0
+    private var thumbBitmap: Bitmap? = null
+
+    /**
+     * Waiting for the GL thread. Atomic, and that is not tidiness: the
+     * extractor hands frames over from its own thread while this one uploads,
+     * and a check-then-recycle between them recycles the very bitmap being
+     * uploaded — which does not throw, it segfaults inside texImage2D when the
+     * driver asks the recycled bitmap for its size. Whoever takes the value
+     * out owns it; whoever puts one in owns whatever it displaced.
+     */
+    private val thumbBmpPending = java.util.concurrent.atomic.AtomicReference<Bitmap?>(null)
+
+    /** The five-second span the live preview stands for, and its shape. */
+    private var thumbBucket = -1
+    private var thumbAspect = 16f / 9f
+
+    /** The composited card: frame, time and picture in one image, so it
+     *  moves as a unit and cannot flicker against itself. */
+    private var cardBitmap: Bitmap? = null
+    /** Set by clearThumb from any thread; acted on by the GL thread. */
+    @Volatile
+    private var thumbDrop = false
+    private var cardAspect = 1f
+    private var thumbCardKey = ""
+
+    @Volatile
+    private var thumbBucketIn = -1
+
+    @Volatile
+    private var thumbAspectIn = 16f / 9f
+
+    /** Bucket last asked of the extractor, so a drag crossing the film asks
+     *  once per span rather than once per frame. */
+    private var thumbAskedBucket = -1
+
+    /** Set by the activity: hand a bucket to the background builder. */
+    @Volatile
+    var thumbSink: ((Int) -> Unit)? = null
+
+    /** The span the grip is over: what the card is for, and the only thing
+     *  it may show. -1 when no drag is held. */
+    @Volatile
+    var cardWantedSpan = -1
+
+    /** Where the card is centred: the grip, in design panel space. */
+    private fun seekThumbCentreU(): Float {
+        val g = seekDrag.thumbRect()      // engine space, y down
+        return (g.left + g.right) * 0.5f
+    }
+
+    /**
+     * The card: time above, picture below, as ONE composited image drawn as
+     * one quad.
+     *
+     * It used to be three things — a frame rectangle and a time label drawn
+     * into the menu bitmap, the picture drawn as a quad on top — and that
+     * split is what made it flicker: the menu bitmap is rebuilt every frame
+     * of a drag and its edges land on whole texels, while the quad's edges
+     * land wherever the grip is, so a sub-texel sliver of frame showed and
+     * hid along the picture's edge at 60 Hz. One image cannot disagree with
+     * itself, so the whole card is composited once per preview and moved as
+     * a unit.
+     *
+     * Returns left, bottom, right, top in design units.
+     */
+    private fun thumbCard(): FloatArray {
+        val imgH = THUMB_IMG_H
+        val imgW = minOf(THUMB_IMG_MAX_W, imgH * thumbAspect)
+        val cardW = imgW + THUMB_CARD_PAD * 2f
+        val cardH = THUMB_TIME_H + imgH + THUMB_CARD_PAD * 2f
+        val top = menuBar.y - menuBar.hh - THUMB_CARD_GAP
+        var cu = seekThumbCentreU()
+        val lim = MENU_X1 - cardW * 0.5f - 0.06f
+        cu = cu.coerceIn(-lim, lim)
+        return floatArrayOf(cu - cardW * 0.5f, top - cardH, cu + cardW * 0.5f, top)
+    }
+
+    /**
+     * Compose the card bitmap if anything about it has changed: a new preview,
+     * or a new second on the clock. The pixels are derived from the design
+     * size, so the picture on it is exactly the shape the quad is.
+     */
+    private fun maybeBuildThumbCard(timeText: String) {
+        val img = thumbBitmap ?: return
+        if (thumbTexId < 0) return
+        val key = "$thumbBucket|$timeText|${(thumbAspect * 1000f).toInt()}"
+        if (key == thumbCardKey && cardBitmap != null) return
+        thumbCardKey = key
+        // Picture height in card texels; the card's pixel size follows from
+        // the design size so the two can never drift apart.
+        val imgHpx = CARD_IMG_H_TEX
+        val imgWpx = (imgHpx * img.width.toFloat() / img.height)
+            .roundToInt().coerceIn(CARD_IMG_H_TEX / 2, CARD_IMG_MAX_W_TEX)
+        val padPx = (THUMB_CARD_PAD * PIXELS_PER_DESIGN_UNIT).roundToInt()
+        val timePx = (THUMB_TIME_H * PIXELS_PER_DESIGN_UNIT).roundToInt()
+        val W = imgWpx + padPx * 2
+        val H = imgHpx + padPx * 2 + timePx
+        cardAspect = W.toFloat() / H
+        val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(Color.TRANSPARENT)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        // The card body, matching the panel's own faces.
+        val rad = padPx * 1.6f
+        p.style = Paint.Style.FILL
+        p.color = Color.argb(235, 10, 14, 22)
+        c.drawRoundRect(1f, 1f, (W - 1).toFloat(), (H - 1).toFloat(), rad, rad, p)
+        p.color = Color.argb(255, 226, 232, 240)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = maxOf(2f, padPx * 0.34f)
+        c.drawRoundRect(p.strokeWidth, p.strokeWidth, W - p.strokeWidth, H - p.strokeWidth, rad, rad, p)
+        p.style = Paint.Style.FILL
+        // Time, in its own row above the picture — inside the card, so it
+        // cannot collide with anything outside it.
+        p.color = Color.WHITE
+        p.textSize = timePx * 0.74f
+        p.textAlign = Paint.Align.CENTER
+        c.drawText(timeText, W / 2f, timePx * 0.80f, p)
+        p.textAlign = Paint.Align.LEFT
+        c.drawBitmap(img, null, RectF(padPx.toFloat(), (timePx + padPx).toFloat(),
+            (W - padPx).toFloat(), (H - padPx).toFloat()), p)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, thumbTexId)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        cardBitmap?.recycle()
+        cardBitmap = bmp
+    }
+
+    /** The five-second span the position in hand falls in: what the grip is
+     *  being asked for, whether or not that frame has arrived yet. */
+    private fun thumbBucketInHand(): Int {
+        val ms = (menuSeekHoverU.coerceIn(0f, 1f) * menuDurMs).toLong()
+        return ThumbStrip.bucketOf(ms, ThumbStrip.DEFAULT_BUCKET_MS)
+    }
+
+    /**
+     * Ask the background builder for the preview of the span in hand — once
+     * per span, not once per frame: a drag can cross the whole film in a
+     * second, and each request is a seek the builder has to give up its
+     * current work for. The builder decides what is free to build.
+     */
+    private fun requestSeekThumb() {
+        val sink = thumbSink ?: return
+        if (!sweepEnabled || menuDurMs <= 0L) return
+        val b = thumbBucketInHand()
+        if (b == thumbAskedBucket) return
+        thumbAskedBucket = b
+        cardWantedSpan = b
+        sink.invoke(b)
+    }
+
+    /**
+     * True while a hand is on the grip. The activity's bandwidth gate reads
+     *  it, and the readback below stands aside for it.
+     */
+    val seekDragHeld: Boolean get() = seekDrag.engaged
+
+    /**
+     * Whether the card should be on screen: a drag is held and there is a
+     * preview to show.
+     *
+     * Deliberately NOT "and the preview is the exact bucket under the grip".
+     * Requiring that made the card blink out for the frame or two between
+     * buckets while the new one was fetched — a flicker at every five-second
+     * boundary, which is exactly what it looked like. Showing the nearest
+     * frame we have keeps the picture steady under the moving grip, and the
+     * time printed above it is the exact position the drop will seek to, so
+     * nothing is misrepresented.
+     */
+    private fun thumbCardReady(): Boolean =
+        seekTipOnThumb && sweepEnabled && menuDurMs > 0L && thumbBucket >= 0 &&
+            thumbBucket == cardWantedSpan
+
+    /**
+     * A preview, from the background builder. Ownership passes here: the
+     * previous frame is recycled once the new one is on the GPU.
+     */
+    fun submitThumb(bucket: Int, bmp: Bitmap) {
+        // While the grip is held, the card shows the frame for the span under
+        // it and nothing else. The prebuild's captures arrive here too — they
+        // are the newest frames in the system — so without this the card
+        // displays whatever the sweep last grabbed (minutes away from where
+        // the user is pointing) under a label saying where the drop will
+        // land. That looked like a strip that was wildly out of time, and
+        // sorted itself out only once the strip was complete, because by then
+        // a drag was fetching the right frame itself.
+        if (seekTipOnThumb && bucket != cardWantedSpan) {
+            bmp.recycle()
+            return
+        }
+        thumbBucketIn = bucket
+        thumbAspectIn = bmp.width.toFloat() / bmp.height.coerceAtLeast(1)
+        // A newer frame displaces an older waiting one rather than queueing
+        // behind it: a preview that arrives late is a preview of somewhere
+        // the grip has already left. The displaced one has provably not been
+        // taken by the GL thread yet (it took its own value out already), so
+        // freeing it here is safe.
+        thumbBmpPending.getAndSet(bmp)?.recycle()
+    }
+
+    /** Called by the activity when the strip is closed: drop the preview so a
+     *  preview from the last film cannot sit under the next one's slider. */
+    fun clearThumb() {
+        // Callable from any thread, so it frees NOTHING: the two bitmaps the GL
+        // thread owns are released there, and the waiting one is simply
+        // dropped (getAndSet claims it atomically, so it cannot be recycled
+        // out from under an upload).
+        thumbBmpPending.getAndSet(null)?.recycle()
+        thumbDrop = true
+        thumbBucket = -1
+        thumbBucketIn = -1
+        thumbAskedBucket = -1
+        cardWantedSpan = -1
+        thumbAspect = 16f / 9f
+        thumbAspectIn = thumbAspect
+        thumbCardKey = ""
+    }
+
+    // ---------- seek-preview capture ----------
+    //
+    // The preview player decodes into [previewSt], and the frame is read back
+    // through a framebuffer sized for the picture rather than for the film:
+    // a 1920x960 frame read at full size would be 7 MB per thumbnail and a
+    // visible stall on the render thread, while 288x144 is ~170 KB and
+    // sub-millisecond. Everything here runs on the GL thread; only the
+    // finished bytes are handed off (see [previewSink]).
+    private var previewOesId = 0
+    private var previewSt: SurfaceTexture? = null
+    private var previewSurface: android.view.Surface? = null
+    private var previewFbo = 0
+    private var previewFbTex = 0
+    private var previewW = 0
+    private var previewH = 0
+    /** The film the builder told us about, and the eye-shaped crop the
+     *  readback is sized for (written from the main thread, read here). */
+    @Volatile
+    private var previewSrcW = 0
+
+    @Volatile
+    private var previewSrcH = 0
+    /** The SOURCE size the framebuffer was last built for. Compared against
+     *  the source size asked for — comparing it against the OUTPUT size
+     *  (144) instead can never match (960), and that mismatch rebuilds the
+     *  texture and a fresh readback buffer every frame, which is a freeze. */
+    private var previewBuiltSrcW = 0
+    private var previewBuiltSrcH = 0
+    private var previewPixels: ByteBuffer? = null
+    private val previewTexMat = FloatArray(16)
+    private val previewPosBuf: FloatBuffer = fb(floatArrayOf(
+        -1f, 1f, 0f, 1f, -1f, -1f, 0f, 1f, 1f, 1f, 0f, 1f, 1f, -1f, 0f, 1f))
+    private val previewTexBuf: FloatBuffer = fb(floatArrayOf(
+        0f, 1f, 0f, 1f, 0f, 0f, 0f, 1f, 1f, 1f, 0f, 1f, 1f, 0f, 0f, 1f))
+    private val previewIdentity = floatArrayOf(
+        1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f)
+
+    /** Frames the preview SurfaceTexture has received (any thread). */
+    @Volatile
+    private var previewFrameSeq = 0
+    private var previewDrainedSeq = 0
+    private var shortReadLogged = false
+
+    /** Bumped whenever the GL context is rebuilt, so the preview player can
+     *  tell its Surface is stale. */
+    @Volatile
+    var previewGen = 0
+        private set
+
+    /** The span being fetched, stamped onto the frame we hand over. */
+    @Volatile
+    var previewExpectBucket = -1
+
+    /**
+     * Whether a frame arriving now belongs to the fetch in progress.
+     *
+     * Set false when a seek is issued and true only once the player reports
+     * being AT the target. Without the gap, the frame that matters is easy to
+     * lose: `seekTo` is asynchronous, so calling `play()` straight after it
+     * resumes playback at the OLD position for a moment, and that frame gets
+     * filed against the new span — a preview of somewhere the film has not
+     * reached yet, which is worse than no preview.
+     */
+    @Volatile
+    var previewSeekArmed = false
+
+    /** Receives (bucket, RGBA bytes, width, height) on the GL thread. The
+     *  receiver owns the array. */
+    @Volatile
+    var previewSink: ((Int, ByteArray, Int, Int) -> Unit)? = null
+
+    /**
+     * The Surface the preview player should decode into. Valid between GL
+     * context rebuilds; re-read it (and compare [previewGen]) whenever the
+     * player is (re)started, since a context loss invalidates the old one.
+     */
+    fun previewSurface(): android.view.Surface? = previewSurface
+
+    /**
+     * The film is [w] x [h]: size the readback framebuffer to that shape, at
+     * preview height. Nothing is captured until this is called, because the
+     * framebuffer cannot be built without knowing what it is reading.
+     */
+    fun setPreviewSourceSize(w: Int, h: Int) {
+        if (w <= 0 || h <= 0) return
+        // Recorded, not acted on: this is called from the main thread (which
+        // owns the player) and GL objects may only be touched on the GL
+        // thread. drainPreviewFrame does the actual work.
+        previewSrcW = w
+        previewSrcH = h
+    }
+
+    /** Build (or rebuild) the readback framebuffer for the film we now know
+     *  the size of. GL thread; the size is chosen so the picture lands at
+     *  preview height, cropped by the stereo layout on the CPU afterwards. */
+    private fun ensurePreviewFbo() {
+        val w = previewSrcW
+        val h = previewSrcH
+        if (w <= 0 || h <= 0) return
+        if (previewFbo != 0 && previewBuiltSrcW == w && previewBuiltSrcH == h) return
+        // The WHOLE frame, not one eye: which eye the preview shows is the
+        // builder's decision, and sizing the readback for the eye as well
+        // meant the crop was taken twice — the preview showed a quarter of
+        // the picture, which is not a preview of anything.
+        val size = FramePixels.fitWithin(w, h, PREVIEW_READ_H, PREVIEW_READ_MAX_W)
+        val nw = size[0]
+        val nh = size[1]
+        if (nw <= 0 || nh <= 0) return
+        previewW = nw; previewH = nh
+        previewBuiltSrcW = w; previewBuiltSrcH = h
+        previewPixels = ByteBuffer.allocateDirect(nw * nh * 4).order(ByteOrder.nativeOrder())
+        if (previewFbo == 0) {
+            val t = IntArray(1)
+            GLES20.glGenTextures(1, t, 0)
+            previewFbTex = t[0]
+            GLES20.glGenFramebuffers(1, t, 0)
+            previewFbo = t[0]
+        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, previewFbTex)
+        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, nw, nh, 0,
+            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, previewFbo)
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+            GLES20.GL_TEXTURE_2D, previewFbTex, 0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        FileLog.i("SweepVR-GL", "preview readback ${nw}x$nh for ${w}x$h (${stereo})")
+    }
+
+    /**
+     * Take the newest preview frame if one has arrived. GL thread, once per
+     * frame: sample the SurfaceTexture, draw it into the readback
+     * framebuffer at the size we want rather than the size it arrived, and
+     * read that back — so the cost of a preview is a few hundred kilobytes
+     * and never a full-resolution copy.
+     */
+    private fun drainPreviewFrame() {
+        val sink = previewSink ?: return
+        val st = previewSt ?: return
+        ensurePreviewFbo()
+        if (previewDrainedSeq >= previewFrameSeq) return
+        // One frame per drain: the builder asks for one at a time, and a
+        // second frame would be somewhere the grip has already left.
+        previewDrainedSeq = previewFrameSeq
+        val bucket = previewExpectBucket
+        // Not armed: a seek is in flight and any frame is from the position
+        // before it. Latch it (below) but keep nothing.
+        if (!previewSeekArmed) {
+            try { st.updateTexImage() } catch (e: Throwable) {
+                FileLog.w("SweepVR-GL", "preview latch failed: ${e.message}")
+            }
+            return
+        }
+        // A frame we cannot use STILL has to be latched. updateTexImage is
+        // what releases the buffer back to the producer, and a SurfaceTexture
+        // has a small fixed pool: a frame that arrives and is never latched
+        // fills it, and the decoder then blocks for good. Skipping this
+        // because "nobody wanted that frame" is what leaves the prebuild
+        // waiting forever on a player that has already stopped producing.
+        if (bucket < 0 || seekTipOnThumb || previewFbo == 0 || previewW <= 0 || previewH <= 0) {
+            try { st.updateTexImage() } catch (e: Throwable) {
+                FileLog.w("SweepVR-GL", "preview latch failed: ${e.message}")
+            }
+            return
+        }
+        // Not while the grip is held (checked above): reading a frame back is
+        // a pipeline synchronisation point on the thread that draws both eyes,
+        // and a drag is exactly when a hitch reads as the world juddering.
+        // The strip is built ahead of time, so the drag itself reads previews
+        // from disk and needs nothing from here.
+        val px = previewPixels ?: return
+        try {
+            st.getTransformMatrix(previewTexMat)
+            st.updateTexImage()
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, previewFbo)
+            GLES20.glViewport(0, 0, previewW, previewH)
+            // Scissor OFF, and this is not tidiness: drawEye leaves the
+            // scissor set to the last eye's half of the window, and
+            // glReadPixels obeys the scissor. Reading a 144-wide framebuffer
+            // through a box starting at x=1163 clips the whole read away and
+            // hands back nothing at all, silently.
+            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+            GLES20.glDisable(GLES20.GL_BLEND)
+            GLES20.glUseProgram(progVideo)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, previewOesId)
+            GLES20.glUniform1i(uVideoTexVid, 0)
+            GLES20.glUniform1f(uCropVid, 0f)   // no zoom: this is the frame as it is
+            GLES20.glUniformMatrix4fv(uTexMatVid, 1, false, previewTexMat, 0)
+            GLES20.glUniformMatrix4fv(uTexTransVid, 1, false, previewTexMat, 0)
+            GLES20.glUniformMatrix4fv(uMvpVid, 1, false, previewIdentity, 0)
+            GLES20.glEnableVertexAttribArray(aPositionVid)
+            GLES20.glVertexAttribPointer(aPositionVid, 4, GLES20.GL_FLOAT, false, 0, previewPosBuf)
+            GLES20.glEnableVertexAttribArray(aTexCoordVid)
+            GLES20.glVertexAttribPointer(aTexCoordVid, 4, GLES20.GL_FLOAT, false, 0, previewTexBuf)
+            previewPosBuf.position(0); previewTexBuf.position(0)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            GLES20.glDisableVertexAttribArray(aPositionVid)
+            GLES20.glDisableVertexAttribArray(aTexCoordVid)
+            px.clear()
+            GLES20.glReadPixels(0, 0, previewW, previewH, GLES20.GL_RGBA,
+                GLES20.GL_UNSIGNED_BYTE, px)
+            // The Java binding writes at the buffer's position and does NOT
+            // advance it, unlike the C API. Reading the length back out of
+            // position() therefore yields zero every time, and the frame comes
+            // out as an empty array — which is how a working readback ends up
+            // looking like an impossible crop.
+            px.position(0)
+            px.limit(previewW * previewH * 4)
+        } catch (e: Throwable) {
+            FileLog.w("SweepVR-GL", "preview readback failed: ${e.message}")
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            return
+        }
+        // Leave GL exactly as we found it: this runs mid-frame, and the eyes
+        // are about to draw.
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        val bytes = ByteArray(px.remaining())
+        px.get(bytes)
+        val err = GLES20.glGetError()
+        if (err != GLES20.GL_NO_ERROR) {
+            // Say so once: a failed read here is invisible from the builder,
+            // which sees only an empty array and an impossible crop.
+            if (!shortReadLogged) {
+                shortReadLogged = true
+                FileLog.w("SweepVR-GL", "preview readback glErr=$err bytes=${bytes.size}")
+            }
+        }
+        sink.invoke(bucket, bytes, previewW, previewH)
+    }
     /** Last ray/plane hit in design panel space (menuHitTest). */
     private var menuHitU = 0f
     private var menuHitV = 0f
@@ -709,6 +1179,34 @@ class VrRenderer(
          *  the drop a shorter gesture — now about the travel of dipping one
          *  of the buttons. */
         const val SEEK_HANDLE_H = 0.52f
+        /** The seek preview card under the slider: image height, and the
+         *  width it may grow to before the picture's own shape decides. */
+        const val THUMB_IMG_H = 1.72f
+        const val THUMB_IMG_MAX_W = 3.00f
+        /** Row of text above the picture, and the card's own padding/gap.
+         *  The card hangs from just under the bar to the panel's bottom edge
+         *  (design y -2.0), and that gap is all the room there is: padding +
+         *  time + picture is sized to land on the edge, not past it. */
+        const val THUMB_TIME_H = 0.34f
+        const val THUMB_CARD_PAD = 0.08f
+        const val THUMB_CARD_GAP = 0.05f
+        /** The composited card's picture, in card texels, and its width cap.
+         *  264 keeps the card's upload around 0.3 MB, once per preview. */
+        const val CARD_IMG_H_TEX = 480
+        const val CARD_IMG_MAX_W_TEX = 960
+        /** Card texels per design unit, so the composite and the quad it is
+         *  drawn as are the same size by construction rather than by two sets
+         *  of numbers agreeing. */
+        val PIXELS_PER_DESIGN_UNIT: Float =
+            (CARD_IMG_H_TEX + 16f) / (THUMB_IMG_H + THUMB_CARD_PAD * 2f)
+        /** Preview readback size: height in pixels, and the width cap. The
+         *  card shows the picture about 0.54 design units tall, which is some
+         *  50 texels of the panel bitmap — but a readback at that size has
+         *  nothing left to show once it is cropped and squashed into a 4:3-ish
+         *  box, so this reads the frame a few times over and lets it be
+         *  scaled down to the panel. */
+        const val PREVIEW_READ_H = 288
+        const val PREVIEW_READ_MAX_W = 576
         /** How far past either end of that track the reticle may travel
          *  before the drag counts as abandoned rather than an overshoot.
          *  Small on purpose: the track already runs half a handle past the
@@ -733,13 +1231,18 @@ class VrRenderer(
         )
         val TRACK_BLUE_POS = floatArrayOf(0f, 0.45f, 0.65f, 0.85f, 1f)
         /** Panel texture covers x ∈ [MENU_X0, MENU_X1], y ∈ [MENU_Y0, MENU_Y1]
-         *  in panel space (y up), 1024 texels wide. */
+         *  in panel space (y up), 1024 texels wide.
+         *
+         *  The bottom edge sits well below anything drawn on the panel: it is
+         *  the room the seek-preview card occupies while a drag is held. The
+         *  texture height follows the design span at the same ~96.5 texels a
+         *  unit is wide, so extending the panel does not stretch it. */
         const val MENU_X0 = -5.3f
         const val MENU_X1 = 5.3f
-        const val MENU_Y0 = -2.0f
+        const val MENU_Y0 = -3.50f
         const val MENU_Y1 = 1.4f
         const val MENU_TEX_W = 1024
-        const val MENU_TEX_H = 328
+        const val MENU_TEX_H = 474
         /** Viewing distance the panel rect was authored for (the flat screen
          *  sits at −11.95 too); the live rect scales with panelDistM. */
         const val MENU_DESIGN_R = 11.95f
@@ -1085,6 +1588,33 @@ void main(){
         surface = android.view.Surface(surfaceTexture)
         surfaceGen++
 
+        // ---- seek-preview capture ----
+        // A second SurfaceTexture for the background preview player, plus a
+        // small framebuffer to read it back through. Both die with this GL
+        // context; the preview player is handed the new Surface afterwards.
+        try { previewSurface?.release(); previewSt?.release() } catch (_: Exception) {}
+        previewSt = null; previewSurface = null; previewFbo = 0; previewFbTex = 0
+        GLES20.glGenTextures(1, tex, 0)
+        previewOesId = tex[0]
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, previewOesId)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        val pst = SurfaceTexture(previewOesId)
+        pst.setOnFrameAvailableListener { previewFrameSeq++ }
+        previewSt = pst
+        previewSurface = android.view.Surface(pst)
+        previewW = 0; previewH = 0; previewSrcW = 0; previewSrcH = 0
+        previewBuiltSrcW = 0; previewBuiltSrcH = 0
+        // Both counters, together. updateTexImage() BLOCKS until a frame is
+        // queued, so "have I seen more frames than I've taken" has to be true
+        // or the render thread hangs — and after a context rebuild the old
+        // frame count means nothing against the new SurfaceTexture.
+        previewDrainedSeq = 0
+        previewFrameSeq = 0
+        previewGen++
+
         GLES20.glGenTextures(1, tex, 0)
         browserTexId = tex[0]
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, browserTexId)
@@ -1133,6 +1663,16 @@ void main(){
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tipTexId)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+
+        GLES20.glGenTextures(1, tex, 0)
+        thumbTexId = tex[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, thumbTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        // A new GL context means new textures and no bitmaps behind them: the
+        // pending hand-off from the extractor may be long gone by then.
+        thumbBmpPending.set(null)
+        thumbDrop = false
 
         videoGeomKey = ""; webMeshKey = "" // meshes survive, but rebuild against the new session
         browserGrid = null
@@ -1192,6 +1732,7 @@ void main(){
         // BROWSER mode now, so the queue must keep draining there too.
         surfaceTexture?.let { st ->
             if (frameAvailable || arrivedFrames > 0) {
+                drainPreviewFrame()
                 try { st.updateTexImage(); if (frameAvailable) consumedFrames++ } catch (e: Throwable) { texFailCount++; if (texFailCount <= 3 || texFailCount % 300 == 0) { android.util.Log.e("SweepVR-GL", "updateTexImage failed #$texFailCount", e); FileLog.e("SweepVR-GL", "updateTexImage failed #$texFailCount", e) } }
                 frameAvailable = false
             }
@@ -1276,6 +1817,37 @@ void main(){
         }
 
         val cur = mode
+        // Seek preview: take the newest decoded frame (if any) before anyone
+        // samples it. Same hand-off as the web page capture — the extractor
+        // thread cannot touch GL, and this is the only place that can.
+        val tb = thumbBmpPending.getAndSet(null)
+        if (tb != null && thumbTexId >= 0) {
+            thumbBucket = thumbBucketIn
+            thumbAspect = thumbAspectIn
+            try {
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, thumbTexId)
+                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, tb, 0)
+                thumbBitmap?.recycle()
+                thumbBitmap = tb
+            } catch (_: Throwable) {
+                tb.recycle()
+            }
+        }
+        // A clear from another thread is finished here, where the bitmaps it
+        // refers to are safe to release.
+        if (thumbDrop) {
+            thumbDrop = false
+            cardBitmap?.recycle()
+            cardBitmap = null
+            thumbBitmap?.recycle()
+            thumbBitmap = null
+        }
+        // The preview card is a composite of the picture and the time it
+        // would drop at, so it is rebuilt when either changes — and only
+        // then, so a drag does not re-upload it sixty times a second.
+        if (cur == Mode.VIDEO && menuOpen && thumbCardReady()) {
+            maybeBuildThumbCard(fmtTime((menuSeekHoverU.coerceIn(0f, 1f) * menuDurMs).toLong()))
+        }
         // Web page: upload the latest capture (if the page changed) before
         // anyone samples it.
         val wb = webBmpPending
@@ -1429,8 +2001,27 @@ void main(){
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         if (cur == Mode.VIDEO) { if (menuAlpha > 0f) drawMenuPanel(menuAlpha) }
         else if (browAlpha > 0f) drawBrowser(browAlpha)
+        // The preview picture sits on the panel it belongs to, after it (the
+        // panel bitmap carries the card behind it) and before the head-locked
+        // reticle and pills, which belong to the gaze rather than the control.
+        if (cur == Mode.VIDEO && menuAlpha > 0f) drawSeekThumb(menuAlpha)
         drawHeadLocked()
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+    }
+
+    /**
+     * The seek preview's picture, in the card the panel bitmap drew behind
+     * it: the image area of the card, at the card's own shape (never
+     * stretched — a preview that is not the frame's shape is a lie about
+     * what is on screen). One textured quad in the panel's plane, like the
+     * anchored pill, so it tracks the grip and never needs clipping: the
+     * picture is generated at exactly the aspect of the rect it fills.
+     */
+    private fun drawSeekThumb(alpha: Float) {
+        if (!thumbCardReady() || thumbTexId < 0 || cardBitmap == null) return
+        val card = thumbCard()
+        panelQuad(card[0], card[1], card[2], card[3])
+        drawQuadTex(thumbTexId, ovM, alpha)
     }
 
     /** Dwell progress 0..1 for the browser pointer (full ring → point).
@@ -2752,6 +3343,8 @@ void main(){
             // live reticle in the same breath — otherwise a grip already
             // under the reticle reads as an entry on the very next line.
             if (seekDrag.engaged && nowMs - seekLastT > 100L) {
+                FileLog.i("SweepVR-menu", "seek drag died: frame gap " +
+                    "${nowMs - seekLastT}ms at value=${"%.2f".format(seekDrag.value)}")
                 seekDrag.reset()
                 seekDrag.prime(menuHitU, -menuHitV)
             }
@@ -2771,6 +3364,11 @@ void main(){
             // engine is left alone instead — its last position is a real
             // approach, and clearing it would make the entry test invent
             // one. Primed only where the reticle's position is live.
+            // Logged because this used to end a drag with nothing in the log
+            // to say so, and an end that appears to be a commit is a bug you
+            // cannot argue with from the other side.
+            FileLog.i("SweepVR-menu", "seek drag died: ${if (hit) "sweep off" else "left the panel"} " +
+                "at value=${"%.2f".format(seekDrag.value)}")
             seekDrag.reset()
             if (hit) seekDrag.prime(menuHitU, -menuHitV)
         }
@@ -2779,6 +3377,13 @@ void main(){
     }
 
     private fun updateMenu() {
+        // The grip's "held" state is read elsewhere — the seek-preview capture
+        // stands aside for a drag, and the bandwidth gate gives the link up
+        // — so it has to mean "held right now" on EVERY path out of this
+        // function, including the ones that return before the grip is
+        // stepped. Left stale it silently disables previews for the rest of
+        // the session, which is exactly what it did.
+        seekTipOnThumb = false
         // recenter aim flow: consume the UI-thread request, close the menu,
         // arm the big blue pointer (suppresses the open logic below)
         if (aimRequest) {
@@ -2880,8 +3485,12 @@ void main(){
             menuHighlight = -1
             menuDwellFiredFor = -3
             updateTooltip(-1)
+            requestSeekThumb()
             return
         }
+        // Not dragging: nothing to preview, and the card must not linger over
+        // a slider nobody is holding.
+        thumbAskedBucket = -1
         if (hit) {
             menuHitValid = true
             val id = menuHitId
@@ -2976,6 +3585,11 @@ void main(){
         val txt = when {
             !enableTooltip -> ""
             !menuHot(id) -> ""
+            // While the grip is held, the seek bar's readout is the preview
+            // card under the slider (time above, picture below): the pill
+            // stands aside rather than repeating the same number a foot away
+            // from the picture it belongs to.
+            id == -1 && seekTipOnThumb -> ""
             id == -1 && menuDurMs > 0 && menuSeekHoverU >= 0f ->
                 fmtTime((menuSeekHoverU.coerceIn(0f, 1f) * menuDurMs).toLong())
             // The cue toggle's name is its state, so it is read live.
@@ -2990,21 +3604,13 @@ void main(){
         if (!tooltipVisible) return
         // Float just above and to the right of the control: the pill's
         // bottom-left corner clears the control's top-right corner. Fixed
-        // relative to the control, so it never slides around while the
-        // gaze creeps across the button. The seek bar (id -1) rides the
-        // GRIP while the drag is held — the pill then states the position
-        // the drop will seek to, so it belongs to the thumb, not to the
-        // gaze — and stays head-locked on a bare hover, where it stands in
-        // for the time readout under the reticle.
+        // relative to the control, so it never slides around while the gaze
+        // creeps across the button. The seek bar keeps the head-locked spot
+        // on a bare hover, where it stands in for the time readout and has
+        // to follow the scrub point; mid-drag it is the card's job instead.
         val b = if (id == -1) null else menuButton(id)
-        val g = if (id == -1 && seekTipOnThumb) seekDrag.thumbRect() else null
-        tipAnchored = b != null || g != null
-        if (g != null) {
-            // thumbRect() is engine space (y down); the pill's v is design
-            // space (y up), so the thumb's top edge is -g.top.
-            tipU = g.right + TIP_GAP + TIP_HALF_W
-            tipV = -g.top + TIP_GAP + TIP_HALF_H
-        } else if (b != null) {
+        tipAnchored = b != null
+        if (b != null) {
             tipU = b.x + b.hw + TIP_GAP + TIP_HALF_W
             tipV = b.y + b.hh + TIP_GAP + TIP_HALF_H
         }

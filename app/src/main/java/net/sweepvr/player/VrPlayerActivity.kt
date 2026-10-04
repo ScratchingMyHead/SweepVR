@@ -14,6 +14,9 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.RelativeLayout
 import com.google.vr.sdk.base.GvrView
+import net.sweepvr.player.thumbs.ThumbBuilder
+import net.sweepvr.player.thumbs.ThumbSplit
+import net.sweepvr.player.thumbs.ThumbMemory
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
@@ -266,6 +269,21 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private var connId: String = ""
     private var playUrl: String? = null
     private var playIsProxy = false
+
+    // ---------- seek previews ----------
+    /** The one live preview builder; see the thumbs package for why there is
+     *  a second player at all. */
+    private var thumbs: ThumbBuilder? = null
+    private val thumbStore by lazy { ThumbMemory() }
+    /** Last bitrate ExoPlayer measured (bits/s), -1 until it has one. Feeds
+     *  the proxy's ceiling for background reads. */
+    private var lastBitrate = -1L
+    /** Set for a couple of seconds after any seek: the player is about to
+     *  pull a burst, and that is the worst possible moment to compete. */
+    private var seekPressureUntil = 0L
+    private var thumbsStarted = false
+    private var previewRefusalLogged = false
+    private var lastPressureCheck = -1L
     // SAF (SD card) folder picker state: volume awaiting a grant.
     private var pendingSafVolume: String? = null
     private val safPicker = registerForActivityResult(
@@ -788,7 +806,17 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 renderer.menuPosMs = pos
                 renderer.menuDurMs = p.duration.coerceAtLeast(0)
                 renderer.menuPlaying = p.playWhenReady && p.playbackState == Player.STATE_READY
+                // Belt and braces for the preview strip: the timeline callback
+                // is the fast path, but this one fires whenever the duration is
+                // genuinely known, which is the only thing the strip needs.
+                if (p.duration > 0) startThumbPrebuild(p.duration)
                 val buf = (p.bufferedPosition - pos).coerceAtLeast(0)
+                // Every other tick is soon enough to react to the player
+                // starving, and slow enough not to chatter the proxy log.
+                if (System.currentTimeMillis() / 2000L != lastPressureCheck) {
+                    lastPressureCheck = System.currentTimeMillis() / 2000L
+                    updateThumbPressure()
+                }
                 val frames = renderer.frameCount
                 val fps = frames - lastWatchFrames
                 lastWatchFrames = frames
@@ -854,6 +882,10 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     }
 
     override fun onDestroy() {
+        // Before the player goes: the prebuild holds its own player, decoder
+        // and reader thread, and none of that is worth keeping past the
+        // activity that started it.
+        stopThumbPrebuild()
         player?.release(); player = null
         if (playIsProxy) playUrl?.let { StreamProxy.unregisterByUrl(it) }
         super.onDestroy()
@@ -2901,6 +2933,11 @@ try {
                     // optimistic position: bar jumps before the seek lands
                     val target = (e.frac.coerceIn(0f, 1f) * d).toLong()
                     renderer.menuPosMs = target
+                    // Where a drop was asked to land, against the frame the
+                    // card was showing for it: the two together say whether a
+                    // mismatch is the strip or the commit.
+                    FileLog.i(TAG, "commit ${"%.4f".format(e.frac)} -> ${target}ms " +
+                        "(card frame for span ${(target / 10_000)})")
                     p.seekTo(target)
                 }
             }
@@ -3000,10 +3037,40 @@ try {
                 // Engine-verbose internals to logcat (pull with logcat -d):
                 // decoder init/release, formats, rendered/dropped counters.
                 exo.addAnalyticsListener(androidx.media3.exoplayer.util.EventLogger())
+                // The link's real throughput, straight from the loader: the
+                // ceiling for preview reads is a share of what playback is
+                // actually achieving, not a guess at what the network can do.
+                exo.addAnalyticsListener(object :
+                    androidx.media3.exoplayer.analytics.AnalyticsListener {
+                    override fun onBandwidthEstimate(
+                        eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
+                        totalLoadTimeMs: Int,
+                        totalBytesLoaded: Long,
+                        bitrateEstimate: Long
+                    ) {
+                        lastBitrate = bitrateEstimate
+                    }
+                })
                 exo.addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(state: Int) {
                         // REPEAT_MODE_ONE never gets here; autocue does.
                         if (state == Player.STATE_ENDED) onMediaEnded()
+                    }
+                    override fun onTimelineChanged(
+                        timeline: androidx.media3.common.Timeline,
+                        reason: Int
+                    ) {
+                        // Duration arrives with the timeline: the first moment
+                        // the strip has a length to be built over.
+                        val d = runCatching { exo.duration }.getOrDefault(androidx.media3.common.C.TIME_UNSET)
+                        if (d != androidx.media3.common.C.TIME_UNSET) startThumbPrebuild(d)
+                    }
+                    override fun onPositionDiscontinuity(
+                        oldPosition: androidx.media3.common.Player.PositionInfo,
+                        newPosition: androidx.media3.common.Player.PositionInfo,
+                        reason: Int
+                    ) {
+                        seekPressureUntil = System.currentTimeMillis() + 2500
                     }
                     override fun onPlayerError(error: PlaybackException) {
                         FileLog.e(TAG, "player error: ${error.message}", error)
@@ -3115,11 +3182,93 @@ try {
                 }
             }
         }
+        // A new film means a new strip: drop the last film's preview so it
+        // cannot sit under this one's slider, and arm the prebuild to start
+        // as soon as the duration is known (startThumbPrebuild's callers).
+        renderer.clearThumb()
+        thumbsStarted = false
+        previewRefusalLogged = false
+        if (playUrl == null) playUrl = url
         Log.i(TAG, "play: $url")
         player?.setMediaItem(MediaItem.fromUri(url))
         player?.prepare()
         player?.playWhenReady = true
         txtStatus.text = "▶ $name  •  ${renderer.projection.label} ${renderer.stereo.label}"
+    }
+
+    /**
+     * Start prebuilding this film's seek-preview strip, once its duration is
+     * known. From here it fills in the background at its own pace, five
+     * seconds at a time, without ever being the reason playback stalls.
+     */
+    private fun startThumbPrebuild(durationMs: Long) {
+        if (thumbsStarted || durationMs <= 0L) return
+        val url = playUrl
+        if (url == null) {
+            // Once per film, not once a tick: the watchdog asks every couple
+            // of seconds for as long as anything is loaded.
+            if (!previewRefusalLogged) {
+                previewRefusalLogged = true
+                FileLog.w(TAG, "preview prebuild skipped: no playback URL")
+            }
+            return
+        }
+        thumbsStarted = true
+        val split = when (renderer.stereo) {
+            Stereo.SBS -> ThumbSplit.HALF_LEFT
+            Stereo.TB -> ThumbSplit.HALF_TOP
+            else -> ThumbSplit.FULL
+        }
+        val b = thumbs ?: ThumbBuilder(this, renderer, thumbStore,
+            onThumb = { bucket, bmp -> renderer.submitThumb(bucket, bmp) },
+            onStripDone = { renderer.showToast("Seek previews ready", 2500) }
+        ).also {
+            thumbs = it
+            renderer.thumbSink = { bucket -> thumbs?.request(bucket) }
+        }
+        b.start(url, durationMs, split)
+        // Said out loud, because a strip that builds itself over minutes with
+        // no sign of life reads as a broken feature.
+        renderer.showToast("Building seek previews…", 3000)
+        FileLog.i(TAG, "preview prebuild: ${durationMs / 1000}s, split=$split")
+    }
+
+    /** Stop the prebuild and let go of the preview texture state. */
+    private fun stopThumbPrebuild() {
+        thumbs?.stop()
+        thumbs = null
+        renderer.thumbSink = null
+        renderer.clearThumb()
+        thumbsStarted = false
+    }
+
+    /**
+     * Tell the proxy how the player is doing, so background preview reads
+     * know when to stand aside: nothing at all while it is buffering or
+     * pulling a seek, and a share of the measured bandwidth otherwise.
+     */
+    private fun updateThumbPressure() {
+        val p = player ?: return
+        // Only a player that is ACTUALLY short of data counts. Merely being
+        // in BUFFERING is not starvation — over SMB that state comes and goes
+        // constantly, and treating it as starvation left the prebuild held off
+        // nearly all the time, so it never produced anything.
+        val ahead = p.bufferedPosition - p.currentPosition
+        val starving = (p.playbackState == Player.STATE_BUFFERING && ahead < 2000L) ||
+            renderer.seekDragHeld ||
+            System.currentTimeMillis() < seekPressureUntil
+        StreamProxy.setPlaybackPressure(starving)
+        if (lastBitrate > 0L) {
+            // A quarter of what the link really delivers, capped: enough to
+            // build a strip briskly on a fast one, negligible on a slow one.
+            // Half of what playback is really achieving: enough that a strip
+            // finishes in minutes rather than an hour, and the hold-off above
+            // (plus the proxy's own pacing) is what keeps it off the player's
+            // back when the player needs the link.
+            StreamProxy.setBackgroundCeiling(
+                (lastBitrate / 2).coerceIn(1_000_000L, 12_000_000L)
+            )
+        }
     }
 
     private fun cycleProjection() {
