@@ -5751,20 +5751,66 @@ void main(){
     private fun makeReticle(color: Int): Int {
         val tex = IntArray(1)
         GLES20.glGenTextures(1, tex, 0)
-        val bmp = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
+        // 256, not 96. The reticle is minified hard the moment it is drawn:
+        // dwell shrinks it to 15% of its size (1 - 0.85·prog), and on the web
+        // page it is a quad at the page's depth rather than the panel's. At 96
+        // a single dwell step threw away four texels per axis and the ring went
+        // to visible steps — which read as "pixelated" rather than as "small".
+        // The resolution buys back the headroom that shrink spends.
+        val S = 256
+        val cxy = S * 0.5f
+        val bmp = Bitmap.createBitmap(S, S, Bitmap.Config.ARGB_8888)
         val c = Canvas(bmp)
-        // transparent background (needs BLEND enabled); small ring that
-        // the draw code shrinks toward a point as dwell progresses
+        // transparent background (needs BLEND enabled)
         c.drawColor(Color.TRANSPARENT)
         val p = Paint(Paint.ANTI_ALIAS_FLAG)
-        p.color = color; p.style = Paint.Style.STROKE; p.strokeWidth = 7f
-        c.drawCircle(48f, 48f, 30f, p)
+
+        // Geometry as fractions of the half-width, so every ring below keeps
+        // its proportion to the reticle at any texture size.
+        val R = cxy * 0.62f          // ring radius
+        val ringW = cxy * 0.115f    // the bright ring's own thickness
+        val keyW = ringW * 2.35f    // the dark outline around it
+
+        // A dark ring UNDER the coloured one, slightly wider. This is what
+        // makes it read as one clean object instead of a shape that vanishes
+        // over white and buzzes over video: the keyline is the constant edge,
+        // and the colour is the highlight inside it. Drawing it as a wider
+        // stroke underneath rather than as a second path means the coloured
+        // ring's edge is still a single antialiased curve.
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = keyW
+        p.color = Color.argb(215, 6, 9, 14)
+        c.drawCircle(cxy, cxy, R, p)
+
+        p.strokeWidth = ringW
+        p.color = color
+        c.drawCircle(cxy, cxy, R, p)
+
+        // The centre dot, same construction: dark disc under a bright one, so
+        // it survives whatever it lands on. Slightly under half the ring's
+        // thickness across, which is the ratio that reads as a dot rather than
+        // as a second ring.
         p.style = Paint.Style.FILL
-        c.drawCircle(48f, 48f, 5f, p)
+        val dotR = cxy * 0.105f
+        p.color = Color.argb(225, 6, 9, 14)
+        c.drawCircle(cxy, cxy, dotR * 1.7f, p)
+        p.color = color
+        c.drawCircle(cxy, cxy, dotR, p)
+
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        // Mipmapped, because minification is the normal case for this quad and
+        // GL_LINEAR alone point-samples it: at dwell's 15% size one screen
+        // pixel was covering several ring texels and the sample landed on
+        // whichever happened to be there, which is the crawl. Mip levels make
+        // it a proper average, so shrinking stays smooth all the way down.
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        // After the upload, at level 0: a mipmapped texture with no levels is
+        // incomplete and samples as solid black.
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
         bmp.recycle()
         return tex[0]
     }
