@@ -1213,15 +1213,29 @@ class VrRenderer(
          *  handle either side (so value 0 and 1 sit on the bar's ENDS) and
          *  set to [SEEK_HANDLE_H] tall; see [seekDrag]. */
         const val SEEK_HANDLE_W = 0.42f
-        /** The grip's height: 0.52 against the bar's own 0.6, so about four
-         *  texels of bar clear the grip top and bottom. The grip must not
+        /** The grip's height: 0.468 against the bar's own 0.6, so more of
+         *  the bar clears the grip top and bottom. The grip must not
          *  swallow the line it rides on — with the bar hidden behind it the
          *  position has no visible context, and there is nothing to aim the
          *  entry at but the grip alone. It is also the drag's vertical band
          *  (a drop is a move past the grip's edge), so a shorter grip makes
          *  the drop a shorter gesture — now about the travel of dipping one
          *  of the buttons. */
-        const val SEEK_HANDLE_H = 0.52f
+        const val SEEK_HANDLE_H = 0.468f
+
+        /**
+         * The grip's border while it is held: a medium blue, and the same
+         * blue as the line down its middle (SEEK_GRIP_MARK_RGB).
+         *
+         * Dark enough to read against the seek bar's own blue historical
+         * fill rather than vanishing into it, which is what a border lighter
+         * than the fill did — and light enough to still be a rim against the
+         * grip's dark face at arm's length.
+         */
+        const val SEEK_GRIP_ARMED_RGB = 0x4A8FD0.toInt()
+        /** The grip's centre line: the same blue, a touch lighter so it
+         *  reads as a mark on the face rather than a seam. */
+        const val SEEK_GRIP_MARK_RGB = 0x6FB0E8.toInt()
         /** The seek preview card under the slider: image height, and the
          *  width it may grow to before the picture's own shape decides. */
         const val THUMB_IMG_H = 1.72f
@@ -6445,7 +6459,40 @@ void main(){
             val g = seekDrag.thumbRect()   // engine space, y-down
             sweepFace(c, p, floatArrayOf(
                 tx(g.left), ty(-g.top), tx(g.right), ty(-g.bottom)),
-                alphaOf(-1), hot = seekDrag.engaged, armed = seekDrag.engaged)
+                alphaOf(-1), hot = seekDrag.engaged, armed = seekDrag.engaged,
+                // Purple, not the shared armed blue. The grip's border sits
+                // directly against the seek bar's blue historical fill, so a
+                // blue rim on a blue fill is the one thing that cannot be seen
+                // — and it is the border that says the drag is live, which is
+                // exactly what is wanted at that moment. Purple is near enough
+                // to the far side of the wheel to read as its complement while
+                // staying light against the dark face.
+                armedRgb = SEEK_GRIP_ARMED_RGB,
+                // Half the fill's opacity, so the bar reads through the grip
+                // while it is held. The border stays opaque: that is the part
+                // carrying the state, and a translucent rim on a translucent
+                // fill would leave nothing to see. 255 (the default) while the
+                // grip is idle, so an untouched grip is as solid as every
+                // other face on the panel.
+                hotAlpha = if (seekDrag.engaged) 128 else 255)
+            // A line down the middle of the grip, in the border's own blue:
+            // the affordance that says "this slides" without a glyph, and the
+            // one part of the grip that reads the same whether it is held or
+            // not. Drawn inside the face's own width rather than to the tips,
+            // so it cannot be mistaken for the notch on either end.
+            p.style = Paint.Style.STROKE
+            p.strokeCap = Paint.Cap.ROUND
+            p.strokeWidth = ((g.right - g.left) * 0.13f).coerceAtLeast(2f)
+            p.color = Color.argb(alphaOf(-1), (SEEK_GRIP_MARK_RGB shr 16) and 0xFF,
+                (SEEK_GRIP_MARK_RGB shr 8) and 0xFF, SEEK_GRIP_MARK_RGB and 0xFF)
+            val ml = tx(g.left)
+            val mr = tx(g.right)
+            val mt = ty(-g.top)
+            val mb = ty(-g.bottom)
+            val mcx = (ml + mr) * 0.5f
+            val mInset = (mb - mt) * 0.22f
+            c.drawLine(mcx, mt + mInset, mcx, mb - mInset, p)
+            p.strokeCap = Paint.Cap.BUTT
         }
         // position / duration under the bar (the live seek time rides the
         // head-locked tooltip pill instead, so the two never overlap).
@@ -6652,15 +6699,22 @@ void main(){
      *  blue only while the sweep holds the button, so the picture cannot
      *  disagree with the gesture. */
     private fun sweepFace(c: Canvas, p: Paint, box: FloatArray, a: Int,
-                          hot: Boolean, armed: Boolean) {
+                          hot: Boolean, armed: Boolean, armedRgb: Int = 0x38BDF8,
+                          hotAlpha: Int = -1) {
         val l = box[0]; val t = box[1]; val r = box[2]; val b = box[3]
         val path = sweepFacePath(l, t, r, b)
         p.style = Paint.Style.FILL
-        p.color = if (hot) Color.argb(a, 30, 58, 95) else Color.argb(a, 21, 32, 45)
+        // The grip's held face is the one fill that gives up opacity: it lies
+        // across the seek bar, and opaque it buried the track and the playhead
+        // under the very thing being dragged along it. -1 means "use the
+        // caller's alpha", which is what every other button wants.
+        val ha = if (hotAlpha >= 0) (a * hotAlpha / 255).coerceIn(0, 255) else a
+        p.color = if (hot) Color.argb(ha, 30, 58, 95) else Color.argb(ha, 21, 32, 45)
         c.drawPath(path, p)
         p.style = Paint.Style.STROKE
         p.strokeWidth = ((r - l) * 0.08f).coerceAtLeast(3f)
-        p.color = if (armed) Color.argb(a, 56, 189, 248)
+        p.color = if (armed) Color.argb(a, (armedRgb shr 16) and 0xFF,
+                  (armedRgb shr 8) and 0xFF, armedRgb and 0xFF)
                   else Color.argb(a, 71, 85, 105)
         c.drawPath(path, p)
         p.style = Paint.Style.FILL
