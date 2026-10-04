@@ -7,7 +7,8 @@ package net.sweepvr.player.sweep
  * A value you drag along a track: a scrollbar thumb, a slider, a scrub bar.
  *
  * Enter it from either END of its axis, and it snaps to the reticle and
- * follows. Let go across the axis to commit the value; let go past either end
+ * follows - or, with [relativeGrab], it simply picks the value up where it
+ * was and follows from there. Let go across the axis to commit the value; let go past either end
  * to abandon it and leave the value alone.
  *
  * That last rule is the whole reason this is a shared control rather than
@@ -41,6 +42,20 @@ class ValueDragControl(
      * changing it silently changes the gesture. The dropdown is unaffected.
      */
     var centreSnap: Boolean = true,
+    /**
+     * Carry on from where you grabbed (true), or snap the value to the
+     * reticle on entry (false, the default).
+     *
+     * Snapping is right for a scrollbar, where the thumb is only a handle
+     * on a position the page owns anyway. A seek bar is the other way
+     * round: the thumb IS the position, so a snap moves the video the
+     * moment the gesture is latched and before the user has moved at all -
+     * and always by however far from the centre the grab happened to land.
+     * With this on, entry records the offset between the value and the
+     * reticle and the value keeps that offset for the whole drag, so
+     * latching changes nothing and every movement after it is 1:1.
+     */
+    var relativeGrab: Boolean = false,
     var cornerFraction: Float = 0f
 ) {
     enum class Axis { VERTICAL, HORIZONTAL }
@@ -68,6 +83,10 @@ class ValueDragControl(
         private set
 
     var engaged: Boolean = false; private set
+
+    /** The offset a relative grab carries: value minus the value the grab
+     *  point maps to. Zero while no relative drag has happened. */
+    private var grabOffset = 0f
 
     /** Fired with the value to commit to, on a sideways release. */
     var onCommit: ((Float) -> Unit)? = null
@@ -132,7 +151,8 @@ class ValueDragControl(
             return when (val ev = engine.step(at, thumbRect(), config())) {
                 is SweepEvent.Entered -> {
                     valueBeforeDrag = value
-                    value = valueAt(at)
+                    if (relativeGrab) grabOffset = value - valueRaw(at)
+                    else value = valueAt(at)
                     engaged = true
                     onTrace?.invoke("grab ${"%.2f".format(value)} via ${ev.side}")
                     true
@@ -146,7 +166,8 @@ class ValueDragControl(
         if (out != null) { release(out, at); return true }
         // Deliberately not traced per frame: at 60fps it is 60 lines a second
         // and it buried the one line that matters, the drop.
-        value = valueAt(at)
+        value = if (relativeGrab) (valueRaw(at) + grabOffset).coerceIn(0f, 1f)
+                else valueAt(at)
         return true
     }
 
@@ -182,23 +203,34 @@ class ValueDragControl(
      * the way along, and the reticle came to rest on the thumb's edge rather
      * than inside it.
      */
-    private fun valueAt(p: Pt): Float {
+    private fun valueAt(p: Pt): Float = valueRaw(p).coerceIn(0f, 1f)
+
+    /**
+     * [valueAt] without the clamp.
+     *
+     * The clamp is right for a snap - a value past either end is not a value
+     * - but it destroys a relative grab: take it on entry and the offset is
+     * pinned by wherever the reticle happened to be, so the drag cannot run
+     * into either end from the inside. Both forms clamp at the last moment
+     * instead, which is also what stops the drag overshooting on its own.
+     */
+    private fun valueRaw(p: Pt): Float {
         val f = thumbFraction.coerceIn(0.02f, 1f)
         if (!centreSnap) {
             return if (axis == Axis.VERTICAL) {
-                if (track.height <= 0f) 0f else ((p.y - track.top) / track.height).coerceIn(0f, 1f)
+                if (track.height <= 0f) 0f else (p.y - track.top) / track.height
             } else {
-                if (track.width <= 0f) 0f else ((p.x - track.left) / track.width).coerceIn(0f, 1f)
+                if (track.width <= 0f) 0f else (p.x - track.left) / track.width
             }
         }
         return if (axis == Axis.VERTICAL) {
             val thumbH = track.height * f
             val travel = track.height - thumbH
-            if (travel <= 0f) 0f else ((p.y - track.top - thumbH * 0.5f) / travel).coerceIn(0f, 1f)
+            if (travel <= 0f) 0f else (p.y - track.top - thumbH * 0.5f) / travel
         } else {
             val thumbW = track.width * f
             val travel = track.width - thumbW
-            if (travel <= 0f) 0f else ((p.x - track.left - thumbW * 0.5f) / travel).coerceIn(0f, 1f)
+            if (travel <= 0f) 0f else (p.x - track.left - thumbW * 0.5f) / travel
         }
     }
 
@@ -224,5 +256,12 @@ class ValueDragControl(
     fun reset() {
         engine.reset()
         engaged = false
+    }
+
+    /** Seed the engine's history with where the reticle is now, so a reset
+     *  made while it already sits on the thumb cannot turn the next frame
+     *  into an entry. See [SweepEngine.prime]. */
+    fun prime(x: Float, y: Float) {
+        engine.prime(Pt(x, y))
     }
 }

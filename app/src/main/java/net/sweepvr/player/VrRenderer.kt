@@ -616,7 +616,10 @@ class VrRenderer(
     private var menuHighlight = -2 // -1 = seek bar, 0..19 buttons, -2 = decorative
     private var menuDwellFiredFor = -3
     private var menuHitValid = false
-    // hovered seek fraction (panel design x) for the live time tooltip; -1 = none
+    /** Where a seek from the bar would land: under the reticle, or the value
+     *  in hand while the grip is dragged. The one anchor a preview thumbnail
+     *  would hang off later — the position being pointed at, whoever is
+     *  pointing. -1 = none. */
     private var menuSeekHoverU = -1f
     /** Last ray/plane hit in design panel space (menuHitTest). */
     private var menuHitU = 0f
@@ -686,6 +689,29 @@ class VrRenderer(
          *  glyphs came too close to the button edges. The faces themselves
          *  are unchanged — only the icons inside them shrink. */
         const val MENU_ICON_FRAC = 0.9f
+        /** The seek bar's grip: the handle the sweep latches onto, in
+         *  design units — as wide as it is tall once the bar's own band
+         *  counts, and grown this far above and below the bar so the
+         *  reticle can take hold of it without landing dead on the line.
+         *  Both numbers build the drag's track, which is the bar widened by
+         *  half a handle either side; see [seekDrag]. */
+        const val SEEK_HANDLE_W = 0.42f
+        const val SEEK_HANDLE_GROW = 0.06f
+        /** How far past either end of that track the reticle may travel
+         *  before the drag counts as abandoned rather than an overshoot.
+         *  Small on purpose: the track already runs half a handle past the
+         *  bar, and the − of the right-hand columns starts at x = 2.85 — a
+         *  longer tolerance would let a runaway drag walk the reticle into
+         *  zoom− sideways and arm it on the way out. */
+        const val SEEK_END_LEEWAY = 0.06f
+        /** How long a committed seek shows as the grip's position before
+         *  falling back to the reported playback position. The commit is
+         *  posted to the UI thread and so is the optimistic position that
+         *  goes with it, so for a frame or two the player still reports
+         *  where the video WAS — the grip would jump back and then
+         *  forward again. It drops out early the moment playback reaches
+         *  the committed position. */
+        const val SEEK_STICKY_MS = 3000L
         /** The transport tile's blue, crown to foot, as the colour emoji
          *  font on this device paints it: near-white cyan at the top
          *  settling to a mid blue at the bottom. */
@@ -2352,13 +2378,55 @@ void main(){
      *  while sweep is on — one entry dip per side and the same commit rules
      *  as the toolbar buttons. Derived from the list above so a button
      *  cannot be added without being swept (read after menuButtons for that
-     *  reason). With sweep off they are ordinary dwell buttons again; only
-     *  the seek bar (id -1) still dwells. */
+     *  reason). With sweep off they are ordinary dwell buttons again. The
+     *  seek bar (id -1) is never in this list: it always dwells — a click
+     *  anywhere on the bar is a seek — and with sweep on it also takes the
+     *  grip, [seekDrag], which is how you drag the playhead. */
     private val SWEEP_MENU_IDS: IntArray = menuButtons.map { it.id }.toIntArray()
     /** Seek bar (id -1), decorative title and backdrop, all design units.
      *  The bar sits left of centre so the − row of the ± columns has its
      *  own lane at the right edge. */
     private val menuBar = MenuBtn(-1, -0.45f, -0.75f, 3.0f, 0.3f)
+    /** A committed seek, shown as the grip's position until playback gets
+     *  there (see seekShownU). -1 = nothing pending. */
+    private var seekStickyU = -1f
+    private var seekStickyT = 0L
+    /** Last frame the grip's drag was stepped, for the frame-gap rule. */
+    private var seekLastT = 0L
+    /** The seek bar's grip: a drag rather than a momentary, so it is stepped
+     *  from updateMenu on the same frame as the buttons and for the same
+     *  reason — a release must resolve exactly once. Engine space, y-down,
+     *  like every other rect here.
+     *
+     *  The track is the bar widened by half a handle either side, so value 0
+     *  and value 1 land on the bar's ENDS rather than a half-handle in from
+     *  them; that makes thumbFraction = handle / (bar + handle) and puts the
+     *  grip's centre exactly where seekFrac() answers, so the grip, the
+     *  progress fill it sits on and the hit test can only ever agree.
+     *
+     *  relativeGrab is the point of the exercise: latching must not seek. A
+     *  snap would move the video the instant the gesture is taken, by
+     *  however far the reticle happened to land from the grip's centre — so
+     *  the offset between value and reticle is captured on entry instead and
+     *  carried for the whole drag. */
+    private val seekDrag = net.sweepvr.player.sweep.ValueDragControl(
+        axis = net.sweepvr.player.sweep.ValueDragControl.Axis.HORIZONTAL,
+        thumbFraction = SEEK_HANDLE_W / (menuBar.hw * 2f + SEEK_HANDLE_W),
+        leeway = 0.03f, rearm = 0.06f, endLeeway = SEEK_END_LEEWAY,
+        centreSnap = true, relativeGrab = true,
+        cornerFraction = MENU_CORNER_FRAC
+    ).apply {
+        track = net.sweepvr.player.sweep.Rect(
+            menuBar.x - menuBar.hw - SEEK_HANDLE_W * 0.5f,
+            -menuBar.y - menuBar.hh - SEEK_HANDLE_GROW,
+            menuBar.x + menuBar.hw + SEEK_HANDLE_W * 0.5f,
+            -menuBar.y + menuBar.hh + SEEK_HANDLE_GROW)
+        onCommit = { v ->
+            seekStickyU = v
+            seekStickyT = now()
+            onMenuEvent(MenuEvent.Seek(v))
+        }
+    }
     private val menuTitleRect = MenuBtn(-2, 0f, 0.70f, 2.55f, 0.3f)
     /** Pane: bottom stays at −1.2; top hugs the title row (1.05) so the
      *  top band uses less vertical space than the old symmetric 1.2. */
@@ -2578,6 +2646,14 @@ void main(){
         for (s in sweepBtns) {
             if (s.ctl.active || s.armed) { s.ctl.reset(); s.armed = false }
         }
+        // The seek grip is deliberately not reset here. Its history has to
+        // survive a close for the same reason these engines' does (see
+        // stepMenuSweeps above), and a grip actually HELD across one is
+        // caught by the frame-gap rule in stepSeekDrag, where the reticle's
+        // position is known and the history can be re-seeded rather than
+        // left empty. The sticky seek is not cleared either: it is about
+        // where the video is going, not about the gesture, and it expires
+        // (or is met) as soon as playback catches up.
     }
 
     /** Step every button's sweep for this frame. Called once per open
@@ -2619,6 +2695,69 @@ void main(){
             s.lastT = nowMs
             s.armed = c.step(menuHitU, -menuHitV, dt)
         }
+    }
+
+    /** What the grip shows when no drag holds it: where playback is, except
+     *  for the few frames after a commit, where it shows the commit — see
+     *  [SEEK_STICKY_MS]. Cleared the moment playback reaches it (within a
+     *  frame of it at any speed) so the handover is seamless, or when the
+     *  seek clearly is not coming. */
+    private fun seekShownU(): Float {
+        val play = if (menuDurMs > 0) (menuPosMs.toFloat() / menuDurMs).coerceIn(0f, 1f) else 0f
+        val s = seekStickyU
+        if (s < 0f) return play
+        if (menuDurMs <= 0) { seekStickyU = -1f; return play }
+        // 1.6s of the duration: a frame of playback at any speed a seek can
+        // be waiting on, and no longer than a slow one deserves.
+        if (kotlin.math.abs(play - s) <= 1600f / menuDurMs ||
+            now() - seekStickyT > SEEK_STICKY_MS
+        ) { seekStickyU = -1f; return play }
+        return s
+    }
+
+    /** The grip's own sweep, stepped once per open-menu frame before the
+     *  buttons: sideways onto the grip to take hold of it, up or down to
+     *  drop it (which seeks), past either end to abandon it. Returns true
+     *  while the drag owns the frame — no dwell may fill under a hand that
+     *  is already moving the video.
+     *
+     *  Off the panel, or with sweep off, there is no gesture to hold, so
+     *  the grip is re-pointed at playback instead: it is the playhead
+     *  marker first and a handle second. */
+    private fun stepSeekDrag(nowMs: Long, hit: Boolean): Boolean {
+        if (sweepEnabled && hit) {
+            // The buttons' frame-gap rule, for the same reason: a hold that
+            // outlived the menu (a mode change under it) is over, and
+            // resolving it against this frame's reticle would seek to a
+            // place the user never took the grip. The reset empties the
+            // history the entry test reads, so it is re-seeded with the
+            // live reticle in the same breath — otherwise a grip already
+            // under the reticle reads as an entry on the very next line.
+            if (seekDrag.engaged && nowMs - seekLastT > 100L) {
+                seekDrag.reset()
+                seekDrag.prime(menuHitU, -menuHitV)
+            }
+            seekLastT = nowMs
+            seekDrag.onTrace =
+                if (bookDbg) ({ FileLog.i("SweepVR-menu", "seek $it") }) else null
+            if (seekDrag.step(menuHitU, -menuHitV)) {
+                // Held, just taken, or just dropped this frame: the grip is
+                // wherever the gesture left it, and the live time it would
+                // jump to is the value in hand.
+                menuSeekHoverU = seekDrag.value
+                return true
+            }
+        } else if (seekDrag.engaged) {
+            // A HELD drag dies off the panel (no surface to release
+            // against) and when sweep goes off (no gesture left). An idle
+            // engine is left alone instead — its last position is a real
+            // approach, and clearing it would make the entry test invent
+            // one. Primed only where the reticle's position is live.
+            seekDrag.reset()
+            if (hit) seekDrag.prime(menuHitU, -menuHitV)
+        }
+        seekDrag.syncTo(seekShownU())
+        return false
     }
 
     private fun updateMenu() {
@@ -2707,7 +2846,18 @@ void main(){
         // its plane and the button table says what was hit. Uses the
         // animated elevation so the pointer tracks the ⇅ flip.
         val hit = menuHitTest()
+        val seeking = stepSeekDrag(nowMs, hit)
         stepMenuSweeps(nowMs, hit)
+        if (seeking) {
+            // The grip owns this frame. Nothing here may fill a dwell: the
+            // bar's slot is cleared too, so a fill banked before the grab
+            // cannot fire a seek the moment the grip is dropped.
+            menuHighlight = -1
+            menuDwellFiredFor = -3
+            menuProg[menuSlot(-1)] = 0f
+            updateTooltip(-1)
+            return
+        }
         if (hit) {
             menuHitValid = true
             val id = menuHitId
@@ -5462,11 +5612,19 @@ void main(){
         var dwellSum = 0
         for (i in menuProg.indices) dwellSum += (menuProg[i] * 64f).toInt()
         // Armed sweep: the held button's face turns blue, and the dips come
-        // and go with sweep itself — all three are part of the picture.
-        val armedSweeps = sweepBtns.count { it.armed }
+        // and go with sweep itself — the grip is held the same way, so it
+        // counts here too.
+        val armedSweeps = sweepBtns.count { it.armed } + (if (seekDrag.engaged) 1 else 0)
         val h = menuHighlight * 31 + posSec * 131 + durSec * 17 +
             (if (menuPlaying) 1 else 0) + (if (flashing) 1009 else 0) + menuFlash.hashCode() +
             (if (menuSeekHoverU >= 0f) (menuSeekHoverU * 128).toInt() else 0) +
+            // The grip does not wait for a second boundary while a hand is
+            // on it: one term per texel of the bar keeps the picture under
+            // the reticle. Idle it deliberately has none — the grip then
+            // steps with posSec, exactly as the fill under it already does —
+            // and a sticky commit only changes as it is taken and handed back.
+            (if (seekDrag.engaged) (seekDrag.value * 956f).toInt() else 0) * 7 +
+            (if (seekStickyU >= 0f) (seekStickyU * 956f).toInt() else -1) * 13 +
             menuTitle.hashCode() * 7 + skipSecs + dwellSum +
             (if (autoCue) 8191 else 0) + armedSweeps * 65537 +
             (if (sweepEnabled) 262147 else 0)
@@ -5572,6 +5730,18 @@ void main(){
             p.color = white(barA); p.style = Paint.Style.STROKE; p.strokeWidth = 4f
             c.drawRect(bar[0], bar[1], bar[2], bar[3], p)
             p.style = Paint.Style.FILL
+        }
+        // The grip: drawn from the drag's own thumb rect, so the shape the
+        // entry test hits and the shape drawn here are one number. It carries
+        // the same face as every button (dips and all — the notches are the
+        // entry sides), turns blue only while the sweep holds it, and sits on
+        // the playhead. Sweep only: with sweep off there is no gesture to
+        // advertise, and the bar alone is the seek target.
+        if (sweepEnabled) {
+            val g = seekDrag.thumbRect()   // engine space, y-down
+            sweepFace(c, p, floatArrayOf(
+                tx(g.left), ty(-g.top), tx(g.right), ty(-g.bottom)),
+                alphaOf(-1), hot = seekDrag.engaged, armed = seekDrag.engaged)
         }
         // position / duration under the bar (the live seek time rides the
         // head-locked tooltip pill instead, so the two never overlap)

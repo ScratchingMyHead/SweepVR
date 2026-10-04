@@ -191,4 +191,16 @@ class SweepEngine {
         awaitingRearm = false
         prev = Pt(0f, 0f)
     }
+
+    /** Seed the history with a position and emit nothing, as if that were
+     *  last frame's. For a reset made while the reticle may already be ON
+     *  the control: without this the next step reads "inside, and not inside
+     *  last frame" and invents an entry nobody swept - the very thing
+     *  [reset] clearing the history was supposed to prevent. THE RULE is
+     *  about not adding a MARGIN to the test, not about pretending we never
+     *  looked, so seeding where we know we looked costs nothing. */
+    fun prime(at: Pt) {
+        prev = at
+        havePrev = true
+    }
 }

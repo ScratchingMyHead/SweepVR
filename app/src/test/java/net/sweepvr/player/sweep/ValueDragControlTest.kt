@@ -218,4 +218,92 @@ class ValueDragControlTest {
         assertTrue("must not claim the frame", !c.step(10f, 10f))
         assertTrue(c.thumbRect().isEmpty)
     }
+
+    // ---- relative grab (the seek bar's rule) ----
+
+    /** A horizontal track in design units, 600 by 60 with a 10% thumb: the
+     *  seek bar's proportions, so 50 units of reticle is 50/540 of the bar. */
+    private val SEEK = Rect(0f, 0f, 600f, 60f)
+    private fun seekBar(value: Float) = ValueDragControl(
+        axis = ValueDragControl.Axis.HORIZONTAL,
+        thumbFraction = 0.1f,
+        leeway = 3f, rearm = 6f, endLeeway = 6f,
+        relativeGrab = true
+    ).apply { track = SEEK; syncTo(value) }
+
+    /** Grab [c] from the left, landing [into] units inside the thumb's left
+     *  edge - deliberately off centre, where a snap would show. */
+    private fun grabLeft(c: ValueDragControl, into: Float) {
+        val th = c.thumbRect()
+        c.step(th.left - 40f, 30f)
+        assertTrue("must grab from the left", c.step(th.left + into, 30f))
+    }
+
+    /**
+     * The point of it: latching is not a seek. A snap would move the value by
+     * however far the reticle landed from the thumb's centre - here about
+     * 0.05 of the bar, which at an hour in is three minutes of video - and it
+     * would do it the instant the gesture was taken, before the user had
+     * moved at all.
+     */
+    @Test
+    fun `a relative grab leaves the value exactly where it was`() {
+        val c = seekBar(0.5f)
+        grabLeft(c, 5f)
+        assertEquals("latching must not seek", 0.5f, c.value, 0.001f)
+    }
+
+    /** From there the drag is 1:1 with the reticle, measured from the point
+     *  it was grabbed at rather than from the thumb's centre. */
+    @Test
+    fun `a relative drag follows the reticle from the grab point`() {
+        val c = seekBar(0.5f)
+        val th = c.thumbRect()
+        grabLeft(c, 5f)
+        c.step(th.left + 55f, 30f)                     // 50 units right of the grab
+        val travel = SEEK.width * (1f - 0.1f)
+        assertEquals("50 units must be 50 of the track's travel",
+            0.5f + 50f / travel, c.value, 0.001f)
+    }
+
+    /** The clamp belongs at the end of the drag, not on the way in: the
+     *  offset a grab records has to be allowed to carry the value past either
+     *  end, or the last slice of the bar could not be reached from inside. */
+    @Test
+    fun `a relative drag reaches both ends of the track`() {
+        val up = seekBar(0.5f)
+        grabLeft(up, 5f)                               // grabbed on the left half
+        up.step(590f, 30f)                             // dragged hard right
+        assertTrue("must still be dragging", up.engaged)
+        assertEquals("must reach the end", 1f, up.value, 0.001f)
+
+        val down = seekBar(0.5f)
+        val th = down.thumbRect()
+        down.step(th.right + 40f, 30f)
+        assertTrue("must grab from the right", down.step(th.right - 5f, 30f))
+        down.step(10f, 30f)                            // dragged hard left
+        assertTrue("must still be dragging", down.engaged)
+        assertEquals("must reach the start", 0f, down.value, 0.001f)
+    }
+
+    /**
+     * The reset the owner makes when a hold outlives what it was held on
+     * empties the engine's history — and a reticle already sitting on the
+     * thumb then reads as "inside, and not inside last frame", i.e. an entry
+     * nobody swept. Seeding the history with the live reticle is what stops
+     * that, without adding any margin to the entry test itself.
+     */
+    @Test
+    fun `a primed history stops a parked reticle from grabbing`() {
+        val c = seekBar(0.5f)
+        val th = c.thumbRect()
+        val on = th.left + 5f
+        c.reset()
+        c.prime(on, 30f)
+        val parked = c.step(on, 30f)
+        assertTrue("parked must not grab, got $parked", !parked)
+        // ...and leaving and coming back is still the gesture.
+        c.step(th.left - 40f, 30f)
+        assertTrue("a genuine re-approach must grab", c.step(on, 30f))
+    }
 }
