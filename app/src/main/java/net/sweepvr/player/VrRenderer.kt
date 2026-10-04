@@ -49,6 +49,7 @@ import com.google.vr.sdk.base.Eye
 import com.google.vr.sdk.base.GvrView
 import com.google.vr.sdk.base.HeadTransform
 import com.google.vr.sdk.base.Viewport
+import net.sweepvr.player.sweep.Rect
 import net.sweepvr.player.thumbs.FramePixels
 import net.sweepvr.player.thumbs.ThumbStrip
 import java.nio.ByteBuffer
@@ -562,6 +563,157 @@ class VrRenderer(
     }
     private var toastTexId = 0
     private var tipTexId = 0
+
+    // ---------------- on-screen keyboard ----------------
+    //
+    // A floating window, head-locked below whatever panel is up, so one
+    // keyboard serves the web page and the file-manager panel without either
+    // having to own it. Head-locked rather than anchored to a field for the
+    // first cut: it needs no coordinate conversion from either surface, and
+    // anchoring is a small change once the gesture itself is proven.
+    //
+    // It is deliberately NOT subject to menuUsable()'s "nothing dwells when
+    // sweep is on". The keyboard has no dwell to lose - every key is swept -
+    // and the rule exists to stop a dwell firing a control the user is
+    // mid-gesture on. Here the whole surface is gesture.
+    private val kbd = net.sweepvr.player.sweep.KeyboardControl()
+
+    /** The address field opens the keyboard when it is swept through the same
+     *  way every key is: in through its top or bottom, out through the far
+     *  one. It is deliberately NOT a dwell - under sweep, nothing on a panel
+     *  dwells, and the keyboard is the one surface where that rule has to be
+     *  suspended because there is no dwell to lose. */
+    private val addrOpen = net.sweepvr.player.sweep.SweepEngine()
+    private var addrArmed = false
+    private var kbTexId = 0
+    private var kbBitmap: Bitmap? = null
+    private var kbKey = ""
+    private var kbOpen = false
+    private var kbAlpha = 0f
+    private var kbAlphaWant = false
+    /** Gaze in the keyboard's own pixels while it owns the frame, else null. */
+    private var kbHit: FloatArray? = null
+
+    /**
+     * Angular half-height of the keyboard, as a fraction of its DISTANCE.
+     *
+     *  A world size is the wrong thing to hold constant here. The keyboard used
+     *  to live on a head-locked plane at panelDistM while the address field
+     *  sits on the web screen at FLAT_DIST - 2.4 m against 12 m - so the two
+     *  were at completely different depths and the eye had to re-focus
+     *  between them on every glance. Fixing the DEPTH fixes that; keeping a
+     *  fixed world size would then shrink the keyboard to nothing, so its size
+     *  is held constant in ANGLE instead and the world size follows the depth.
+     */
+    private val kbAngleH: Float get() = KBD_HALF_H / panelDistM
+
+    /** Half-height in metres at the depth the keyboard is actually at. */
+    private var kbWorldHalfH = KBD_HALF_H
+        private set
+    private var kbWorldHalfW = KBD_HALF_H * (KBD_TEX_W.toFloat() / KBD_TEX_H)
+
+    /** Where the keyboard sits in the world, and the basis it faces on. */
+    private val kbPoint = FloatArray(3)
+    private val kbRight = FloatArray(3)
+    private val kbUp = FloatArray(3)
+    private val kbNormal = FloatArray(3)
+    private var kbPlaced = false
+    private var kbDiagT = 0L
+    private var kbAliveT = 0L
+
+    /**
+     * Put the keyboard just under the text field, ON THE FIELD'S OWN SURFACE.
+     *
+     * The web screen, when it is up: the point below the toolbar, pushed down
+     * the screen's own vertical axis so it follows the curve rather than
+     * dropping straight to world-floor level. The browser panel otherwise,
+     * which is the panel plane.
+     */
+    private fun placeKeyboard() {
+        val useWeb = mode == Mode.WEB && webPagePointOk && panelDistM > 0.01f
+        if (!useWeb) {
+            // No web surface behind it (the file-manager panel): sit on the
+            // PANEL's own plane, so the depth and the facing both match the
+            // surface it belongs to.
+            if (panelDistM <= 0.01f) { kbPlaced = false; return }
+            val d = panelDistM
+            val el = Math.toRadians(browserElevDeg.toDouble()).toFloat()
+            val ce = kotlin.math.cos(el); val se = kotlin.math.sin(el)
+            val cy = se * d; val cz = -ce * d
+            kbWorldHalfH = kbAngleH * d
+            kbWorldHalfW = kbWorldHalfH * (KBD_TEX_W.toFloat() / KBD_TEX_H)
+            val halfW = panelHalfW()
+            val hh = panelHalfH() * panelHc() / TEX
+            val sx = halfW * 0.86f
+            kbPoint[0] = sx
+            kbPoint[1] = cy - hh - kbWorldHalfH - KBD_TOP_GAP
+            kbPoint[2] = cz
+            // The panel basis, as drawBrowser builds it: right = (1,0,0),
+            // up = n x right, n = the inward normal.
+            kbRight[0] = 1f; kbRight[1] = 0f; kbRight[2] = 0f
+            kbUp[0] = 0f; kbUp[1] = ce; kbUp[2] = se
+            kbNormal[0] = 0f; kbNormal[1] = se; kbNormal[2] = ce
+            kbPlaced = true
+            return
+        }
+        if (useWeb) {
+            // v = TB_V0 is the toolbar's LOWER edge: the boundary the keyboard
+            // hangs from.
+            webPointAt(0.5f, TB_V0, kbPoint)
+            val dTop = kotlin.math.sqrt(
+                (kbPoint[0] - invHeadWorldM[12]).let { it * it } +
+                    (kbPoint[1] - invHeadWorldM[13]).let { it * it } +
+                    (kbPoint[2] - invHeadWorldM[14]).let { it * it })
+            if (dTop < 0.2f) { kbPlaced = false; return }
+            // The screen's downward direction, read off the surface itself so
+            // it follows the curve. v = 1 is the TOP of the page and v = 0 the
+            // bottom, so "down" is bottom MINUS top. It was written the other
+            // way round and labelled downward, which hung the keyboard ABOVE
+            // the field it belongs to.
+            val ty = FloatArray(3); val by = FloatArray(3)
+            webPointAt(0.5f, 1f, ty)
+            webPointAt(0.5f, 0f, by)
+            var dx = by[0] - ty[0]; var dy = by[1] - ty[1]; var dz = by[2] - ty[2]
+            val dl = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
+            if (dl > 1e-4f) { dx /= dl; dy /= dl; dz /= dl } else { dy = -1f; dz = 0f; dx = 0f }
+            val depth = dTop
+            kbWorldHalfH = kbAngleH * depth
+            kbWorldHalfW = kbWorldHalfH * (KBD_TEX_W.toFloat() / KBD_TEX_H)
+            val off = kbWorldHalfH + KBD_TOP_GAP * (depth / panelDistM)
+            kbPoint[0] += dx * off; kbPoint[1] += dy * off; kbPoint[2] += dz * off
+
+            // Face like the SCREEN, not like the head. Billboarding it turned
+            // the keyboard to follow every head movement, which reads as it
+            // spinning about its own centre; anchored to the browser it is
+            // part of the surface instead.
+            //
+            // The basis is read off the surface at four points, so it matches
+            // the drawn screen exactly - including the curve - rather than
+            // approximating its tilt.
+            val lf = FloatArray(3); val rt = FloatArray(3)
+            webPointAt(0f, 0.5f, lf)
+            webPointAt(1f, 0.5f, rt)
+            var rx = rt[0] - lf[0]; var ry = rt[1] - lf[1]; var rz = rt[2] - lf[2]
+            val rl = kotlin.math.sqrt(rx * rx + ry * ry + rz * rz)
+            if (rl < 1e-4f) { kbPlaced = false; return }
+            rx /= rl; ry /= rl; rz /= rl
+            // Screen up is the negated down vector already computed.
+            val ux = -dx; val uy = -dy; val uz = -dz
+            // normal = right x up, which points at the viewer.
+            var nx = ry * uz - rz * uy
+            var ny = rz * ux - rx * uz
+            var nz = rx * uy - ry * ux
+            val nl = kotlin.math.sqrt(nx * nx + ny * ny + nz * nz)
+            if (nl < 1e-4f) { kbPlaced = false; return }
+            nx /= nl; ny /= nl; nz /= nl
+            kbRight[0] = rx; kbRight[1] = ry; kbRight[2] = rz
+            kbUp[0] = ux; kbUp[1] = uy; kbUp[2] = uz
+            kbNormal[0] = nx; kbNormal[1] = ny; kbNormal[2] = nz
+            kbPlaced = true
+            return
+        }
+    }
+
     private var lastToastText = ""
     private var lastToastActive = false
     private fun maybeUploadToast() {
@@ -1196,6 +1348,17 @@ class VrRenderer(
     @Volatile var lastHeight = 1
 
     companion object {
+        /** Keyboard texture size and fade. The texture is wider than tall in
+         *  the same proportion the quad is drawn at, so nothing is stretched. */
+        const val KBD_TEX_W = 1024
+        const val KBD_TEX_H = 400
+        const val KBD_FADE_MS = 140f
+        /** Gap under the text field, in metres. */
+        const val KBD_TOP_GAP = 0.035f
+        /** Half-height in metres at panelDistM; converted to an ANGLE so the
+         *  keyboard keeps its size wherever it is anchored. */
+        const val KBD_HALF_H = 0.42f
+
         /** Play-menu panel world geometry (doc §7): a button is 0.6 m
          *  across at pitch 0.75 m on a panel of radius panelDistM. */
         const val MENU_BTN_HALF = 0.3f
@@ -1727,6 +1890,19 @@ void main(){
 
         GLES20.glGenTextures(1, tex, 0)
         tipTexId = tex[0]
+
+        GLES20.glGenTextures(1, tex, 0)
+        kbTexId = tex[0]
+        // The keyboard lays itself out in its own pixel space, so the drawn
+        // keys and the hit rects are the same numbers whatever the panel or
+        // page is doing. Ratio matches KBD_TEX_W:KBD_TEX_H so nothing is
+        // stretched when the quad is placed.
+        kbd.window = Rect(0f, 0f, KBD_TEX_W.toFloat(), KBD_TEX_H.toFloat())
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, kbTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tipTexId)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
@@ -2093,6 +2269,10 @@ void main(){
         // panel bitmap carries the card behind it) and before the head-locked
         // reticle and pills, which belong to the gaze rather than the control.
         if (cur == Mode.VIDEO && menuAlpha > 0f) drawSeekThumb(menuAlpha)
+        // The keyboard is a surface, so it draws over the panels and under the
+        // reticle - the reticle belongs to the gaze, the keyboard to the
+        // control.
+        drawKeyboard()
         drawHeadLocked()
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
     }
@@ -2105,6 +2285,490 @@ void main(){
      * anchored pill, so it tracks the grip and never needs clipping: the
      * picture is generated at exactly the aspect of the rect it fills.
      */
+
+    // ---------------- keyboard: drawing ----------------
+
+    /**
+     * Rebuild the keyboard bitmap if the picture changed. Hash-guarded like
+     *  every other panel, so a drag does not re-upload it sixty times a
+     *  second. The rects come from the control, so what is drawn and what is
+     *  hit are the same numbers.
+     *
+     *  The hash MUST include where the rows actually ARE, not just which row
+     *  is live. Those are not the same on a row change: the switch redraws on
+     *  the frame the button fires, which is while the drum is still at the
+     *  FULL slide offset, and then the hash never changes again as it settles.
+     *  So the drawn keys stayed one row off the rects the control tests, for
+     *  ever, and the user had to aim a row above the letters they could see to
+     *  type them. The gaze-to-key mapping was correct the whole time - the
+     *  log showed every armed sample inside the band, at the right index.
+     */
+    private fun maybeUploadKeyboard() {
+        if (kbTexId <= 0) return
+        val w = kbd.window
+        if (w.isEmpty) return
+        val row = kbd.activeRowName
+        val caps = kbd.capsLabel()
+        val txt = kbd.text
+        val held = kbd.heldLabel
+        // The live row's top, quantised: it moves through every value while
+        // the drum slides, so this redraws the slide and the settled frame
+        // after it.
+        val rowTop = kbd.activeRowBand.top.toInt()
+        val key = "$row|$caps|$txt|$held|${w.width.toInt()}|$rowTop"
+        if (key == kbKey) return
+        kbKey = key
+
+        val bmp = kbBitmap ?: Bitmap.createBitmap(KBD_TEX_W, KBD_TEX_H, Bitmap.Config.ARGB_8888)
+            .also { kbBitmap = it }
+        val c = Canvas(bmp)
+        c.drawColor(Color.TRANSPARENT)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        val sx = KBD_TEX_W / w.width
+        val sy = KBD_TEX_H / w.height
+        fun tx(x: Float) = (x - w.left) * sx
+        fun ty(y: Float) = (y - w.top) * sy
+
+        p.style = Paint.Style.FILL
+        p.color = Color.argb(238, 10, 14, 22)
+        c.drawRoundRect(RectF(0f, 0f, KBD_TEX_W.toFloat(), KBD_TEX_H.toFloat()), 10f, 10f, p)
+
+        /** The space key: a face, and the space BAR drawn on it.
+         *
+         *  A word was wrong twice over - it was five letters shrunk into a key,
+         *  and then "space" is a label for the key rather than a picture of
+         *  what it does. This is the symbol: a bar with a stem standing on it,
+         *  which is what a spacebar looks like from the front. */
+        fun spaceKey(r: Rect, live: Boolean, arm: Boolean) {
+            val x0 = tx(r.left); val y0 = ty(r.top); val x1 = tx(r.right); val y1 = ty(r.bottom)
+            val rad = 6f
+            p.style = Paint.Style.FILL
+            p.color = if (arm) Color.argb(255, 56, 189, 248)
+                      else if (live) Color.argb(255, 26, 36, 52)
+                      else Color.argb(140, 15, 21, 31)
+            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 1.6f
+            p.color = if (arm) Color.argb(255, 226, 232, 240) else Color.argb(110, 71, 85, 105)
+            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+
+            val w = x1 - x0
+            val h = y1 - y0
+            val cx = (x0 + x1) * 0.5f
+            val base = y1 - h * 0.30f
+            val halfW = w * 0.30f
+            val stem = h * 0.20f
+            p.strokeWidth = (h * 0.07f).coerceAtLeast(2f)
+            p.strokeCap = Paint.Cap.ROUND
+            p.color = if (live || arm) Color.WHITE else Color.argb(80, 200, 210, 225)
+            val g = Path()
+            g.moveTo(cx - halfW, base)
+            g.lineTo(cx + halfW, base)
+            g.moveTo(cx, base)
+            g.lineTo(cx, base - stem)
+            c.drawPath(g, p)
+            p.strokeCap = Paint.Cap.BUTT
+        }
+
+        /** An icon key: the face, then a glyph drawn as a path.
+         *
+         *  Words are the wrong thing on these. "DEL" and "BKSP" on a key are
+         *  four or five letters shrunk to fit, which reads as noise and, at
+         *  this size, as more letters than the key can hold. The glyph carries
+         *  one idea in one shape and stays legible from across the room. */
+        fun iconKey(r: Rect, kind: String, live: Boolean, arm: Boolean) {
+            val x0 = tx(r.left); val y0 = ty(r.top); val x1 = tx(r.right); val y1 = ty(r.bottom)
+            val rad = 6f
+            p.style = Paint.Style.FILL
+            p.color = if (arm) Color.argb(255, 56, 189, 248)
+                      else if (live) Color.argb(255, 26, 36, 52)
+                      else Color.argb(140, 15, 21, 31)
+            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 1.6f
+            p.color = if (arm) Color.argb(255, 226, 232, 240) else Color.argb(110, 71, 85, 105)
+            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+
+            val w = x1 - x0
+            val h = y1 - y0
+            val cx = (x0 + x1) * 0.5f
+            val cy = (y0 + y1) * 0.5f
+            val stroke = (h * 0.055f).coerceAtLeast(2f)
+            p.strokeWidth = stroke
+            p.strokeCap = Paint.Cap.ROUND
+            p.strokeJoin = Paint.Join.ROUND
+            p.color = if (live || arm) Color.WHITE else Color.argb(80, 200, 210, 225)
+            val g = Path()
+            when (kind) {
+                // Return: up the right side, then away to the left.
+                // Return: up the right side, then away to the left. Sized off
+                // the SHORTER axis, because the edge columns are narrow and
+                // tall - sizing off the height ran the glyph out of the box.
+                "ENT" -> {
+                    val u = kotlin.math.min(w, h)
+                    val right = cx + u * 0.20f
+                    val left = cx - u * 0.22f
+                    val top = cy - u * 0.22f
+                    val bot = cy + u * 0.24f
+                    val head = u * 0.15f
+                    g.moveTo(right, bot); g.lineTo(right, top)
+                    g.lineTo(left, top)
+                    g.moveTo(left + head, top - head)
+                    g.lineTo(left, top)
+                    g.lineTo(left + head, top + head)
+                }
+                // Backspace: a point on the left with a cross inside it.
+                // Backspace: a point on the left with a cross inside it. Again
+                // off the shorter axis, and inset from the face so the point
+                // does not touch the rounded corner.
+                "DEL" -> {
+                    val u = kotlin.math.min(w, h)
+                    val inset = u * 0.16f
+                    val tip = cx - u * 0.34f
+                    val shoulder = cx - u * 0.06f
+                    val back = cx + u * 0.36f
+                    val halfH = u * 0.22f
+                    g.moveTo(shoulder, cy - halfH)
+                    g.lineTo(back, cy - halfH)
+                    g.lineTo(back, cy + halfH)
+                    g.lineTo(shoulder, cy + halfH)
+                    g.lineTo(tip, cy)
+                    g.close()
+                    val q = u * 0.13f
+                    val mx = cx + u * 0.12f
+                    g.moveTo(mx - q, cy - q); g.lineTo(mx + q, cy + q)
+                    g.moveTo(mx + q, cy - q); g.lineTo(mx - q, cy + q)
+                }
+                // Cancel: a cross.
+                else -> {
+                    val s = kotlin.math.min(w, h) * 0.22f
+                    g.moveTo(cx - s, cy - s); g.lineTo(cx + s, cy + s)
+                    g.moveTo(cx + s, cy - s); g.lineTo(cx - s, cy + s)
+                }
+            }
+            c.drawPath(g, p)
+            p.strokeCap = Paint.Cap.BUTT
+        }
+
+        fun key(r: Rect, label: String, live: Boolean, arm: Boolean) {
+            val x0 = tx(r.left); val y0 = ty(r.top); val x1 = tx(r.right); val y1 = ty(r.bottom)
+            val rad = 6f
+            p.style = Paint.Style.FILL
+            p.color = when {
+                arm -> Color.argb(255, 56, 189, 248)
+                live -> Color.argb(255, 26, 36, 52)
+                else -> Color.argb(140, 15, 21, 31)
+            }
+            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 1.6f
+            p.color = if (arm) Color.argb(255, 226, 232, 240) else Color.argb(110, 71, 85, 105)
+            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            val t = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
+            t.color = if (live) Color.WHITE else Color.argb(80, 200, 210, 225)
+            t.textSize = (y1 - y0) * 0.56f
+            t.textAlign = Paint.Align.CENTER
+            c.drawText(label, (x0 + x1) * 0.5f,
+                (y0 + y1) * 0.5f - (t.descent() + t.ascent()) * 0.5f, t)
+        }
+
+        val barLabels = kbd.barLabels
+        for (i in barLabels.indices) {
+            val lbl = if (barLabels[i] == "Aa") caps else barLabels[i]
+            val active = when (lbl) {
+                "123" -> row == "123"
+                "abc" -> row == "abc"
+                "Sym2" -> row == "Sym2"
+                else -> false
+            }
+            val r0 = kbd.barKeyRect(kbd.topBar, i, barLabels.size)
+            val r1 = kbd.barKeyRect(kbd.bottomBar, i, barLabels.size)
+            val arm = kbd.isBarKeyHeld(lbl)
+            if (barLabels[i] == "BKSP") {
+                iconKey(r0, "DEL", true, arm)
+                iconKey(r1, "DEL", true, arm)
+            } else {
+                key(r0, lbl, true, arm)
+                key(r1, lbl, true, arm)
+            }
+        }
+        iconKey(kbd.enterKey, "ENT", true, held == "ENT")
+        iconKey(kbd.delWordKey, "DEL", true, held == "DEL")
+        iconKey(kbd.cancelLeft, "X", true, held == "X")
+        iconKey(kbd.cancelRight, "X", true, held == "X")
+
+        for (r in 0..2) {
+            val live = r == kbd.activeRowIndex
+            val chars = kbd.rowKeys(r)
+            for (i in chars.indices) {
+                val shown = if (live && chars[i].length == 1 && chars[i][0].isLetter() &&
+                    kbd.capsMode != net.sweepvr.player.sweep.KeyboardControl.CapsMode.LOCK)
+                    chars[i].lowercase() else chars[i]
+                if (chars[i] == " ") spaceKey(kbd.charRect(r, i), live, live && held == " ")
+                else key(kbd.charRect(r, i), shown, live,
+                    live && i == kbd.heldCharIndex)
+            }
+        }
+
+        val t = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
+        t.color = Color.argb(225, 226, 232, 240)
+        t.textSize = 24f
+        t.textAlign = Paint.Align.LEFT
+        val shown = if (txt.length > 44) txt.takeLast(43) + "\u2026" else txt
+        c.drawText(shown, tx(kbd.bottomBar.left + 12f), ty(kbd.bottomBar.bottom) + 9f, t)
+
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, kbTexId)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+    }
+
+    /**
+     * Gaze -> keyboard pixels, and whether it is over the keyboard.
+     *
+     * The keyboard is head-locked on the plane z = -panelDistM, dropped by
+     * kbDropY, and this is the ray against exactly that plane - so the pixel
+     * under the reticle and the pixel the control is stepped with are the same
+     * number by construction.
+     *
+     * The point is returned even when the gaze is OFF the keyboard, clamped to
+     * a band one window wide beyond it, and that is deliberate. It used to
+     * return null instead and the caller stepped a magic far-away point, which
+     * sits to the upper LEFT of every key - so a key released that way always
+     * read as a LEFT exit. DELWORD commits through its RIGHT edge, so it could
+     * never fire, while ENTER, which commits left, fired on any release at all.
+     * That is the whole of "the del word key doesn't work, or is that enter?".
+     *
+     * Real geometry preserves the exit side; a constant cannot.
+     */
+    private fun keyboardGaze(): FloatArray? {
+        val w = kbd.window
+        if (w.isEmpty || !kbPlaced) return null
+        val f = lastEffFwd
+        // Ray against the keyboard's own world plane: origin at the head,
+        // normal the basis it faces on. The drawn quad and the hit-tested
+        // plane are then the same plane by construction, at whatever depth the
+        // surface behind it is.
+        val hx = invHeadWorldM[12] - kbPoint[0]
+        val hy = invHeadWorldM[13] - kbPoint[1]
+        val hz = invHeadWorldM[14] - kbPoint[2]
+        // The normal points from the surface AT the eye, so it opposes the
+        // gaze direction: n.f is negative for any ray heading at the plane.
+        // Dividing the positive distance by it gave a negative t every frame,
+        // the guard below rejected every frame, and the keyboard silently
+        // stopped engaging - AND stopped claiming the frame, so the page behind
+        // it stayed live and its links fired through. The denominator is
+        // negated so t is the distance ALONG THE GAZE.
+        val ndotf = kbNormal[0] * f[0] + kbNormal[1] * f[1] + kbNormal[2] * f[2]
+        if (ndotf > -1e-4f) return null
+        val t = (hx * kbNormal[0] + hy * kbNormal[1] + hz * kbNormal[2]) / -ndotf
+        if (t <= 0f || t.isNaN()) return null
+        // hx/hy/hz are ALREADY the head relative to kbPoint, so this is
+        // hit - kbPoint and nothing more. Subtracting kbPoint a second time
+        // gave hit - 2*kbPoint, which is invisible on the horizontal axis
+        // (kbPoint.x is 0) and shifts the vertical axis by the full height of
+        // the anchor: 1.67m, or 1.56x the key band. Every vertical coordinate
+        // was wrong by that factor, so a key armed only when the reticle was
+        // far from it. The eye X was exact, which is what kept this hidden.
+        val px = hx + f[0] * t
+        val py = hy + f[1] * t
+        val pz = hz + f[2] * t
+        val u = ((px * kbRight[0] + py * kbRight[1] + pz * kbRight[2]) / kbWorldHalfW) * 0.5f + 0.5f
+        val v = 0.5f - ((px * kbUp[0] + py * kbUp[1] + pz * kbUp[2]) / kbWorldHalfH) * 0.5f
+        // Unclamped in u, clamped in v: a gaze far above the keyboard must
+        // not turn into a wild sideways reading that releases a bar key.
+        val x = (w.left + u * w.width).coerceIn(w.left - w.width, w.right + w.width)
+        val y = (w.top + v * w.height).coerceIn(w.top - w.height, w.bottom + w.height)
+        return floatArrayOf(x, y, if (u in 0f..1f && v in 0f..1f) 1f else 0f)
+    }
+
+    /** Step the keyboard for this frame. True when it owns the gaze. */
+    private fun stepKeyboard(dtMs: Long): Boolean {
+        // Placement has to happen here, every frame: it reads the surface
+        // behind the keyboard, which MOVES with the head and with the page.
+        // Without it kbPlaced stayed false for ever, and a false kbPlaced makes
+        // keyboardGaze() return null and drawKeyboard() bail out - the
+        // keyboard silently never appeared at all.
+        placeKeyboard()
+        if (now() - kbAliveT > 1000L) {
+            kbAliveT = now()
+            FileLog.i("SweepVR-kbd", "tick open=$kbOpen placed=$kbPlaced alpha=$kbAlpha")
+        }
+        kbAlphaWant = kbOpen || kbAlpha > 0.01f
+        kbAlpha = if (kbAlphaWant) minOf(1f, kbAlpha + dtMs / KBD_FADE_MS)
+                  else maxOf(0f, kbAlpha - dtMs / KBD_FADE_MS)
+        if (!kbOpen) { kbd.reset(); kbHit = null; return false }
+        if (kbTexId <= 0) return false
+        val g = keyboardGaze()
+        if (g == null) {
+            // Worth saying out loud: a silent null here looks identical to a
+            // keyboard that is present but unresponsive, which is precisely
+            // the symptom that sent us looking in the wrong place.
+            if (now() - kbDiagT > 150L) {
+                kbDiagT = now()
+                // Built by concatenation, not String.format. Three of these
+                // diagnostics have now been lost to format-string mistakes
+                // (once `.format` binding tighter than `+`, twice to an
+                // IllegalFormatConversionException thrown INSIDE the logging
+                // call, which swallowed the very line that was meant to report
+                // it). A diagnostic that can throw is worse than no diagnostic.
+                val u = webGazeUv(lastEffFwd)
+                FileLog.i("SweepVR-kbd",
+                    "gazeNULL kb=" + f3(kbPoint) + " half=" + kbWorldHalfW + "," + kbWorldHalfH +
+                    " up=" + f3(kbUp) + " nrm=" + f3(kbNormal) + " fwd=" + f3(lastEffFwd) +
+                    " pageUV=" + uvStr(u))
+            }
+            kbHit = null; kbd.reset(); return false
+        }
+        val over = g[2] > 0.5f
+        // Stepped either way: leaving the keyboard has to reach the controls so
+        // a key in hand can resolve, and the geometry decides how.
+        val owned = kbd.step(g[0], g[1], dtMs)
+        // What the control was actually handed, against what it believes the
+        // live row is. Two rounds of reasoning about this mapping were both
+        // wrong, so it is measured rather than deduced.
+        //
+        // ONE format string, whole. Written as a concatenation it silently
+        // formatted only the second half - `.format` binds tighter than `+` -
+        // so the line that exists to be read came out as literal `%.0f`
+        // placeholders and was no use at all.
+        if (now() - kbDiagT > 150L) {
+            kbDiagT = now()
+            val b = kbd.activeRowBand
+            val u = webGazeUv(lastEffFwd)
+            val pp = FloatArray(3)
+            if (u != null) webPointAt(u[0], u[1], pp)
+            // Two independent solves at the same instant. The app's own
+            // ray->page solve is the one every other control on the page uses
+            // and is known good, so agreeing or disagreeing with it settles
+            // whether my intersection or my DRAWING is wrong, without either
+            // being deduced.
+            val hx = invHeadWorldM[12] - kbPoint[0]
+            val hy = invHeadWorldM[13] - kbPoint[1]
+            val hz = invHeadWorldM[14] - kbPoint[2]
+            val nd = kbNormal[0] * lastEffFwd[0] + kbNormal[1] * lastEffFwd[1] +
+                kbNormal[2] * lastEffFwd[2]
+            val mine = FloatArray(3)
+            mine[0] = Float.NaN; mine[1] = Float.NaN; mine[2] = Float.NaN
+            if (nd < -1e-4f) {
+                val tt = (hx * kbNormal[0] + hy * kbNormal[1] + hz * kbNormal[2]) / -nd
+                mine[0] = invHeadWorldM[12] + lastEffFwd[0] * tt
+                mine[1] = invHeadWorldM[13] + lastEffFwd[1] * tt
+                mine[2] = invHeadWorldM[14] + lastEffFwd[2] * tt
+            }
+            FileLog.i("SweepVR-kbd",
+                "gaze " + g[0] + "," + g[1] + " over=" + over +
+                " band=" + b.left + "," + b.top + ".." + b.right + "," + b.bottom +
+                " held=" + kbd.heldLabel + " idx=" + kbd.heldCharIndex +
+                " rows=" + kbd.activeRowName +
+                " pageUV=" + uvStr(u) +
+                " mine=" + f3(mine) + " page=" + f3(pp) +
+                " kb=" + f3(kbPoint) + " half=" + kbWorldHalfW + "," + kbWorldHalfH)
+        }
+        kbHit = if (over) floatArrayOf(g[0], g[1]) else null
+        return over && owned
+    }
+
+    /** Sweep the address field to open the keyboard. True on the frame it
+     *  fires, so the toolbar's own buttons do not also fire underneath. */
+    private fun stepAddrField(u: Float, v: Float, dtMs: Long): Boolean {
+        if (kbOpen) { addrArmed = false; addrOpen.reset(); return false }
+        // Bar space is y-up and v-up; the control is y-down, so flip.
+        val r = net.sweepvr.player.sweep.Rect(TB_ADDR_U0, 1f - TB_V1, TB_ADDR_U1, 1f - TB_V0)
+        if (r.isEmpty) return false
+        val cfg = net.sweepvr.player.sweep.SweepConfig(
+            entrySides = setOf(net.sweepvr.player.sweep.Side.Top,
+                net.sweepvr.player.sweep.Side.Bottom),
+            leeway = 0f, rearm = 0f,
+            refuseCorners = true, cornerFraction = 0.18f,
+            tieBreak = net.sweepvr.player.sweep.TieBreak.REFUSE)
+        return when (val ev = addrOpen.step(net.sweepvr.player.sweep.Pt(u, 1f - v), r, cfg)) {
+            is net.sweepvr.player.sweep.SweepEvent.Entered -> {
+                addrArmed = true
+                toolbarAddrFocused = true
+                true
+            }
+            is net.sweepvr.player.sweep.SweepEvent.Engaged -> true
+            is net.sweepvr.player.sweep.SweepEvent.Released -> {
+                val fire = addrArmed &&
+                    ev.side != net.sweepvr.player.sweep.Side.Left &&
+                    ev.side != net.sweepvr.player.sweep.Side.Right
+                addrArmed = false
+                if (fire) openKeyboard(webBarUrl)
+                fire
+            }
+            net.sweepvr.player.sweep.SweepEvent.Idle -> { addrArmed = false; false }
+        }
+    }
+
+    private fun drawKeyboard() {
+        if (kbAlpha <= 0.01f || kbTexId <= 0) return
+        maybeUploadKeyboard()
+        if (!kbPlaced) return
+        // Built from the same orthonormal basis the hit test uses, so the drawn
+        // quad and the tested plane cannot drift apart. A yaw-only rotation
+        // would have been wrong here: the screen is tilted, so square-on means
+        // pitched as well.
+        val hw = kbWorldHalfW
+        val hh = kbWorldHalfH
+        tmpA[0] = kbRight[0] * hw; tmpA[1] = kbRight[1] * hw
+        tmpA[2] = kbRight[2] * hw; tmpA[3] = 0f
+        tmpA[4] = kbUp[0] * hh; tmpA[5] = kbUp[1] * hh
+        tmpA[6] = kbUp[2] * hh; tmpA[7] = 0f
+        tmpA[8] = kbNormal[0]; tmpA[9] = kbNormal[1]
+        tmpA[10] = kbNormal[2]; tmpA[11] = 0f
+        tmpA[12] = kbPoint[0]; tmpA[13] = kbPoint[1]
+        tmpA[14] = kbPoint[2]; tmpA[15] = 1f
+        Matrix.multiplyMM(mvpM, 0, ovM, 0, tmpA, 0)
+        putQuad(ptrVerts, ptrTex, -1f, -1f, 1f, 1f)
+        drawQuadTex(kbTexId, mvpM, kbAlpha)
+    }
+
+    // ---------------- keyboard: open and close ----------------
+
+    /** True while the keyboard owns an edit. */
+    val keyboardOpen: Boolean get() = kbOpen
+
+    /** Open the keyboard on [value], which the caller then shows live. */
+
+    fun openKeyboard(value: String) {
+        kbd.beginEdit(value)
+        kbOpen = true
+        onKeyboardOpened?.invoke()
+        kbd.changed = {
+            onKeyboardText?.invoke(kbd.text)
+            val g = kbHit
+            if (g != null) kbd.prime(g[0], g[1])
+        }
+        // Every entry, fire and cancel, into the app log. Guessing at why a
+        // key does nothing has been the wrong tool repeatedly in this session;
+        // the log answers it directly.
+        kbd.onTrace = { FileLog.i("SweepVR-kbd", it) }
+        kbd.committed = { closeKeyboard(true, it) }
+        FileLog.i("SweepVR-kbd", "opened: placed=$kbPlaced " +
+            "point=%.2f,%.2f,%.2f half=%.2fx%.2f normal=%.2f,%.2f,%.2f".format(
+                kbPoint[0], kbPoint[1], kbPoint[2], kbWorldHalfW, kbWorldHalfH,
+                kbNormal[0], kbNormal[1], kbNormal[2]))
+        kbd.cancelled = { closeKeyboard(false, kbd.initialText) }
+        onKeyboardText?.invoke(kbd.text)
+        val g = kbHit
+        if (g != null) kbd.prime(g[0], g[1])
+    }
+
+    /** Text changed: the owner redraws whatever shows it. */
+    var onKeyboardText: ((String) -> Unit)? = null
+    /** The keyboard took an edit. */
+    var onKeyboardOpened: (() -> Unit)? = null
+
+    /** ENTER committed ([navigate] true) or X abandoned the edit. */
+    var onKeyboardClose: ((Boolean, String) -> Unit)? = null
+
+    fun closeKeyboard(navigate: Boolean, text: String) {
+        kbOpen = false
+        kbd.reset()
+        kbHit = null
+        onKeyboardClose?.invoke(navigate, text)
+    }
+
+
     private fun drawSeekThumb(alpha: Float) {
         if (!thumbCardReady() || thumbTex() < 0 || cardBitmap == null) return
         val card = thumbCard()
@@ -2680,6 +3344,11 @@ void main(){
                     return
                 }
             }
+            // The keyboard owns the frame while it is up, over the panel as
+            // well as over the page: the same "a gesture surface cannot have a
+            // dwell fire underneath it" rule as barSweep on the web side.
+            if (stepKeyboard(dtMs)) { hitValid = false; return }
+
             if (onPanelRect) {
                 hitX = hx; hitY = hy; hitZ = hz; hitValid = true
                 val u = (alongRight + hw) / (2 * hw)
@@ -2932,6 +3601,14 @@ void main(){
     }
 
     private fun now() = System.currentTimeMillis()
+
+    /** "x,y,z" for a 3-vector, for log lines. Never throws. */
+    private fun f3(a: FloatArray): String =
+        a[0].toString() + "," + a[1].toString() + "," + a[2].toString()
+
+    /** "u,v" for the page solve, or "none". */
+    private fun uvStr(u: FloatArray?): String =
+        if (u == null) "none" else u[0].toString() + "," + u[1].toString()
 
     /** Angle between two head-forward vectors, degrees. */
     private fun angleDeg(a: FloatArray, b: FloatArray): Float {
@@ -4357,6 +5034,16 @@ void main(){
         // The sweep targets claim the frame before the page dwell, so a drag
         // or a held arrow never also registers as a click on the page.
         barDwellProg = 0f
+        // The keyboard owns the frame outright while it is up: every key is a
+        // sweep, and a page dwell firing underneath one would be the exact
+        // accident sweep exists to prevent. Same rule as barSweep below.
+        if (stepKeyboard(dtMs)) { webProgF = 0f; return }
+        // The scrollbar THUMB before the arrows, as it always was. This line
+        // was deleted outright by an edit meant to insert the keyboard claim
+        // above it, so the thumb's entry test stopped being evaluated at all
+        // and the thumb could not be grabbed - while the arrows, stepped on
+        // the next line, kept working, which is a confusing way for it to
+        // break.
         if (webScrollable && barSweep(uv[0], uv[1], still, dtMs)) { webProgF = 0f; return }
         if (webScrollable && barArrows(uv[0], uv[1], dtMs, still)) { webProgF = 0f; return }
         // Toolbar above the screen: live whether or not the page scrolls.
@@ -4966,6 +5653,7 @@ void main(){
         // The address field is hover, not sweep: gaze inside = focused.
         toolbarAddrFocused =
             u >= TB_ADDR_U0 && u <= TB_ADDR_U1 && v >= TB_V0 && v <= TB_V1
+        if (stepAddrField(u, v, dtMs)) return true
         return b0 || b1 || b2 || b3 || b4 || z0 || z1
     }
 

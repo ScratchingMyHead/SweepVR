@@ -437,6 +437,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             onMenuEvent = { e -> runOnUiThread { handleMenuEvent(e) } },
             onWebEvent = { e -> runOnUiThread { handleWebEvent(e) } }
         )
+        initKeyboard()
         applyOptics()
         renderer.projection = runCatching { Projection.valueOf(intent.getStringExtra(EXTRA_PROJ) ?: settings.projection.name) }.getOrDefault(settings.projection)
         renderer.stereo = runCatching { Stereo.valueOf(intent.getStringExtra(EXTRA_STEREO) ?: settings.stereo.name) }.getOrDefault(settings.stereo)
@@ -1328,6 +1329,26 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private var webFullCallback: android.webkit.WebChromeClient.CustomViewCallback? = null
     private var bookmarks: MutableList<WebBookmark> = mutableListOf()
     private var webUrl = ""
+    /** Set while the keyboard owns the address field, so the state poll stops
+     *  writing the page's URL over what the user is typing. */
+    private var keyboardEditing = false
+
+    private fun initKeyboard() {
+        renderer.onKeyboardText = { txt -> renderer.webBarUrl = txt }
+        renderer.onKeyboardOpened = { keyboardEditing = true }
+        renderer.onKeyboardClose = { navigate, text ->
+            keyboardEditing = false
+            renderer.webBarUrl = webUrl
+            if (navigate && text.isNotBlank()) {
+                val u = if (text.contains("://") || text.startsWith("localhost")) text
+                        else "http://$text"
+                FileLog.i(TAG, "keyboard navigate $u")
+                webUrl = u
+                webView?.loadUrl(u)
+            }
+        }
+    }
+
     private var lastStateLog = 0L
     /** Where web mode starts with no bookmark. */
     private val WEB_HOME = "https://www.iana.org/help/example-domains"
@@ -2205,7 +2226,9 @@ try {
                 webUrl = o.optString("url", webUrl)
                 // Toolbar address field. Same poll, same value: the drawn
                 // text cannot disagree with the page the state came from.
-                renderer.webBarUrl = webUrl
+                // While the keyboard has the edit it OWNS the field, or the
+                // poll would write the old URL over every keystroke.
+                if (!keyboardEditing) renderer.webBarUrl = webUrl
                 val ti = o.optString("t", "")
                 if (ti.isNotEmpty()) webTitle = ti
             } catch (_: Exception) {
