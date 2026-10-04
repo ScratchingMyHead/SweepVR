@@ -621,6 +621,12 @@ class VrRenderer(
      *  would hang off later — the position being pointed at, whoever is
      *  pointing. -1 = none. */
     private var menuSeekHoverU = -1f
+    /** True for the whole grab→drop episode of the grip — entry to release
+     *  inclusive (the release frame returns owned even though engaged has
+     *  already cleared). The seek pill rides the thumb while this is set
+     *  instead of sitting head-locked, because what it reads is the position
+     *  the drop commits to. See updateTooltip. */
+    private var seekTipOnThumb = false
     /** Last ray/plane hit in design panel space (menuHitTest). */
     private var menuHitU = 0f
     private var menuHitV = 0f
@@ -1606,8 +1612,10 @@ void main(){
      *  just above and to the right of the control being held, so it sits
      *  WITH the control instead of riding the gaze — looking at the control
      *  and finding the pill somewhere else below it is the whole complaint.
-     *  The seek bar keeps the head-locked spot under the reticle: it stands
-     *  in for the time readout there and has to follow the scrub point.
+     *  The seek bar does the same while the grip is dragged (the pill then
+     *  reads the position the drop commits to), and keeps the head-locked
+     *  spot under the reticle on a bare hover, where it stands in for the
+     *  time readout and has to follow the scrub point.
      *  Half-extents are design units × menuScale(), so the pill keeps its
      *  apparent size at every panel distance (same rule as the menu rect). */
     private fun drawTooltip() {
@@ -2857,6 +2865,7 @@ void main(){
         // animated elevation so the pointer tracks the ⇅ flip.
         val hit = menuHitTest()
         val seeking = stepSeekDrag(nowMs, hit)
+        seekTipOnThumb = seeking
         stepMenuSweeps(nowMs, hit)
         // Sweep and dwell are alternatives, never both: with sweep on the
         // integrators have no job at all (menuUsable refuses every id), and
@@ -2959,8 +2968,10 @@ void main(){
     }
 
     /** Tooltip pill text for whatever the gaze is on: the button's name, or
-     *  the time a seek-bar hover would jump to. A swept button only gets
-     *  named while the sweep holds it — entry to exit, never sooner. */
+     *  the time a seek-bar hover would jump to — which, mid-drag, is the
+     *  position the drop will commit, anchored to the thumb (see
+     *  [seekTipOnThumb]). A swept button only gets named while the sweep
+     *  holds it — entry to exit, never sooner. */
     private fun updateTooltip(id: Int) {
         val txt = when {
             !enableTooltip -> ""
@@ -2980,10 +2991,20 @@ void main(){
         // Float just above and to the right of the control: the pill's
         // bottom-left corner clears the control's top-right corner. Fixed
         // relative to the control, so it never slides around while the
-        // gaze creeps across the button. id -1 (seek bar) stays head-locked.
+        // gaze creeps across the button. The seek bar (id -1) rides the
+        // GRIP while the drag is held — the pill then states the position
+        // the drop will seek to, so it belongs to the thumb, not to the
+        // gaze — and stays head-locked on a bare hover, where it stands in
+        // for the time readout under the reticle.
         val b = if (id == -1) null else menuButton(id)
-        tipAnchored = b != null
-        if (b != null) {
+        val g = if (id == -1 && seekTipOnThumb) seekDrag.thumbRect() else null
+        tipAnchored = b != null || g != null
+        if (g != null) {
+            // thumbRect() is engine space (y down); the pill's v is design
+            // space (y up), so the thumb's top edge is -g.top.
+            tipU = g.right + TIP_GAP + TIP_HALF_W
+            tipV = -g.top + TIP_GAP + TIP_HALF_H
+        } else if (b != null) {
             tipU = b.x + b.hw + TIP_GAP + TIP_HALF_W
             tipV = b.y + b.hh + TIP_GAP + TIP_HALF_H
         }
@@ -5757,11 +5778,13 @@ void main(){
                 alphaOf(-1), hot = seekDrag.engaged, armed = seekDrag.engaged)
         }
         // position / duration under the bar (the live seek time rides the
-        // head-locked tooltip pill instead, so the two never overlap)
+        // head-locked tooltip pill instead, so the two never overlap).
+        // 31.2 = 24 × 1.3: read at arm's length across the room, which the
+        // old size did not manage.
         if (!(menuHighlight == -1 && menuSeekHoverU >= 0f && menuDurMs > 0)) {
             text(
                 if (flashing) menuFlash else "${fmtTime(menuPosMs)} / ${fmtTime(menuDurMs)}",
-                tx(menuBar.x), ty(-1.5f), 24f, 255, outline = true
+                tx(menuBar.x), ty(-1.5f), 31.2f, 255, outline = true
             )
         }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, menuTexId)
