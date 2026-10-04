@@ -690,13 +690,19 @@ class VrRenderer(
          *  are unchanged — only the icons inside them shrink. */
         const val MENU_ICON_FRAC = 0.9f
         /** The seek bar's grip: the handle the sweep latches onto, in
-         *  design units — as wide as it is tall once the bar's own band
-         *  counts, and grown this far above and below the bar so the
-         *  reticle can take hold of it without landing dead on the line.
-         *  Both numbers build the drag's track, which is the bar widened by
-         *  half a handle either side; see [seekDrag]. */
+         *  design units. The track it drags on is the bar widened by half a
+         *  handle either side (so value 0 and 1 sit on the bar's ENDS) and
+         *  set to [SEEK_HANDLE_H] tall; see [seekDrag]. */
         const val SEEK_HANDLE_W = 0.42f
-        const val SEEK_HANDLE_GROW = 0.06f
+        /** The grip's height: 0.52 against the bar's own 0.6, so about four
+         *  texels of bar clear the grip top and bottom. The grip must not
+         *  swallow the line it rides on — with the bar hidden behind it the
+         *  position has no visible context, and there is nothing to aim the
+         *  entry at but the grip alone. It is also the drag's vertical band
+         *  (a drop is a move past the grip's edge), so a shorter grip makes
+         *  the drop a shorter gesture — now about the travel of dipping one
+         *  of the buttons. */
+        const val SEEK_HANDLE_H = 0.52f
         /** How far past either end of that track the reticle may travel
          *  before the drag counts as abandoned rather than an overshoot.
          *  Small on purpose: the track already runs half a handle past the
@@ -2300,11 +2306,13 @@ void main(){
     private var browProgF = 0f
     private var browProgT = 0L
     private fun menuSlot(id: Int) = if (id == -1) 18 else id
-    /** Whether [id] may fill a dwell and fire it. A swept button opts out
-     *  while sweep is on: its gesture is the sweep's, and a dwell filling
-     *  underneath would commit it while the user is mid-sweep. */
-    private fun menuUsable(id: Int) =
-        id != -2 && !(sweepEnabled && id in SWEEP_MENU_IDS)
+    /** Whether [id] may fill a dwell and fire it. Sweep and dwell are
+     *  alternatives, never both: with sweep on NOTHING on this panel dwells,
+     *  the seek bar included — the buttons are swept and the bar is dragged
+     *  by the grip. A dwell filling underneath would fire a control the user
+     *  is mid-gesture on, or has just let go of, which is the exact class of
+     *  accident sweep exists to remove. Decorative ids never fire. */
+    private fun menuUsable(id: Int) = id != -2 && !sweepEnabled
 
     /** Whether [id] should read as "on" right now: gaze, for an ordinary
      *  button, but for a swept button only while the sweep holds it.
@@ -2341,7 +2349,8 @@ void main(){
      *  The left column is three small squares — recenter, settings, cue
      *  toggle — clear of the backdrop and of the seek bar's left end.
      *  Title and backdrop are decorative. Every button here takes the
-     *  sweep gesture (see SWEEP_MENU_IDS); only the seek bar dwells. */
+     *  sweep gesture (see SWEEP_MENU_IDS); with sweep off the whole panel
+     *  falls back to dwell, seek bar included. */
     private val menuButtons = arrayOf(
     // Transport row runs one pitch further left now that web sits beside
     // the files button (9 buttons, still clear of the zoom/fov/vol columns).
@@ -2379,9 +2388,10 @@ void main(){
      *  as the toolbar buttons. Derived from the list above so a button
      *  cannot be added without being swept (read after menuButtons for that
      *  reason). With sweep off they are ordinary dwell buttons again. The
-     *  seek bar (id -1) is never in this list: it always dwells — a click
-     *  anywhere on the bar is a seek — and with sweep on it also takes the
-     *  grip, [seekDrag], which is how you drag the playhead. */
+     *  seek bar (id -1) is never in this list — it is not swept at all: with
+     *  sweep on it is dragged by the grip, [seekDrag], and with sweep off it
+     *  dwells, a click anywhere on the bar being a seek. Sweep and dwell
+     *  never overlap: see menuUsable. */
     private val SWEEP_MENU_IDS: IntArray = menuButtons.map { it.id }.toIntArray()
     /** Seek bar (id -1), decorative title and backdrop, all design units.
      *  The bar sits left of centre so the − row of the ± columns has its
@@ -2418,9 +2428,9 @@ void main(){
     ).apply {
         track = net.sweepvr.player.sweep.Rect(
             menuBar.x - menuBar.hw - SEEK_HANDLE_W * 0.5f,
-            -menuBar.y - menuBar.hh - SEEK_HANDLE_GROW,
+            -menuBar.y - SEEK_HANDLE_H * 0.5f,
             menuBar.x + menuBar.hw + SEEK_HANDLE_W * 0.5f,
-            -menuBar.y + menuBar.hh + SEEK_HANDLE_GROW)
+            -menuBar.y + SEEK_HANDLE_H * 0.5f)
         onCommit = { v ->
             seekStickyU = v
             seekStickyT = now()
@@ -2848,13 +2858,18 @@ void main(){
         val hit = menuHitTest()
         val seeking = stepSeekDrag(nowMs, hit)
         stepMenuSweeps(nowMs, hit)
+        // Sweep and dwell are alternatives, never both: with sweep on the
+        // integrators have no job at all (menuUsable refuses every id), and
+        // anything banked before the toggle would sit there un-drained and
+        // dim its control until the reticle happened to hover it. Zeroed
+        // here rather than per branch so no path can skip it.
+        if (sweepEnabled) for (i in menuProg.indices) menuProg[i] = 0f
         if (seeking) {
-            // The grip owns this frame. Nothing here may fill a dwell: the
-            // bar's slot is cleared too, so a fill banked before the grab
-            // cannot fire a seek the moment the grip is dropped.
+            // The grip owns this frame: no hover or dwell bookkeeping runs
+            // under a hand that is already moving the video. The tooltip
+            // reads the value in hand instead.
             menuHighlight = -1
             menuDwellFiredFor = -3
-            menuProg[menuSlot(-1)] = 0f
             updateTooltip(-1)
             return
         }
@@ -2864,7 +2879,9 @@ void main(){
             menuSeekHoverU = if (id == -1) seekFrac(menuHitU) else -1f
             // Leaky dwell: adopt immediately; progress grows while still
             // on target and drains slowly otherwise. Churn and motion
-            // only dent progress instead of zeroing the timer.
+            // only dent progress instead of zeroing the timer. Under
+            // sweep this never accumulates — menuUsable says no — but the
+            // highlight and tooltip still run off the same hover.
             if (id != menuHighlight) {
                 menuHighlight = id; menuDwellFiredFor = -3
                 // cap carried progress on adopt: churn can never bank
@@ -2876,10 +2893,6 @@ void main(){
             // A swept button stays anonymous until its sweep holds it.
             updateTooltip(id)
             val slot = menuSlot(id)
-            // Sweep owns every button now, so their slots are forced empty
-            // every frame: a fill banked before sweep was switched on would
-            // otherwise sit there un-drained and dim those buttons forever.
-            if (sweepEnabled && id in SWEEP_MENU_IDS) menuProg[slot] = 0f
             val dtMs = (nowMs - menuProgT).coerceIn(0L, 500L)
             menuProgT = nowMs
             for (i in menuProg.indices)
