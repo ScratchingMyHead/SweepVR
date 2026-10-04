@@ -3221,15 +3221,17 @@ try {
         }
         val b = thumbs ?: ThumbBuilder(this, renderer, thumbStore,
             onThumb = { bucket, bmp -> renderer.submitThumb(bucket, bmp) },
-            onStripDone = { renderer.showToast("Seek previews ready", 2500) }
+            // Silent by choice: the strip announces itself by having a
+            // picture under the grip, and a toast over the panel is one more
+            // thing to read while dragging. Progress is in the log.
+            onStripDone = {
+                FileLog.i(TAG, "preview prebuild complete")
+            }
         ).also {
             thumbs = it
             renderer.thumbSink = { bucket -> thumbs?.request(bucket) }
         }
         b.start(url, durationMs, split)
-        // Said out loud, because a strip that builds itself over minutes with
-        // no sign of life reads as a broken feature.
-        renderer.showToast("Building seek previews…", 3000)
         FileLog.i(TAG, "preview prebuild: ${durationMs / 1000}s, split=$split")
     }
 

@@ -644,7 +644,23 @@ class VrRenderer(
      *  handed over the same way a web page capture is: a volatile pending
      *  reference, uploaded on the GL thread. Only one frame is ever live.
      */
-    private var thumbTexId = 0
+
+    /**
+     * The card is composited into one of two textures and shown from the
+     * other, so the texture being sampled is never the one being written.
+     *
+     * Uploading into the live texture is undefined behaviour in GL — the
+     * driver may apply the new pixels to a quad whose fetch already used the
+     * old ones — and on this panel the card is re-uploaded on every span
+     * crossing during a drag, which is exactly when it showed. Alternating
+     * makes each card whole before the frame that shows it, which is the
+     * texture-side half of not flickering; holding the previous card while
+     * the next is built is the other half.
+     */
+    private var thumbTexIds = IntArray(2) { -1 }
+    private var thumbTexShown = 0
+
+    private fun thumbTex(): Int = thumbTexIds[thumbTexShown]
     private var thumbBitmap: Bitmap? = null
 
     /**
@@ -669,6 +685,14 @@ class VrRenderer(
     private var thumbDrop = false
     private var cardAspect = 1f
     private var thumbCardKey = ""
+
+    /**
+     * Counts previews the GL thread has taken up. The card rebuild compares
+     * this against the count it was last built at, so "a new picture arrived"
+     * is detectable without comparing bitmaps.
+     */
+    private var thumbFrameSeq = 0L
+    private var thumbCardSeq = -1L
 
     @Volatile
     private var thumbBucketIn = -1
@@ -729,10 +753,11 @@ class VrRenderer(
      */
     private fun maybeBuildThumbCard(timeText: String) {
         val img = thumbBitmap ?: return
-        if (thumbTexId < 0) return
+        if (thumbTex() < 0) return
         val key = "$thumbBucket|$timeText|${(thumbAspect * 1000f).toInt()}"
         if (key == thumbCardKey && cardBitmap != null) return
         thumbCardKey = key
+        thumbCardSeq = thumbFrameSeq
         // Picture height in card texels; the card's pixel size follows from
         // the design size so the two can never drift apart.
         val imgHpx = CARD_IMG_H_TEX
@@ -752,10 +777,22 @@ class VrRenderer(
         p.style = Paint.Style.FILL
         p.color = Color.argb(235, 10, 14, 22)
         c.drawRoundRect(1f, 1f, (W - 1).toFloat(), (H - 1).toFloat(), rad, rad, p)
-        p.color = Color.argb(255, 226, 232, 240)
+        // A DARK edge, and a thin one.
+        //
+        // This was a bright ~7px stroke, which on a texture this size lands on
+        // a handful of texels and is then magnified across the panel: the
+        // stroke's own edge is the card's highest-contrast feature, so it is
+        // where the magnification shows, and it crawled as the card moved.
+        // Anti-aliasing only softens that edge, it does not stop a hard
+        // boundary being resampled at a moving position — the crawl comes
+        // from the contrast, not the jaggies. Against the panel's own dark
+        // faces a dark rim separates just as well and has almost no contrast
+        // left to shimmer with.
+        p.color = Color.argb(255, 46, 56, 74)
         p.style = Paint.Style.STROKE
-        p.strokeWidth = maxOf(2f, padPx * 0.34f)
-        c.drawRoundRect(p.strokeWidth, p.strokeWidth, W - p.strokeWidth, H - p.strokeWidth, rad, rad, p)
+        p.strokeWidth = maxOf(1.5f, padPx * 0.13f)
+        val sw = p.strokeWidth * 0.5f
+        c.drawRoundRect(sw, sw, W - sw, H - sw, rad, rad, p)
         p.style = Paint.Style.FILL
         // Time, in its own row above the picture — inside the card, so it
         // cannot collide with anything outside it.
@@ -766,8 +803,12 @@ class VrRenderer(
         p.textAlign = Paint.Align.LEFT
         c.drawBitmap(img, null, RectF(padPx.toFloat(), (timePx + padPx).toFloat(),
             (W - padPx).toFloat(), (H - padPx).toFloat()), p)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, thumbTexId)
+        // Into the texture that is NOT on screen, then show it: the swap is the
+        // assignment, with no frame in which a half-built card is sampled.
+        val back = 1 - thumbTexShown
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, thumbTexIds[back])
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        thumbTexShown = back
         cardBitmap?.recycle()
         cardBitmap = bmp
     }
@@ -807,15 +848,15 @@ class VrRenderer(
      *
      * Deliberately NOT "and the preview is the exact bucket under the grip".
      * Requiring that made the card blink out for the frame or two between
-     * buckets while the new one was fetched — a flicker at every five-second
-     * boundary, which is exactly what it looked like. Showing the nearest
-     * frame we have keeps the picture steady under the moving grip, and the
-     * time printed above it is the exact position the drop will seek to, so
-     * nothing is misrepresented.
+     * buckets while the next one was fetched — a flicker at every span
+     * boundary, which is what a drag spends all its time crossing. submitThumb
+     * still refuses any frame that is not the span under the grip, so what is
+     * held is always a frame of somewhere the grip has been; it simply stays
+     * up, with the time it was taken at, until the frame for the span in hand
+     * replaces it.
      */
     private fun thumbCardReady(): Boolean =
-        seekTipOnThumb && sweepEnabled && menuDurMs > 0L && thumbBucket >= 0 &&
-            thumbBucket == cardWantedSpan
+        seekTipOnThumb && sweepEnabled && menuDurMs > 0L && thumbBucket >= 0
 
     /**
      * A preview, from the background builder. Ownership passes here: the
@@ -860,6 +901,8 @@ class VrRenderer(
         thumbAspect = 16f / 9f
         thumbAspectIn = thumbAspect
         thumbCardKey = ""
+        thumbCardSeq = -1L
+        thumbFrameSeq++
     }
 
     // ---------- seek-preview capture ----------
@@ -1664,11 +1707,22 @@ void main(){
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
 
-        GLES20.glGenTextures(1, tex, 0)
-        thumbTexId = tex[0]
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, thumbTexId)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        // Two, so a card is always composited into the one not on screen.
+        // Its own array: `tex` is the single-name scratch the calls above use,
+        // and asking for two names in it overruns it.
+        val cardTex = IntArray(2)
+        GLES20.glGenTextures(2, cardTex, 0)
+        thumbTexIds[0] = cardTex[0]
+        thumbTexIds[1] = cardTex[1]
+        thumbTexShown = 0
+        // Both, not just the one shown first: whichever is the back buffer at
+        // the first swap is still on default filtering until it is bound here,
+        // and it is the one every card after the first is composited into.
+        for (id in thumbTexIds) {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, id)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        }
         // A new GL context means new textures and no bitmaps behind them: the
         // pending hand-off from the extractor may be long gone by then.
         thumbBmpPending.set(null)
@@ -1821,17 +1875,17 @@ void main(){
         // samples it. Same hand-off as the web page capture — the extractor
         // thread cannot touch GL, and this is the only place that can.
         val tb = thumbBmpPending.getAndSet(null)
-        if (tb != null && thumbTexId >= 0) {
+        if (tb != null && thumbTex() >= 0) {
             thumbBucket = thumbBucketIn
             thumbAspect = thumbAspectIn
-            try {
-                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, thumbTexId)
-                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, tb, 0)
-                thumbBitmap?.recycle()
-                thumbBitmap = tb
-            } catch (_: Throwable) {
-                tb.recycle()
-            }
+            thumbFrameSeq++
+            // Taken ownership of, NOT uploaded: the only thing ever drawn from
+            // this texture is the finished card, composite below. Uploading
+            // the bare frame here as well put an unbordered, unlabelled frame
+            // on screen for the width of a texImage2D whenever the composite
+            // did not immediately cover it.
+            thumbBitmap?.recycle()
+            thumbBitmap = tb
         }
         // A clear from another thread is finished here, where the bitmaps it
         // refers to are safe to release.
@@ -1845,7 +1899,17 @@ void main(){
         // The preview card is a composite of the picture and the time it
         // would drop at, so it is rebuilt when either changes — and only
         // then, so a drag does not re-upload it sixty times a second.
-        if (cur == Mode.VIDEO && menuOpen && thumbCardReady()) {
+        //
+        // A frame lands, or the clock moves while the picture on the card is
+        // the frame for the span in hand. While the grip has run on to the
+        // next span and its frame is still being fetched, neither happens and
+        // the card stays as it was — picture and the time it was taken at,
+        // agreeing with each other, rather than a fresh time over an old
+        // picture. That is the whole of the flicker fix: the card never shows
+        // a half-swapped state, it holds the last whole one until the next
+        // whole one is ready.
+        if (cur == Mode.VIDEO && menuOpen && thumbCardReady() &&
+            (thumbFrameSeq != thumbCardSeq || thumbBucket == cardWantedSpan)) {
             maybeBuildThumbCard(fmtTime((menuSeekHoverU.coerceIn(0f, 1f) * menuDurMs).toLong()))
         }
         // Web page: upload the latest capture (if the page changed) before
@@ -2018,10 +2082,10 @@ void main(){
      * picture is generated at exactly the aspect of the rect it fills.
      */
     private fun drawSeekThumb(alpha: Float) {
-        if (!thumbCardReady() || thumbTexId < 0 || cardBitmap == null) return
+        if (!thumbCardReady() || thumbTex() < 0 || cardBitmap == null) return
         val card = thumbCard()
         panelQuad(card[0], card[1], card[2], card[3])
-        drawQuadTex(thumbTexId, ovM, alpha)
+        drawQuadTex(thumbTex(), ovM, alpha)
     }
 
     /** Dwell progress 0..1 for the browser pointer (full ring → point).
