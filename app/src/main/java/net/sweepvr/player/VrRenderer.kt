@@ -1079,8 +1079,18 @@ class VrRenderer(
         // from disk and needs nothing from here.
         val px = previewPixels ?: return
         try {
-            st.getTransformMatrix(previewTexMat)
+            // Latch FIRST, then ask for the transform.
+            //
+            // getTransformMatrix() reports the transform of the buffer that
+            // updateTexImage() most recently latched, so reading it first
+            // describes the PREVIOUS frame. For every capture after the first
+            // that is harmless — a steady film has the same matrix twice — but
+            // on the first capture of a session there is no previous buffer,
+            // so it returns the identity and the frame is drawn with the
+            // wrong vertical orientation. That is the upside-down first frame
+            // in the strip, and the ordering here is the whole of it.
             st.updateTexImage()
+            st.getTransformMatrix(previewTexMat)
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, previewFbo)
             GLES20.glViewport(0, 0, previewW, previewH)
             // Scissor OFF, and this is not tidiness: drawEye leaves the
