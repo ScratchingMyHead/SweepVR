@@ -12,6 +12,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import net.sweepvr.player.thumbs.FramePixels
+import androidx.media3.common.PlaybackException
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -97,12 +98,100 @@ class ThumbBuilder(
         /** How often to re-check while the decoder is still coming up. */
         const val WARMUP_POLL_MS = 500L
         /** How often to ask whether a seek has landed, and how many times
-         *  before playing anyway. 40 × 60 ms is ~2.4 s, past any sane rebuffer. */
+         *  before playing anyway.
+         *
+         *  55 × 60 ms is ~3.3 s, deliberately inside ExoPlayer's own 4 s
+         *  stuck-playback watchdog so this wait can never outlast the player
+         *  tolerating the state.
+         *
+         *  Giving up early is not a harmless timeout, which is why it is worth
+         *  being long: the capture then takes whatever frame is on screen,
+         *  which is from BEFORE the seek, and files it against the new span —
+         *  a preview of the wrong moment. */
         const val LAND_POLL_MS = 60L
-        const val LAND_POLL_TRIES = 40
-        /** Frames are capped by their own area: beyond this the decoded
-         *  plane buffer alone is tens of MB, and the heap belongs to playback. */
-        const val MAX_FRAME_PIXELS = 12_000_000L
+        const val LAND_POLL_TRIES = 55
+        /** An upper bound on frame area, not a limit on what the app will try.
+         *
+         *  This was 12 MP, justified as "the decoded plane buffer alone is tens
+         *  of MB" — but the preview readback is scaled to PREVIEW_READ_H
+         *  (288px) regardless of the film, so the frames that are kept are a
+         *  few hundred kilobytes whatever the source is. At 12 MP it refused
+         *  5760x2880 and larger outright with "frame too large for a preview,
+         *  skipping", which is most of a real library, and it did so BEFORE
+         *  anything was attempted.
+         *
+         *  It stays as a bound because there has to be a line somewhere: a
+         *  frame this large cannot be decoded at all on most hardware, and a
+         *  check that can refuse is better than an OOM. 40 MP is above every
+         *  resolution seen failing in practice (8192x4096 is 33.6 MP), so it
+         *  no longer refuses anything real. */
+        const val MAX_FRAME_PIXELS = 40_000_000L
+
+        /** A failed preview decoder: how long to wait before trying again, and
+         *  when to stop trying for good.
+         *
+         *  This used to not exist, and the absence was the bug: one
+         *  DECODER_INIT_FAILED cleared `strip` and ended prebuilding for the
+         *  rest of the session, so a film whose decoder could not allocate
+         *  because the heap was momentarily full never got a strip at all, and
+         *  a restart was the only way out. Those failures are usually
+         *  transient — the heap a minute later is a different heap. */
+        const val DECODER_RETRY_MS = 15_000L
+        const val DECODER_GIVE_UP_MS = 180_000L
+        /** Ceiling on the backoff's doubling. Must stay under
+         *  [DECODER_GIVE_UP_MS], or a film that could have recovered is never
+         *  given the chance. */
+        const val DECODER_RETRY_MAX_MS = 240_000L
+
+        /**
+         * The wait before retrying a failed decoder, given how many attempts
+         * have already failed. Doubling, capped.
+         *
+         * Each retry is a whole new player that re-reads the container, and on
+         * a big remote file that is bandwidth the prebuild is not allowed to
+         * spend — playback comes first. Retrying flat spends it every 15s for
+         * three minutes on a decoder that is never going to appear.
+         */
+        fun decoderRetryDelayMs(attempts: Int): Long =
+            (DECODER_RETRY_MS shl attempts.coerceIn(0, 4))
+                .coerceAtMost(DECODER_RETRY_MAX_MS)
+
+        /**
+         * Which decoder error codes are worth retrying, by code so the policy
+         * can be pinned in a test (DecoderRetryTest).
+         *
+         * Allocation-adjacent codes only: a decoder that could not be created
+         * usually means the allocation did not fit at that moment rather than
+         * that the format is undecodable. A container the demuxer cannot read
+         * is not that, and retrying it just re-downloads the same bytes to
+         * fail again.
+         *
+         * Anything unrecognised is treated as PERMANENT, deliberately. The
+         * failure mode of guessing wrong in the other direction is a
+         * hopeless file re-fetching itself for three minutes; the failure mode
+         * here is one film with no strip, which is visible and cheap.
+         */
+        fun isTransientErrorCode(code: Int): Boolean = when (code) {
+            PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+            PlaybackException.ERROR_CODE_DECODING_FAILED,
+            PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES,
+            PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED,
+            // FAILED_RUNTIME_CHECK is the codec reporting a problem from
+            // INSIDE a decoder that had already started — observed on a
+            // 3840x1920 file whose preview surface was attached and working
+            // for 17 s before the error, with no format complaint anywhere.
+            // That is a decoder being torn down or starved while playback also
+            // wants the hardware instance, not an undecodable file, and it
+            // resolves by trying again on a fresh player.
+            //
+            // It matters that this is listed: without it the "unknown means
+            // permanent" rule below applied, and a file that builds fine on
+            // other attempts lost its strip for the rest of the session on the
+            // one attempt that hit this — which is worse than the behaviour
+            // the retry was added to fix.
+            PlaybackException.ERROR_CODE_FAILED_RUNTIME_CHECK -> true
+            else -> false
+        }
     }
 
     /** Where the strip stands, for the status line and the tests. */
@@ -114,6 +203,17 @@ class ThumbBuilder(
     @Volatile private var urgent = -1
 
     private var player: ExoPlayer? = null
+    /** What the player was built from, so a failed one can be rebuilt. */
+    @Volatile private var sourceUrl: String? = null
+    /** Set when the preview decoder reported an error; cleared by a retry. */
+    @Volatile private var decoderFailed = false
+    /** When it gave up, so the retry can wait — and eventually stop waiting.
+     *  Set at the moment of failure: leaving it 0 made the elapsed time read
+     *  as "now", which is instantly over the give-up budget and abandoned the
+     *  strip on the first error. That is the permanence this exists to fix. */
+    @Volatile private var decoderFailedAt = 0L
+    /** Consecutive failures, for the backoff between retries. */
+    @Volatile private var decoderAttempts = 0
     /** The renderer's capture surface, and the GL generation it belongs to. */
     private var attachedSurface: android.view.Surface? = null
     private var attachedGen = -1
@@ -210,6 +310,10 @@ class ThumbBuilder(
         loggedComplete = false
         waitingLogged = false
         noSizeLogged = false
+        decoderFailed = false
+        decoderFailedAt = 0L
+        decoderAttempts = 0
+        sourceUrl = url
         val st = ThumbStrip(durationMs)
         strip = st
         // Memory-only: the strip starts empty and is built again for this
@@ -239,6 +343,33 @@ class ThumbBuilder(
         mqReady = true
         mq.post { buildPlayer(url) }
         wq!!.post { sweep() }
+    }
+
+    /**
+     * Throw away the failed preview player and build another.
+     *
+     * MAIN THREAD, like every other player operation — hence the post from the
+     * worker tick that calls this. Returns false when there is nothing to
+     * rebuild from, which leaves the strip as it is rather than pretending.
+     */
+    private fun rebuildPreviewPlayer(): Boolean {
+        val url = sourceUrl ?: return false
+        val p = player
+        if (p != null) {
+            try { p.release() } catch (_: Exception) {}
+            player = null
+        }
+        // The failed surface must be forgotten, or attachSurface sees the same
+        // one it already has and skips handing it over — leaving the new
+        // player rendering into a released surface.
+        attachedSurface = null
+        attachedSize = null
+        renderer.previewExpectBucket = -1
+        renderer.previewSeekArmed = false
+        pendingBucket = -1
+        FileLog.i(TAG, "retrying the preview decoder (attempt ${decoderAttempts + 1})")
+        mq.post { if (!stopped) buildPlayer(url) }
+        return true
     }
 
     /** Stop prebuilding and give back the decoder, the reader and the thread. */
@@ -276,24 +407,30 @@ class ThumbBuilder(
      */
     fun request(bucket: Int) {
         val st = strip ?: return
-        // Drop whatever was being fetched. The grip has moved on, so that
-        // frame is for somewhere the user is no longer, and holding the
-        // decoder on it means the bucket they ARE pointing at waits longer.
-        if (pendingBucket >= 0 && pendingBucket != bucket) {
-            pendingBucket = -1
-            pendingCoarse = -1
-            renderer.previewExpectBucket = -1
-        }
+        // A fetch is out and the grip has moved on. It used to abandon the fetch
+        // here (pendingBucket = -1), which meant the very next sweep tick
+        // issued another seek while the previous one was still executing on
+        // the player. During a drag that is a seek every POLL_MS with the
+        // buffer budget below it — bufferForPlaybackAfterRebuffer is 100ms —
+        // and it is what produced ERROR_CODE_FAILED_RUNTIME_CHECK on a film
+        // that previews fine when nobody is dragging it.
+        //
+        // Letting it finish is both cheaper and more useful: the frame lands
+        // where it was asked for, and is a perfectly good preview for THAT
+        // span, so the drag costs nothing and the strip gains one. The grip's
+        // current position is recorded below and picked up on the next tick,
+        // which is what bounds the rate to one seek per POLL_MS.
+        //
         // Answerable already — by its own preview, or by the coarse frame that
         // covers it — then show it. Asking for a finer one mid-drag would
         // stall the card on a fetch the strip will get to anyway.
-        if (!st.answered(bucket)) {
-            urgent = bucket
+        if (st.answered(bucket)) {
+            wq?.post {
+                if (!stopped) showFromDisk(bucket)
+            }
             return
         }
-        wq?.post {
-            if (!stopped) showFromDisk(bucket)
-        }
+        urgent = bucket
     }
 
     // ---------- the preview player ----------
@@ -313,16 +450,51 @@ class ThumbBuilder(
                 .setDefaultRequestProperties(mapOf("X-SweepVR-Bg" to "1"))
             val ds = DefaultDataSource.Factory(context, http)
             val renderers = DefaultRenderersFactory(context)
-            // One frame's worth of buffer and no more. This player wants a
-            // single keyframe, and the buffer it asks for before it will
-            // render one IS what it reads: at 2 MB it pulled two to three
-            // megabytes per preview to show a two-hundred-kilobyte frame, so a
-            // strip of them read gigabytes and took minutes. These figures
-            // ask for roughly one 512 KiB window, which is also the proxy's
-            // own read granularity.
+            // Keep LOADING, and render early.
+            //
+            // These figures were once (200, 600, 50, 100) with a 384 KB byte
+            // target and bytes taking priority. That is what caused
+            // ERROR_CODE_FAILED_RUNTIME_CHECK on high-bitrate files, and the
+            // cause was not contention:
+            //
+            // ExoPlayerImplInternal throws IllegalStateException("Playback
+            // stuck buffering and not loading") once it has spent 4 s with
+            // UNDER 500 ms buffered while its load control says loading is no
+            // longer possible. DefaultLoadControl says exactly that — in its
+            // own words, logged every poll — when the buffer target is reached
+            // before 500 ms of media has arrived:
+            //
+            //   W/DefaultLoadControl: Target buffer size reached with less
+            //     than 500ms of buffered media data.
+            //
+            // 384 KB is under 500 ms on anything above ~6 MB/s, so the player
+            // stopped loading just below the watchdog's threshold and was
+            // then declared stuck. Whether a fetch landed above or below
+            // 500 ms was a coin toss, which is why one file worked on some
+            // attempts and died ~5 s in on others while a slower one never
+            // tripped it at all. (These films run at up to 14 MB/s, so 500 ms
+            // of video is ~7 MB.)
+            //
+            // So the byte budget is raised well past anything we could load
+            // before we pause, and maxBufferMs likewise. The load control
+            // therefore never reaches its target while a fetch is in flight,
+            // so it never claims "no more loading is possible", and the
+            // watchdog is never armed. Meanwhile bufferForPlaybackMs stays
+            // tiny so the frame we came for is rendered as soon as it exists.
+            //
+            // The cost is that the loader may pull a little further ahead
+            // while it waits than a hard byte cap would allow — bounded, in
+            // practice, by how long the first frame takes. It is all marked
+            // background: paced, on its own thread, and held off entirely
+            // while playback is starved.
             val load = DefaultLoadControl.Builder()
-                .setBufferDurationsMs(200, 600, 50, 100)
-                .setTargetBufferBytes(384 * 1024)
+                // minBufferMs (first) must be >= bufferForPlaybackAfterRebufferMs
+                // (last) or the builder throws; the earlier (100, 10_000, 100,
+                // 250) violated that and the player never got built at all.
+                // Hence 300 for both, which is still small enough to render
+                // the frame we came for promptly.
+                .setBufferDurationsMs(300, 10_000, 150, 300)
+                .setTargetBufferBytes(16 * 1024 * 1024)
                 .setPrioritizeTimeOverSizeThresholds(false)
                 .build()
             val exo = ExoPlayer.Builder(context, renderers)
@@ -371,7 +543,22 @@ class ThumbBuilder(
 
                 override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                     FileLog.w(TAG, "preview player error: ${error.errorCodeName} ${error.message}")
-                    strip = null      // no point sweeping for a strip we cannot read
+                    // Not fatal to the strip. It used to clear `strip` here,
+                    // which ended prebuilding for the rest of the session on
+                    // the first hiccup — and the errors that land here are
+                    // often transient: a decoder that could not allocate
+                    // because the heap was busy succeeds minutes later, once
+                    // playback has settled. So: stand down, keep the strip,
+                    // and let the sweep retry below.
+                    decoderFailed = true
+                    decoderAttempts = 0
+                    decoderFailedAt = android.os.SystemClock.elapsedRealtime()
+                    if (!isTransientErrorCode(error.errorCode)) {
+                        strip = null
+                        FileLog.w(TAG, "preview player: unrecoverable, giving up on the strip")
+                    } else {
+                        FileLog.i(TAG, "preview player: transient, will retry")
+                    }
                 }
             })
             player = exo
@@ -383,7 +570,17 @@ class ThumbBuilder(
             exo.prepare()
             FileLog.i(TAG, "preview player prepared: $url")
         } catch (e: Exception) {
-            FileLog.w(TAG, "preview player failed: ${e.message}")
+            // Loud, and retried. This used to log one line and give up, which
+            // made a construction-time mistake look exactly like "this film
+            // has no previews" — the one failure mode this whole path is
+            // supposed to be diagnosable about. A thrown IllegalArgumentException
+            // here is our own configuration, not the film, and it is
+            // deterministic, so it is re-thrown to the sweep as a decoder
+            // failure rather than silently ending the session with nothing.
+            FileLog.e(TAG, "preview player failed to build: ${e.message}")
+            decoderFailed = true
+            decoderAttempts = 0
+            decoderFailedAt = android.os.SystemClock.elapsedRealtime()
         }
     }
 
@@ -487,6 +684,24 @@ class ThumbBuilder(
     }
 
     private fun sweepOnce(st: ThumbStrip) {
+        // The preview decoder gave up. Transient failures are worth another
+        // go — an allocation that could not be met while playback was busy
+        // often succeeds once things settle — but not immediately, and not
+        // forever.
+        if (decoderFailed) {
+            val waited = android.os.SystemClock.elapsedRealtime() - decoderFailedAt
+            if (waited >= DECODER_GIVE_UP_MS) {
+                strip = null
+                FileLog.w(TAG, "preview decoder still failing after ${waited}ms — giving up")
+                return
+            }
+            if (waited < decoderRetryDelayMs(decoderAttempts)) return
+            if (!rebuildPreviewPlayer()) return
+            decoderFailed = false
+            decoderFailedAt = 0L
+            decoderAttempts++
+            return      // the new player needs a tick of its own to get going
+        }
         // Playback wants the link: nothing else matters until it says.
         if (pressure) {
             if (!pressureLogged) {

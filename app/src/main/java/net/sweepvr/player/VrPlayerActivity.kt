@@ -3182,11 +3182,15 @@ try {
                 }
             }
         }
-        // A new film means a new strip: drop the last film's preview so it
-        // cannot sit under this one's slider, and arm the prebuild to start
-        // as soon as the duration is known (startThumbPrebuild's callers).
-        renderer.clearThumb()
-        thumbsStarted = false
+        // A new film means a new strip. The builder is stopped FIRST, then the
+        // card cleared: clearing alone left the PREVIOUS film's prebuild still
+        // sweeping, and every frame it captured was handed straight to the
+        // renderer — so the new film's slider showed the old film's picture
+        // until its own prebuild happened to overwrite it (and indefinitely,
+        // on a film whose prebuild never got a decoder). Order matters, and
+        // this is the order that stops one film's frame under another film's
+        // label.
+        stopThumbPrebuild()
         previewRefusalLogged = false
         if (playUrl == null) playUrl = url
         Log.i(TAG, "play: $url")
