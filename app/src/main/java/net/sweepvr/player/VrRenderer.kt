@@ -601,6 +601,13 @@ class VrRenderer(
      *  Without this the keyboard is UNREACHABLE with sweep disabled: the field
      *  is the only thing that opens it, and its only gesture was a sweep. A
      *  setting that turns sweep off must not also remove the only way in. */
+    /** The address field as a dwell target.
+     *
+     *  NOT stepped in [stepAddrField]: with sweep off, toolbarStep returns into
+     *  toolbarDwell and never reaches the sweep address logic at all, so a
+     *  dwell implementation placed there is dead code. It belongs with the
+     *  other dwell buttons, and its absence there is why the field opened the
+     *  keyboard with no visible charge. */
     private val addrDwell = net.sweepvr.player.sweep.DwellButton()
     private var addrArmed = false
     private var kbTexId = 0
@@ -2384,13 +2391,12 @@ void main(){
             p.style = Paint.Style.FILL
             p.color = Color.argb(255, 26, 36, 52)
             c.drawRoundRect(x0, y0, x1, y1, 6f, 6f, p)
-            // The fill CLIMBS the key as the dwell charges. This is the whole
-            // feedback for a dwell key: there is no sweep to feel, so if the
-            // progress is not visible there is nothing between "not yet" and
-            // "already fired".
-            if (progF > 0f) {
+            // Charge is shown by the SHRINKING RETICLE, not by filling the
+            // key: that is the indicator used everywhere else in the app, and
+            // a second one here would mean a second rule to learn.
+            if (progF >= 1f) {
                 p.color = Color.argb(255, 56, 189, 248)
-                c.drawRoundRect(x0, y0, x0 + (x1 - x0) * progF, y1, 6f, 6f, p)
+                c.drawRoundRect(x0, y0, x1, y1, 6f, 6f, p)
             }
             p.style = Paint.Style.STROKE
             p.strokeWidth = 1.9f
@@ -2443,25 +2449,68 @@ void main(){
                     p.style = Paint.Style.FILL
                 }
                 net.sweepvr.player.sweep.DwellKeyboardControl.Kind.ENTER -> {
-                    val u = kotlin.math.min(x1 - x0, y1 - y0) * 0.20f
+                    // A return arrow as ONE path: across the top, down the
+                    // right, then diagonally away to the lower left with the
+                    // arrowhead ON that end of the stroke. Drawn as loose
+                    // pieces it read as two unrelated angled lines.
+                    // A RIGHT ANGLE, not a diagonal: stem down the right side,
+                    // turn 90 degrees into a horizontal, chevron pointing left.
+                    // Every earlier attempt drew a diagonal into the arrowhead
+                    // and it read as a thin "7" - the shape was wrong, not just
+                    // the weight.
+                    val u = kotlin.math.min(x1 - x0, y1 - y0) * 0.30f
+                    val stemX = cx + u * 0.62f
+                    val stemTop = cy - u * 0.95f
+                    val tipX = cx - u * 0.72f
+                    val tipY = cy + u * 0.42f
                     val g = android.graphics.Path()
-                    g.moveTo(cx - u, cy - u); g.lineTo(cx + u, cy - u)
-                    g.lineTo(cx + u, cy + u * 0.4f)
-                    g.moveTo(cx + u * 0.3f, cy)
-                    g.lineTo(cx + u, cy + u * 0.4f)
-                    g.lineTo(cx + u * 0.3f, cy + u)
+                    g.moveTo(stemX, stemTop)
+                    g.lineTo(stemX, tipY)
+                    g.lineTo(tipX, tipY)
+                    // Barbs symmetric about the direction of travel. Written
+                    // as two literal offsets they came out at different
+                    // angles - one at 45 degrees, one vertical - which is what
+                    // made the head look broken rather than hand-drawn.
+                    // Symmetric about the horizontal, opening to the right.
+                    val bl = u * 0.66f
+                    for (sgn in intArrayOf(1, -1)) {
+                        val a = sgn * 0.62
+                        g.moveTo(tipX, tipY)
+                        g.lineTo(tipX + (bl * kotlin.math.cos(a)).toFloat(),
+                                 tipY + (bl * kotlin.math.sin(a)).toFloat())
+                    }
                     p.color = Color.argb(255, 226, 232, 240)
                     p.style = Paint.Style.STROKE
-                    p.strokeWidth = 3f
+                    p.strokeWidth = 4f
                     p.strokeCap = Paint.Cap.ROUND
                     p.strokeJoin = Paint.Join.ROUND
                     c.drawPath(g, p)
                     p.strokeCap = Paint.Cap.BUTT
                     p.style = Paint.Style.FILL
                 }
+                net.sweepvr.player.sweep.DwellKeyboardControl.Kind.DISMISS -> {
+                    // A cross, drawn as a cross rather than the letter X so it
+                    // matches the sweep keyboard's dismiss.
+                    val u = kotlin.math.min(x1 - x0, y1 - y0) * 0.20f
+                    p.color = Color.argb(255, 226, 232, 240)
+                    p.style = Paint.Style.STROKE
+                    p.strokeWidth = 3f
+                    p.strokeCap = Paint.Cap.ROUND
+                    c.drawLine(cx - u, cy - u, cx + u, cy + u, p)
+                    c.drawLine(cx + u, cy - u, cx - u, cy + u, p)
+                    p.strokeCap = Paint.Cap.BUTT
+                    p.style = Paint.Style.FILL
+                }
                 else -> {
                     t.textSize = kotlin.math.min(x1 - x0, y1 - y0) * 0.42f
-                    c.drawText(k.spec.label, cx, cy - (t.descent() + t.ascent()) * 0.5f, t)
+                    // Show the letters as they will be TYPED. The shift key
+                    // lights when caps is up, which tells you the mode; it
+                    // does not tell you what the row will produce. The sweep
+                    // keyboard did the same.
+                    val show = if (kbdw.capsMode ==
+                        net.sweepvr.player.sweep.DwellKeyboardControl.CapsMode.LOWER)
+                        k.spec.label else k.spec.label.uppercase()
+                    c.drawText(show, cx, cy - (t.descent() + t.ascent()) * 0.5f, t)
                 }
             }
         }
@@ -2927,6 +2976,7 @@ void main(){
         // a key in hand can resolve, and the geometry decides how.
         val owned = if (dwellKeyboard) kbdw.step(g[0], g[1], dtMs, still)
                     else kbd.step(g[0], g[1], dtMs)
+        kbdDwellProg = if (dwellKeyboard) (kbdw.activeKey?.dwell?.progress ?: 0f) else 0f
         // What the control was actually handed, against what it believes the
         // live row is. Two rounds of reasoning about this mapping were both
         // wrong, so it is measured rather than deduced.
@@ -2958,16 +3008,6 @@ void main(){
         // Bar space is y-up and v-up; the control is y-down, so flip.
         val r = net.sweepvr.player.sweep.Rect(TB_ADDR_U0, 1f - TB_V1, TB_ADDR_U1, 1f - TB_V0)
         if (r.isEmpty) return false
-        if (!sweepEnabled) {
-            addrOpen.reset()
-            addrArmed = false
-            addrDwell.rect = r
-            addrDwell.onFire = { openKeyboard(webBarUrl) }
-            val p = addrDwell.step(u, 1f - v, still, dtMs)
-            toolbarAddrFocused = p > 0f
-            return p > 0f
-        }
-        addrDwell.reset()
         val cfg = net.sweepvr.player.sweep.SweepConfig(
             entrySides = setOf(net.sweepvr.player.sweep.Side.Top,
                 net.sweepvr.player.sweep.Side.Bottom),
@@ -3065,7 +3105,7 @@ void main(){
             w.beginEdit(value)
             w.changed = { onKeyboardText?.invoke(w.text) }
             w.committed = { closeKeyboard(true, it) }
-            w.cancelled = { closeKeyboard(false, w.initialText) }
+            w.cancelled = { closeKeyboard(false, w.text) }
             w.onTrace = { FileLog.i("SweepVR-kbd", "dwell $it") }
             onKeyboardText?.invoke(w.text)
             return
@@ -3085,7 +3125,7 @@ void main(){
             "point=%.2f,%.2f,%.2f half=%.2fx%.2f normal=%.2f,%.2f,%.2f".format(
                 kbPoint[0], kbPoint[1], kbPoint[2], kbWorldHalfW, kbWorldHalfH,
                 kbNormal[0], kbNormal[1], kbNormal[2]))
-        kbd.cancelled = { closeKeyboard(false, kbd.initialText) }
+        kbd.cancelled = { closeKeyboard(false, kbd.text) }
         onKeyboardText?.invoke(kbd.text)
         val g = kbHit
         if (g != null) kbd.prime(g[0], g[1])
@@ -3155,7 +3195,7 @@ void main(){
             if (panelGaze && webBookIconRow >= 0 && !sweepEnabled) bookControl.dwellProgress else 0f
         val prog = if (bookGaze && sweepEnabled) 0f else if (screenSweep) screenSweepProg() else
             if (panelGaze) maxOf(browserDwellProg(), flyoutProg) else
-            if (cur == Mode.WEB) maxOf(webDwellProg(), toolbarDwellProg, barDwellProg) else
+            if (cur == Mode.WEB) maxOf(webDwellProg(), toolbarDwellProg, barDwellProg, kbdDwellProg) else
             if (cur == Mode.BROWSER) browserDwellProg() else menuDwellProg()
         // The reticle is ALWAYS up in web mode: the page is the pointer.
         val show = testSweep || screenSweep || cur == Mode.WEB || cur == Mode.BROWSER ||
@@ -5037,6 +5077,14 @@ void main(){
      *  dwell does not also fire underneath a held arrow. */
     /** Deepest arrow dwell fill this frame, for the reticle shrink. */
     private var barDwellProg = 0f
+
+    /** The dwell keyboard's charge, 0..1, so the RETICLE shrinks.
+     *
+     *  The key used to fill with a moving bar instead. The reticle is the
+     *  application's dwell indicator everywhere else - page, rows, toolbar -
+     *  and a second, different indicator on the keyboard means learning a new
+     *  rule for one surface. One indicator, used consistently. */
+    private var kbdDwellProg = 0f
     private fun barArrows(u: Float, v: Float, dtMs: Long, still: Boolean): Boolean {
         barDwellProg = 0f
         if (!webScrollable) { barUp.reset(); barDown.reset(); return false }
@@ -5986,7 +6034,14 @@ void main(){
         // The address field is hover, not sweep: gaze inside = focused.
         toolbarAddrFocused =
             u >= TB_ADDR_U0 && u <= TB_ADDR_U1 && v >= TB_V0 && v <= TB_V1
-        if (stepAddrField(u, v, dtMs, still)) return true
+        val addrP = stepAddrField(u, v, dtMs, still)
+        // Fold the address field in HERE, before toolbarDwellProg is assigned.
+        // Returning early on it - which is what this did - meant the frame went
+        // out before the assignment, so the one control that opens the
+        // keyboard was the one control with no visible charge.
+        toolbarDwellProg = maxOf(toolbarDwellProg,
+            if (!sweepEnabled) addrDwell.progress else 0f)
+        if (addrP) return true
         return b0 || b1 || b2 || b3 || b4 || z0 || z1
     }
 
@@ -6037,6 +6092,15 @@ void main(){
         prog = maxOf(prog, cfgDwell(dwZoomIn, 1f - TB_BTN * 2, 1f - TB_BTN, "zoomin") { onWebEvent(WebEvent.TextZoom(1)) })
         // Icon fill counts too, so the reticle shrinks while opening.
         prog = maxOf(prog, bookBarCtl.dwellProgress)
+        // The address field, like every other control in here.
+        addrDwell.rect = net.sweepvr.player.sweep.Rect(
+            TB_ADDR_U0, TB_Y0, TB_ADDR_U1, TB_Y1)
+        addrDwell.onFire = { openKeyboard(webBarUrl) }
+        prog = maxOf(prog, addrDwell.step(u, 1f - v, still, dtMs))
+        // The address field counts when dwell is how it is opened. Without
+        // this it opened on a dwell nobody could see filling - the one control
+        // in the toolbar with no feedback.
+        if (!sweepEnabled) prog = maxOf(prog, addrDwell.progress)
         toolbarDwellProg = prog
         return prog > 0f
     }

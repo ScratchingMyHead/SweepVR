@@ -67,7 +67,9 @@ class DwellKeyboardControlTest {
         assertEquals(listOf("q", "w", "e", "r", "t", "y", "u", "i", "o", "p"), labels[0])
         assertEquals(listOf("a", "s", "d", "f", "g", "h", "j", "k", "l"), labels[1])
         assertEquals(listOf("^", "z", "x", "c", "v", "b", "n", "m", "<"), labels[2])
-        assertEquals(listOf("?123", ",", "space", ".", "return"), labels[3])
+        // X included: a phone has no close key because the back gesture does
+        // it, and a headset has no back gesture.
+        assertEquals(listOf("?123", ",", "space", ".", "return", "X"), labels[3])
 
         // Every key inside the window, and none overlapping another. Overlap
         // on a dwell keyboard is not cosmetic: two overlapping keys means the
@@ -100,6 +102,18 @@ class DwellKeyboardControlTest {
         // Row 3 also has nine keys, so it shares row 2's inset - asserted
         // rather than assumed, because it is the same arithmetic.
         assertTrue("row 3 aligned with row 2", kotlin.math.abs(row3.left - row2.left) < 1f)
+    }
+
+    @Test
+    fun dismissClosesTheKeyboard() {
+        // Without this the keyboard cannot be left at all: every other key
+        // edits, switches or commits, and none of them gets you out.
+        var cancelled = false
+        val k = kb("typed")
+        k.cancelled = { cancelled = true }
+        val x = keyFor(k, "X")!!.rect
+        dwell(k, x.midX(), x.midY())
+        assertTrue("dismiss fires", cancelled)
     }
 
     @Test

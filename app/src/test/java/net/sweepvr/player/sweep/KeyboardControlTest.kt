@@ -664,7 +664,7 @@ class KeyboardControlTest {
     }
 
     @Test
-    fun dismissFiresAndRestoresTheOriginal() {
+    fun dismissFiresAndKeepsWhatWasTyped() {
         var cancelled = false
         val k = kb("http://old")
         k.cancelled = { cancelled = true }

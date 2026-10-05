@@ -31,7 +31,7 @@ class DwellKeyboardControl {
     /** How capitals are applied, matching the sweep keyboard's three states. */
     enum class CapsMode { LOWER, SHIFT, CAPS }
 
-    enum class Kind { CHAR, SPACE, SHIFT, BKSP, ENTER, CLEAR, DELWORD, SWITCH }
+    enum class Kind { CHAR, SPACE, SHIFT, BKSP, ENTER, CLEAR, DELWORD, SWITCH, DISMISS }
 
     class KeySpec(
         val label: String,
@@ -98,9 +98,14 @@ class DwellKeyboardControl {
             listOf(
                 KeySpec("?123", Kind.SWITCH),
                 KeySpec(",", Kind.CHAR, ","),
-                KeySpec("space", Kind.SPACE, " ", 4.6f),
+                KeySpec("space", Kind.SPACE, " ", 4.0f),
                 KeySpec(".", Kind.CHAR, "."),
-                KeySpec("return", Kind.ENTER)
+                KeySpec("return", Kind.ENTER),
+                // A phone keyboard has no close - the back gesture does it.
+                // In a headset there is no back gesture, so without this the
+                // keyboard could not be dismissed at all: every other key
+                // edits or switches, and none of them gets you out.
+                KeySpec("X", Kind.DISMISS)
             )
         ),
         Layer.SYMBOLS to listOf(
@@ -112,10 +117,11 @@ class DwellKeyboardControl {
                 listOf(KeySpec("<", Kind.BKSP)),
             listOf(
                 KeySpec("ABC", Kind.SWITCH),
-                KeySpec("clear", Kind.CLEAR, "", 1.6f),
-                KeySpec("space", Kind.SPACE, " ", 4.6f),
-                KeySpec("delword", Kind.DELWORD, "", 1.6f),
-                KeySpec("return", Kind.ENTER)
+                KeySpec("clear", Kind.CLEAR, "", 1.5f),
+                KeySpec("space", Kind.SPACE, " ", 3.4f),
+                KeySpec("delword", Kind.DELWORD, "", 1.5f),
+                KeySpec("return", Kind.ENTER),
+                KeySpec("X", Kind.DISMISS)
             )
         )
     )
@@ -235,6 +241,7 @@ class DwellKeyboardControl {
             Kind.CLEAR -> "Clear"
             Kind.DELWORD -> "Delete word"
             Kind.SWITCH -> if (layer == Layer.ALPHA) "Symbols" else "Letters"
+            Kind.DISMISS -> "Close"
         }
     }
 
@@ -323,6 +330,7 @@ class DwellKeyboardControl {
                 changed?.invoke()
             }
             Kind.ENTER -> committed?.invoke(text)
+            Kind.DISMISS -> cancelled?.invoke()
             Kind.SWITCH -> {
                 layer = if (layer == Layer.ALPHA) Layer.SYMBOLS else Layer.ALPHA
                 built = emptyList()

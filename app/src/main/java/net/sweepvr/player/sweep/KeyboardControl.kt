@@ -816,11 +816,14 @@ private fun side(right: Boolean, zone: Rect, slot: Int): Rect {
                 changed?.invoke()
             }
             Action.ENTER -> committed?.invoke(text)
-            // Restore here rather than leaving it entirely to the owner. The
-            // viewer's close handler does put the text back, but a control
-            // whose own state survives its own CANCEL is not testable, and
-            // the two could drift apart.
-            Action.CANCEL -> { text = initialText; cancelled?.invoke() }
+            // DISMISS, not cancel: leave whatever is typed exactly as it is.
+            //
+            // Restoring initialText here did not discard an edit - for a page
+            // field the text was written as it was typed, so the field already
+            // held what the keyboard showed, and restoring overwrote the
+            // user's own words with what was there before they started. Real
+            // text boxes have no cancel button; they have undo.
+            Action.CANCEL -> cancelled?.invoke()
             Action.CLEAR -> { text = ""; changed?.invoke() }
             Action.CHAR -> Unit
         }
