@@ -2344,18 +2344,20 @@ void main(){
          *  and then "space" is a label for the key rather than a picture of
          *  what it does. This is the symbol: a bar with a stem standing on it,
          *  which is what a spacebar looks like from the front. */
-        fun spaceKey(r: Rect, live: Boolean, arm: Boolean) {
+        fun spaceKey(r: Rect, live: Boolean, arm: Boolean,
+                     entry: Set<net.sweepvr.player.sweep.Side> = emptySet()) {
             val x0 = tx(r.left); val y0 = ty(r.top); val x1 = tx(r.right); val y1 = ty(r.bottom)
             val rad = 6f
             p.style = Paint.Style.FILL
             p.color = if (arm) Color.argb(255, 56, 189, 248)
                       else if (live) Color.argb(255, 26, 36, 52)
                       else Color.argb(140, 15, 21, 31)
-            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            val path = dipKeyPath(x0, y0, x1, y1, entry, rad, KBD_DIP, KBD_DIP_H)
+            c.drawPath(path, p)
             p.style = Paint.Style.STROKE
             p.strokeWidth = 1.6f
             p.color = if (arm) Color.argb(255, 226, 232, 240) else Color.argb(110, 71, 85, 105)
-            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            c.drawPath(path, p)
 
             val w = x1 - x0
             val h = y1 - y0
@@ -2381,18 +2383,20 @@ void main(){
          *  four or five letters shrunk to fit, which reads as noise and, at
          *  this size, as more letters than the key can hold. The glyph carries
          *  one idea in one shape and stays legible from across the room. */
-        fun iconKey(r: Rect, kind: String, live: Boolean, arm: Boolean) {
+        fun iconKey(r: Rect, kind: String, live: Boolean, arm: Boolean,
+                    entry: Set<net.sweepvr.player.sweep.Side> = emptySet()) {
             val x0 = tx(r.left); val y0 = ty(r.top); val x1 = tx(r.right); val y1 = ty(r.bottom)
             val rad = 6f
             p.style = Paint.Style.FILL
             p.color = if (arm) Color.argb(255, 56, 189, 248)
                       else if (live) Color.argb(255, 26, 36, 52)
                       else Color.argb(140, 15, 21, 31)
-            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            val path = dipKeyPath(x0, y0, x1, y1, entry, rad, KBD_DIP, KBD_DIP_H)
+            c.drawPath(path, p)
             p.style = Paint.Style.STROKE
             p.strokeWidth = 1.6f
             p.color = if (arm) Color.argb(255, 226, 232, 240) else Color.argb(110, 71, 85, 105)
-            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            c.drawPath(path, p)
 
             val w = x1 - x0
             val h = y1 - y0
@@ -2465,7 +2469,8 @@ void main(){
             p.strokeCap = Paint.Cap.BUTT
         }
 
-        fun key(r: Rect, label: String, live: Boolean, arm: Boolean) {
+        fun key(r: Rect, label: String, live: Boolean, arm: Boolean,
+                entry: Set<net.sweepvr.player.sweep.Side> = emptySet()) {
             val x0 = tx(r.left); val y0 = ty(r.top); val x1 = tx(r.right); val y1 = ty(r.bottom)
             val rad = 6f
             p.style = Paint.Style.FILL
@@ -2474,11 +2479,12 @@ void main(){
                 live -> Color.argb(255, 26, 36, 52)
                 else -> Color.argb(140, 15, 21, 31)
             }
-            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            val path = dipKeyPath(x0, y0, x1, y1, entry, rad, KBD_DIP, KBD_DIP_H)
+            c.drawPath(path, p)
             p.style = Paint.Style.STROKE
             p.strokeWidth = 1.6f
             p.color = if (arm) Color.argb(255, 226, 232, 240) else Color.argb(110, 71, 85, 105)
-            c.drawRoundRect(x0, y0, x1, y1, rad, rad, p)
+            c.drawPath(path, p)
             val t = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
             t.color = if (live) Color.WHITE else Color.argb(80, 200, 210, 225)
             t.textSize = (y1 - y0) * 0.56f
@@ -2507,21 +2513,22 @@ void main(){
             // same string, which is why only this one looked broken.
             val arm = kbd.isBarKeyHeld(barLabels[i])
             if (barLabels[i] == "BKSP") {
-                iconKey(r0, "DEL", true, arm)
-                iconKey(r1, "DEL", true, arm)
+                iconKey(r0, "DEL", true, arm, kbd.topBarEntry(i))
+                iconKey(r1, "DEL", true, arm, kbd.bottomBarEntry(i))
             } else {
-                key(r0, lbl, true, arm)
-                key(r1, lbl, true, arm)
+                key(r0, lbl, true, arm, kbd.topBarEntry(i))
+                key(r1, lbl, true, arm, kbd.bottomBarEntry(i))
             }
         }
-        iconKey(kbd.enterTop, "ENT", true, held == "ENT")
-        iconKey(kbd.enterBottom, "ENT", true, held == "ENT")
-        iconKey(kbd.clearTop, "CLR", true, held == "CLR")
-        iconKey(kbd.clearKey, "CLR", true, held == "CLR")
-        iconKey(kbd.cancelTop, "X", true, held == "X")
-        iconKey(kbd.cancelBottom, "X", true, held == "X")
-        iconKey(kbd.delWordTop, "DEL", true, held == "DEL")
-        iconKey(kbd.delWordBottom, "DEL", true, held == "DEL")
+        fun ec(e: net.sweepvr.player.sweep.KeyboardControl.EdgeKey) = kbd.edgeEntry(e)
+        iconKey(kbd.enterTop, "ENT", true, held == "ENT", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.ENTER_TOP))
+        iconKey(kbd.enterBottom, "ENT", true, held == "ENT", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.ENTER_BOTTOM))
+        iconKey(kbd.clearTop, "CLR", true, held == "CLR", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.CLEAR_TOP))
+        iconKey(kbd.clearKey, "CLR", true, held == "CLR", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.CLEAR_BOTTOM))
+        iconKey(kbd.cancelTop, "X", true, held == "X", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.DISMISS_TOP))
+        iconKey(kbd.cancelBottom, "X", true, held == "X", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.DISMISS_BOTTOM))
+        iconKey(kbd.delWordTop, "DEL", true, held == "DEL", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.DELWORD_TOP))
+        iconKey(kbd.delWordBottom, "DEL", true, held == "DEL", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.DELWORD_BOTTOM))
         iconKey(kbd.cancelLeft, "X", true, held == "X")
 
         for (r in 0..2) {
@@ -2538,9 +2545,12 @@ void main(){
                 val shown = if (live && chars[i].length == 1 && chars[i][0].isLetter() &&
                     kbd.capsMode != net.sweepvr.player.sweep.KeyboardControl.CapsMode.LOWER)
                     chars[i] else chars[i].lowercase()
-                if (chars[i] == " ") spaceKey(kbd.charRect(r, i), live, live && held == " ")
-                else key(kbd.charRect(r, i), shown, live,
-                    live && i == kbd.heldCharIndex)
+                val ent = kbd.charEntry()
+                if (chars[i] == " ")
+                    spaceKey(kbd.charRect(r, i), live, live && held == " ", ent)
+                else
+                    key(kbd.charRect(r, i), shown, live,
+                        live && i == kbd.heldCharIndex, ent)
             }
         }
 
@@ -5942,6 +5952,64 @@ void main(){
             }, p)
         }
         p.textAlign = Paint.Align.LEFT
+    }
+
+    /**
+     * A key's outline: rounded rectangle with a V-dip cut into each edge the
+     * key is ENTERED through, the same language as the toolbar's buttons.
+     *
+     * Only the admitting edges are cut. A dip on an edge that refuses entry
+     * advertises a gesture that does nothing, and a key with no dip where
+     * entry is allowed makes a working gesture invisible - so the sets are
+     * read from the control's own entry configuration rather than restated
+     * here, and the artwork cannot drift from the behaviour.
+     *
+     * Drawn as one path so the border follows the notch instead of running
+     * straight across the cutout.
+     */
+    private val KBD_DIP = 5f
+    private val KBD_DIP_H = 4f
+
+    private fun dipKeyPath(
+        x0: Float, y0: Float, x1: Float, y1: Float,
+        sides: Set<net.sweepvr.player.sweep.Side>,
+        r: Float, dip: Float, dh: Float
+    ): android.graphics.Path {
+        val hasT = net.sweepvr.player.sweep.Side.Top in sides
+        val hasB = net.sweepvr.player.sweep.Side.Bottom in sides
+        val hasL = net.sweepvr.player.sweep.Side.Left in sides
+        val hasR = net.sweepvr.player.sweep.Side.Right in sides
+        val mx = (x0 + x1) * 0.5f
+        val my = (y0 + y1) * 0.5f
+        val rr = minOf(r, minOf(x1 - x0, y1 - y0) * 0.5f)
+        val dd = minOf(dip, (if (hasL || hasR) (x1 - x0) else Float.MAX_VALUE) * 0.5f)
+        val dv = minOf(dip, (if (hasT || hasB) (y1 - y0) else Float.MAX_VALUE) * 0.5f)
+        val dhv = minOf(dh, (y1 - y0) * 0.25f)
+        val dhw = minOf(dh, (x1 - x0) * 0.25f)
+        return android.graphics.Path().apply {
+            moveTo(x0 + rr, y0)
+            if (hasT) {
+                lineTo(mx - dv, y0); lineTo(mx, y0 + dhv); lineTo(mx + dv, y0)
+            }
+            lineTo(x1 - rr, y0)
+            quadTo(x1, y0, x1, y0 + rr)
+            if (hasR) {
+                lineTo(x1, my - dhw); lineTo(x1 - dd, my); lineTo(x1, my + dhw)
+            }
+            lineTo(x1, y1 - rr)
+            quadTo(x1, y1, x1 - rr, y1)
+            if (hasB) {
+                lineTo(mx + dv, y1); lineTo(mx, y1 - dhv); lineTo(mx - dv, y1)
+            }
+            lineTo(x0 + rr, y1)
+            quadTo(x0, y1, x0, y1 - rr)
+            if (hasL) {
+                lineTo(x0, my + dhw); lineTo(x0 + dd, my); lineTo(x0, my - dhw)
+            }
+            lineTo(x0, y0 + rr)
+            quadTo(x0, y0, x0 + rr, y0)
+            close()
+        }
     }
 
     /** One toolbar momentary button: rounded square with side dips (the entry

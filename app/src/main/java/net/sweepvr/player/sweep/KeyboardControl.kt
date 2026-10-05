@@ -407,6 +407,12 @@ private fun side(right: Boolean, zone: Rect, slot: Int): Rect {
             }
         }
 
+        /** The sides this key admits entry through, for the renderer to draw
+         *  as dips. A notch that is not an entry side is a lie, and one
+         *  missing where entry IS allowed is worse: the gesture becomes
+         *  invisible. */
+        val entrySides: Set<Side> get() = entry
+
         fun reset() { engine.reset(); armed = false; coolMs = Long.MAX_VALUE }
 
         /** Refuse to arm for STANDOFF_MS, without forgetting where the gaze
@@ -524,6 +530,42 @@ private fun side(right: Boolean, zone: Rect, slot: Int): Rect {
     private var heldKeyMs: Long = 0L
     private var heldKeyAge: Long = 0L
     private var heldKeyRect: Rect? = null
+
+    // ---------------------------------------------------------- entry dips
+    //
+    // The renderer draws a notch on each edge a key is entered through, the
+    // same language as the toolbar's buttons. These expose the sets so the
+    // artwork and the gesture cannot drift apart: the dips are read FROM the
+    // entry configuration rather than restated beside it.
+
+    /** Entry sides of the [i]th key of the top bar. */
+    fun topBarEntry(i: Int): Set<Side> = topKeys.getOrNull(i)?.entrySides ?: emptySet()
+
+    /** Entry sides of the [i]th key of the bottom bar. */
+    fun bottomBarEntry(i: Int): Set<Side> = bottomKeys.getOrNull(i)?.entrySides ?: emptySet()
+
+    /** Entry sides of a character key. Every row is entered the same way, so
+     *  this does not vary with the row. */
+    fun charEntry(): Set<Side> =
+        charKeys.getOrNull(0)?.getOrNull(0)?.entrySides ?: emptySet()
+
+    /** Entry sides of one of the side keys. */
+    fun edgeEntry(which: EdgeKey): Set<Side> = when (which) {
+        EdgeKey.ENTER_TOP -> enterTopCtl.entrySides
+        EdgeKey.ENTER_BOTTOM -> enterBottomCtl.entrySides
+        EdgeKey.CLEAR_TOP -> clearTopCtl.entrySides
+        EdgeKey.CLEAR_BOTTOM -> clearBottomCtl.entrySides
+        EdgeKey.DISMISS_TOP -> cancelTopCtl.entrySides
+        EdgeKey.DISMISS_BOTTOM -> cancelBottomCtl.entrySides
+        EdgeKey.DELWORD_TOP -> delWordTopCtl.entrySides
+        EdgeKey.DELWORD_BOTTOM -> delWordBottomCtl.entrySides
+    }
+
+    /** The keys down the two side columns, in a stable order. */
+    enum class EdgeKey {
+        ENTER_TOP, ENTER_BOTTOM, CLEAR_TOP, CLEAR_BOTTOM,
+        DISMISS_TOP, DISMISS_BOTTOM, DELWORD_TOP, DELWORD_BOTTOM
+    }
 
     /** What the renderer should light up.
      *
