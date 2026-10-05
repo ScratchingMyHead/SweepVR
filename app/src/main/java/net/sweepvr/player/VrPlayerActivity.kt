@@ -2802,7 +2802,13 @@ try {
             }
         }
         FileLog.i("SweepVR-web", "enterWeb url=$want have=${player != null}")
-        if (BuildConfig.DEBUG) renderer.webDbgOn = true // TEMP DEBUG: gaze crosshair
+        // The gaze crosshair stays OFF even in debug builds. It was switched
+        // on unconditionally here, which meant every debug run started with a
+        // crosshair burned into the page - a debugging aid nobody asked to see
+        // in normal use, and one that is easy to forget is on because the
+        // overlay looks like part of the page. The "Gaze crosshair" toggle in
+        // the menu still turns it on.
+        if (BuildConfig.DEBUG) renderer.webDbgOn = false // TEMP DEBUG
     }
 
     /** Back to video, resuming whatever was playing. With no video there is
