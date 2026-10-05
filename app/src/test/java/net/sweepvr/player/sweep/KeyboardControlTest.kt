@@ -173,6 +173,31 @@ class KeyboardControlTest {
     }
 
     @Test
+    fun everySideKeyIsEnteredFromTheEdgeFacingTheBand() {
+        // The renderer cuts its entry dips from these sets, so a wrong set
+        // here is a missing or lying dip on screen rather than a failure.
+        val k = kb()
+        fun sides(e: KeyboardControl.EdgeKey) =
+            k.edgeEntry(e).map { it.name }.sorted().joinToString(",")
+        // Everything in the top dead zone is entered from BELOW, and
+        // everything in the bottom dead zone from ABOVE.
+        assertEquals("ENTER_TOP", "Bottom", sides(KeyboardControl.EdgeKey.ENTER_TOP))
+        assertEquals("CLEAR_TOP", "Bottom", sides(KeyboardControl.EdgeKey.CLEAR_TOP))
+        assertEquals("DISMISS_TOP", "Bottom", sides(KeyboardControl.EdgeKey.DISMISS_TOP))
+        assertEquals("DELWORD_TOP", "Bottom", sides(KeyboardControl.EdgeKey.DELWORD_TOP))
+        assertEquals("ENTER_BOTTOM", "Top", sides(KeyboardControl.EdgeKey.ENTER_BOTTOM))
+        assertEquals("CLEAR_BOTTOM", "Top", sides(KeyboardControl.EdgeKey.CLEAR_BOTTOM))
+        assertEquals("DISMISS_BOTTOM", "Top", sides(KeyboardControl.EdgeKey.DISMISS_BOTTOM))
+        assertEquals("DELWORD_BOTTOM", "Top", sides(KeyboardControl.EdgeKey.DELWORD_BOTTOM))
+        // Characters may be entered from either end.
+        assertEquals("chars", "Bottom,Top",
+            k.charEntry().map { it.name }.sorted().joinToString(","))
+        // And the bars face the drum, not each other.
+        assertEquals("top bar", "Bottom", k.topBarEntry(0).map { it.name }.joinToString(","))
+        assertEquals("bottom bar", "Top", k.bottomBarEntry(0).map { it.name }.joinToString(","))
+    }
+
+    @Test
     fun onePressTypesOneCharacter() {
         // A single sweep must type ONE character.
         //

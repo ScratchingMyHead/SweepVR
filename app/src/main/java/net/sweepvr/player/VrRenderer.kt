@@ -2355,8 +2355,12 @@ void main(){
             val path = dipKeyPath(x0, y0, x1, y1, entry, rad, KBD_DIP, KBD_DIP_H)
             c.drawPath(path, p)
             p.style = Paint.Style.STROKE
-            p.strokeWidth = 1.6f
-            p.color = if (arm) Color.argb(255, 226, 232, 240) else Color.argb(110, 71, 85, 105)
+            p.strokeWidth = 1.9f
+            p.color = when {
+                arm -> KBD_ARMED_EDGE
+                live -> KBD_EDGE_LIVE
+                else -> KBD_EDGE_IDLE
+            }
             c.drawPath(path, p)
 
             val w = x1 - x0
@@ -2371,8 +2375,15 @@ void main(){
             val g = Path()
             g.moveTo(cx - halfW, base)
             g.lineTo(cx + halfW, base)
-            g.moveTo(cx, base)
-            g.lineTo(cx, base - stem)
+            // Stems at the ENDS, not the middle. A stem in the centre reads as
+            // a single object standing on the bar - a divider, or a plinth -
+            // rather than as the bar itself being the thing you press. Two
+            // marks at the ends describe a surface with a left and a right,
+            // which is what a spacebar has.
+            g.moveTo(cx - halfW, base)
+            g.lineTo(cx - halfW, base - stem)
+            g.moveTo(cx + halfW, base)
+            g.lineTo(cx + halfW, base - stem)
             c.drawPath(g, p)
             p.strokeCap = Paint.Cap.BUTT
         }
@@ -2394,8 +2405,8 @@ void main(){
             val path = dipKeyPath(x0, y0, x1, y1, entry, rad, KBD_DIP, KBD_DIP_H)
             c.drawPath(path, p)
             p.style = Paint.Style.STROKE
-            p.strokeWidth = 1.6f
-            p.color = if (arm) Color.argb(255, 226, 232, 240) else Color.argb(110, 71, 85, 105)
+            p.strokeWidth = 1.9f
+            p.color = if (arm) KBD_ARMED_EDGE else KBD_EDGE_LIVE
             c.drawPath(path, p)
 
             val w = x1 - x0
@@ -2482,8 +2493,12 @@ void main(){
             val path = dipKeyPath(x0, y0, x1, y1, entry, rad, KBD_DIP, KBD_DIP_H)
             c.drawPath(path, p)
             p.style = Paint.Style.STROKE
-            p.strokeWidth = 1.6f
-            p.color = if (arm) Color.argb(255, 226, 232, 240) else Color.argb(110, 71, 85, 105)
+            p.strokeWidth = 1.9f
+            p.color = when {
+                arm -> KBD_ARMED_EDGE
+                live -> KBD_EDGE_LIVE
+                else -> KBD_EDGE_IDLE
+            }
             c.drawPath(path, p)
             val t = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
             t.color = if (live) Color.WHITE else Color.argb(80, 200, 210, 225)
@@ -2529,7 +2544,6 @@ void main(){
         iconKey(kbd.cancelBottom, "X", true, held == "X", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.DISMISS_BOTTOM))
         iconKey(kbd.delWordTop, "DEL", true, held == "DEL", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.DELWORD_TOP))
         iconKey(kbd.delWordBottom, "DEL", true, held == "DEL", ec(net.sweepvr.player.sweep.KeyboardControl.EdgeKey.DELWORD_BOTTOM))
-        iconKey(kbd.cancelLeft, "X", true, held == "X")
 
         for (r in 0..2) {
             val live = r == kbd.activeRowIndex
@@ -5969,6 +5983,22 @@ void main(){
      */
     private val KBD_DIP = 5f
     private val KBD_DIP_H = 4f
+
+    /** Border on a key you can act on now: half way between the bright
+     *  version and the old dark one, on colour and alpha alike, because a
+     *  half-measure on one axis only reads as a different colour rather than
+     *  as a lighter version of the same thing. */
+    private val KBD_EDGE_LIVE = Color.argb(183, 99, 117, 141)
+
+    /** The original faint border, kept for the rows the drum has parked.
+     *
+     *  A row that is not live is inert - nothing on it fires - and drawing it
+     *  with the same bright outline as the live row made all three look
+     *  equally available. The dim border costs nothing and says which row
+     *  actually takes input, which is the drum's whole job. */
+    private val KBD_EDGE_IDLE = Color.argb(110, 71, 85, 105)
+
+    private val KBD_ARMED_EDGE = Color.argb(255, 240, 246, 252)
 
     private fun dipKeyPath(
         x0: Float, y0: Float, x1: Float, y1: Float,
