@@ -173,6 +173,24 @@ class KeyboardControlTest {
     }
 
     @Test
+    fun onePressTypesOneCharacter() {
+        // A single sweep must type ONE character.
+        //
+        // The resolve used to reset the row's engines with the gaze already
+        // OUTSIDE the band - which is the only reason it resolved. reset()
+        // discards the history, so the next frame every engine read its
+        // first sample outside its own rect as an entry, found the gaze still
+        // outside, and typed the same character again: "ll" from one press.
+        val k = kb()
+        sweepUp(k, "L")
+        assertEquals("one press, one character", "l", k.text)
+        // And it must stay that way while the gaze lingers outside the band,
+        // which is where jitter lives.
+        repeat(12) { k.step(k.activeRowBand.midX(), k.activeRowBand.bottom + 30f, frame) }
+        assertEquals("no second character from lingering", "l", k.text)
+    }
+
+    @Test
     fun onePressTurnsCapsBackOnAfterTheSingleCapIsSpent() {
         // The exact dead-press: Aaa, type one character so it resets itself
         // to aaa, then ONE sweep over Aa. It has to come back on first time.

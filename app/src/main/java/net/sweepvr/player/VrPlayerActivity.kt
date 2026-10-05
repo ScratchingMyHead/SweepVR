@@ -18,6 +18,8 @@ import net.sweepvr.player.thumbs.ThumbBuilder
 import net.sweepvr.player.thumbs.ThumbSplit
 import net.sweepvr.player.thumbs.ThumbMemory
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -1334,7 +1336,13 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private var keyboardEditing = false
 
     private fun initKeyboard() {
-        renderer.onKeyboardText = { txt -> renderer.webBarUrl = txt }
+        // Only the ADDRESS bar mirrors what is being typed. While a page
+        // field is being edited the keystrokes belong to that field, and
+        // writing them into the URL would make the address bar flicker
+        // through the search text while the user typed it into the page.
+        renderer.onKeyboardText = { txt ->
+            if (!renderer.keyboardIsField) renderer.webBarUrl = txt else liveFieldWrite(txt)
+        }
         renderer.onKeyboardOpened = { keyboardEditing = true }
         renderer.onKeyboardClose = { navigate, text ->
             keyboardEditing = false
@@ -1347,6 +1355,32 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             // exactly as it had been. The control already restores the
             // original text itself on cancel, so `text` is correct on both
             // paths and nothing needs to choose between them here.
+            if (renderer.keyboardIsField) {
+                fieldLiveRun?.let { fieldLive.removeCallbacks(it) }
+                fieldLiveRun = null
+                fieldLiveText = null
+                if (navigate) {
+                    // ENTER. Commit the value, then let the page do whatever
+                    // Enter does there - submit a form, or move to the next
+                    // box. Calling it "Go" and inventing a navigation would
+                    // have been wrong on most pages and broken on the rest.
+                    pushField(text)
+                    pressEnter()
+                    FileLog.i("SweepVR-web",
+                        "field enter sent='" + text.take(40) + "'")
+                } else {
+                    // X is CLOSE, not cancel.
+                    //
+                    // The field was being written as you typed, so it already
+                    // holds exactly what the keyboard shows. Restoring
+                    // initialText here did not discard an edit - it overwrote
+                    // the user's own text with what was there before they
+                    // started, which is the opposite of what closing a text
+                    // box does anywhere else. Real fields have no such button;
+                    // they have undo. So: close, and change nothing.
+                    FileLog.i("SweepVR-web", "field close, text kept")
+                }
+            } else {
             renderer.webBarUrl = text
             if (navigate && text.isNotBlank()) {
                 val u = if (text.contains("://") || text.startsWith("localhost")) text
@@ -1362,6 +1396,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 // was about to load. It also cost a frame on every press.
                 runOnUiThread { webView?.loadUrl(u) }
             }
+            }
         }
     }
 
@@ -1370,6 +1405,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private val WEB_HOME = "https://www.iana.org/help/example-domains"
 
     private val WEB_SCHEMES = setOf("http", "https", "about", "data", "file", "javascript", "blob")
+
+    /** How often a live page-field edit is pushed into the page. */
+    private val FIELD_LIVE_MS = 120L
 
     /** texture px per CSS px on the page (1 with the density-1 context). */
     private var webDpr = 1f
@@ -1384,7 +1422,14 @@ if (window.__limpet) return;
 function clickable(e){
   for (var i=0; e && i<6; i++, e=e.parentElement){
     var t=(e.tagName||'').toLowerCase();
-    if (t==='a'||t==='button'||t==='summary'||t==='details'||t==='label'||t==='video') return true;
+    if (t==='a'||t==='button'||t==='summary'||t==='details'||t==='label'||t==='video'||t==='select') return true;
+    // Any visible <input> is interactive. Submit and button inputs are
+    // `<input type=submit>`, NOT `<button>`, so the tag test above never saw
+    // them and they were undwellable: a button on a form simply did nothing.
+    if (t==='input') {
+      var ty=(e.getAttribute('type')||'text').toLowerCase();
+      if (ty!=='hidden') return true;
+    }
     if (e.onclick) return true;
     if (e.getAttribute && e.getAttribute('role')==='button') return true;
     try { if (getComputedStyle(e).cursor==='pointer') return true; } catch (x) {}
@@ -1392,8 +1437,164 @@ function clickable(e){
   return false;
 }
 window.__limpet = {
-  hit: function(x,y){ try { return clickable(document.elementFromPoint(x,y)); } catch (e) { return false; } },
+  /* Is there anything here worth a DWELL?
+     An editable field counts. It has to: the dwell is what opens the keyboard
+     against a field, and this answer is what starts a dwell at all. A search
+     box is an <input type=text> with no onclick, no role and no pointer
+     cursor, so clickable() said no, the dwell never ran, and the keyboard was
+     never even asked for. Everything on the page felt dead at exactly the
+     place you most want it alive. */
+  hit: function(x,y){ try {
+      var el = document.elementFromPoint(x,y);
+      for (var i=0; el && i < 4 && !this.editable(el); i++) el = el.parentElement;
+      if (this.editable(el)) return true;
+      return clickable(document.elementFromPoint(x,y));
+  } catch (e) { return false; } },
+  /* ---- text fields ------------------------------------------------------
+     The WebView is deliberately non-focusable (wv.isFocusable = false) so it
+     never steals the keyboard from the page, which means two things follow.
+     document.activeElement is not something we can rely on, and a real
+     el.focus() may quietly do nothing. So the field being edited is held HERE
+     and looked up by id, in the same spirit as click() below, which
+     synthesises its events rather than trusting the browser to deliver them.
+
+     Fields are also tagged with a generated id so a page that re-renders can
+     be survived: a held element reference goes stale the moment the site
+     replaces its DOM, and a half-applied edit is worse than none. */
+  _field: null,
+  _fieldNo: 0,
+  editable: function(e) {
+    if (!e || !e.tagName) return false;
+    var t = e.tagName.toLowerCase();
+    if (t === 'textarea') return true;
+    if (t === 'input') {
+      var ty = (e.getAttribute('type') || 'text').toLowerCase();
+      return ['text','search','url','email','tel','password','number',
+              'date','month','week','time','datetime-local'].indexOf(ty) >= 0;
+    }
+    return e.isContentEditable === true;
+  },
+  read: function(e) {
+    try {
+      if (!e) return '';
+      var t = (e.tagName || '').toLowerCase();
+      if (t === 'input' || t === 'textarea')
+        return String(e.value == null ? '' : e.value);
+      return String(e.textContent == null ? '' : e.textContent);
+    } catch (x) { return ''; }
+  },
+  tag: function(e) {
+    if (!e) return '';
+    if (!e.id) e.id = '__limpetF' + (++this._fieldNo);
+    return e.id;
+  },
+  /* The editable field under a CSS point, if any. Climbs a few parents so a
+     label wrapped around its input still counts. */
+  at: function(x, y) {
+    try {
+      var el = document.elementFromPoint(x, y);
+      for (var i = 0; el && i < 4 && !this.editable(el); i++) el = el.parentElement;
+      if (!this.editable(el)) return null;
+      var id = this.tag(el);
+      this._field = id;
+      try { el.focus({preventScroll:true}); } catch (x) {}
+      // The rectangle, so the keyboard can hang under the FIELD rather than
+      // under the address bar, which is where it used to appear no matter
+      // what was being edited. Client coordinates, matching what the renderer
+      // already works in: page UV is just these over the viewport.
+      var r = el.getBoundingClientRect();
+      return {id:id, val:this.read(el), tag:(el.tagName||'').toLowerCase(),
+              r:[r.left, r.top, r.width, r.height],
+              vw:window.innerWidth, vh:window.innerHeight};
+    } catch (e) { return null; }
+  },
+  /* Write through the prototype's native setter. React, Vue and anything
+     else that patches value keep the last value THEY set and ignore a plain
+     el.value = ..., so the page never sees the edit and then overwrites it on
+     its next render - which reads as the keyboard silently not working.
+     Dispatching input as well as change is what makes a controlled component
+     update; change alone is ignored by most of them. */
+  write: function(text) {
+    var el = null;
+    try { el = this._field ? document.getElementById(this._field) : null; } catch (x) {}
+    if (!el) return 'gone';
+    var t = (el.tagName || '').toLowerCase();
+    try {
+      if (t === 'input' || t === 'textarea') {
+        var proto = (t === 'input') ? window.HTMLInputElement.prototype
+                                   : window.HTMLTextAreaElement.prototype;
+        var d = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (d && d.set) d.set.call(el, text); else el.value = text;
+      } else {
+        el.textContent = text;
+      }
+      el.dispatchEvent(new Event('input', {bubbles:true}));
+      el.dispatchEvent(new Event('change', {bubbles:true}));
+      return this.read(el);
+    } catch (e) { return 'err:' + e; }
+  },
+  /* What Enter does to a field.
+     Not a "Go" button: the same thing the key does in a browser. In a form
+     that is submit, run through requestSubmit so the page's own submit
+     handler AND its validation both happen - el.form.submit() would skip
+     validation and never fires onsubmit. With no form there is nothing to
+     submit, so the key is dispatched for real and then focus moves to the
+     next field, which is what a lone box does. */
+  enter: function() {
+    var el = null;
+    try { el = this._field ? document.getElementById(this._field) : null; } catch (x) {}
+    if (!el) return 'gone';
+    try { el.focus({preventScroll:true}); } catch (x) {}
+    try {
+      if (el.form && typeof el.form.requestSubmit === 'function') {
+        el.form.requestSubmit(); return 'submit';
+      }
+      if (el.form && typeof el.form.submit === 'function') {
+        el.form.submit(); return 'submit';
+      }
+    } catch (x) {}
+    try {
+      var o = {bubbles:true, cancelable:true, key:'Enter', code:'Enter',
+               keyCode:13, which:13, charCode:13};
+      ['keydown','keypress','keyup'].forEach(function(t){
+        try { el.dispatchEvent(new KeyboardEvent(t, o)); } catch (e) {}
+      });
+    } catch (x) {}
+    try {
+      var all = document.querySelectorAll('input,textarea,[contenteditable]');
+      var seen = false;
+      for (var i = 0; i < all.length; i++) {
+        var f = all[i];
+        if (!this.editable(f)) continue;
+        var r = f.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) continue;
+        if (f === el) { seen = true; continue; }
+        if (seen) {
+          try { f.focus({preventScroll:true}); } catch (e) {}
+          this._field = this.tag(f);
+          return 'next';
+        }
+      }
+    } catch (x) {}
+    return 'enter';
+  },
+  /* The field under the point, without taking it: the renderer uses this to
+     draw a caret or a hint before anything is committed. */
+  peek: function(x, y) {
+    try {
+      var el = document.elementFromPoint(x, y);
+      for (var i = 0; el && i < 4 && !this.editable(el); i++) el = el.parentElement;
+      return this.editable(el) ? 1 : 0;
+    } catch (e) { return 0; }
+  },
   click: function(x,y){ try {
+      // A text field is EDITED, not activated. Clicking one can submit the
+      // form it sits in, and a dwell on a search box means "type here", not
+      // "press the button next to it". So take the field, never click it, and
+      // say so in the return value - the caller opens the keyboard instead of
+      // navigating.
+      var f = this.at(x,y);
+      if (f) return JSON.stringify(f);
       var el=document.elementFromPoint(x,y);
       for (var i=0; el && i<6 && !clickable(el); i++) el=el.parentElement;
       if (!el) return 'none';
@@ -1721,7 +1922,9 @@ window.__limpet = {
         sh = Math.max(se?se.scrollHeight:0, b?b.scrollHeight:0, b?b.offsetHeight:0);
         ch = window.innerHeight; st = window.scrollY;
       }
-      return JSON.stringify({sh:sh, ch:ch, st:st, inner: !!e,
+      var fid = '';
+      try { if (this._field && document.getElementById(this._field)) fid = this._field; } catch (x) {}
+      return JSON.stringify({sh:sh, ch:ch, st:st, inner: !!e, fid:fid,
                              url:location.href, t:document.title}); } catch (e) { return '{}'; } }
 };
 function e_connected(e) {
@@ -2225,6 +2428,131 @@ try {
 
     private fun jsNum(v: Float) = String.format(java.util.Locale.US, "%.1f", v)
 
+    /** A quoted, escaped JS string literal. Text being typed into the page can
+     *  contain anything at all - quotes, backslashes, newlines, "</script>" -
+     *  and it is spliced into a script, so it cannot go in raw. */
+    private fun jsStr(v: String): String {
+        val b = StringBuilder("\"")
+        for (ch in v) when {
+            ch == '\\' -> b.append("\\\\")
+            ch == '"' -> b.append("\\\"")
+            ch == '\n' -> b.append("\\n")
+            ch == '\r' -> b.append("\\r")
+            ch == '\t' -> b.append("\\t")
+            ch.code < 0x20 -> b.append(String.format(java.util.Locale.US, "\\u%04x", ch.code))
+            else -> b.append(ch)
+        }
+        return b.append('"').toString()
+    }
+
+    /** Last value pushed into a page field, and when. */
+    private var fieldLiveAt = 0L
+    private var fieldLiveText: String? = null
+    private val fieldLive = Handler(Looper.getMainLooper())
+    private var fieldLiveRun: Runnable? = null
+
+    /**
+     * Push what has been typed into the page field as it is typed, not only
+     * when the keyboard closes.
+     *
+     * Otherwise the field the user is looking at stays empty for the whole
+     * edit and fills in only at the end, which makes every keystroke
+     * unverifiable - you cannot tell whether a character registered. The
+     * feedback is the point of showing the field at all.
+     *
+     * Throttled: this is a cross-process call into the page on every
+     * keystroke, and a page that re-renders on each input event is slow
+     * enough to be felt. 120ms is under the threshold where typing looks
+     * immediate and well under one dwell.
+     */
+    private fun liveFieldWrite(txt: String) {
+        val now = System.currentTimeMillis()
+        fieldLiveText = txt
+        val since = now - fieldLiveAt
+        // Always cancel a pending push first: what is queued is now stale, and
+        // the point is to push the LATEST value, not every one of them.
+        fieldLiveRun?.let { fieldLive.removeCallbacks(it) }
+        fieldLiveRun = null
+        if (since >= FIELD_LIVE_MS) {
+            fieldLiveAt = now
+            pushField(txt)
+            return
+        }
+        // DEFER, do not drop. Dropping the value meant the field only ever saw
+        // the first keystroke - or none of them - because onKeyboardText only
+        // fires on a CHANGE and nothing retried afterwards. Typing faster than
+        // the throttle interval therefore discarded everything typed, and the
+        // box sat empty for the whole edit.
+        val r = Runnable {
+            fieldLiveRun = null
+            fieldLiveAt = System.currentTimeMillis()
+            fieldLiveText?.let { pushField(it) }
+        }
+        fieldLiveRun = r
+        fieldLive.postDelayed(r, FIELD_LIVE_MS - since)
+    }
+
+    /** Let the page handle Enter for the field it is holding. */
+    private fun pressEnter() {
+        val wv = webView ?: return
+        wv.post {
+            wv.evaluateJavascript("window.__limpet?__limpet.enter():'noshim'") { r ->
+                FileLog.i("SweepVR-web", "field enter -> ${r?.take(40)}")
+                webVersion++
+            }
+        }
+    }
+
+    /** Write a value into the field the page is holding for us. */
+    private fun pushField(txt: String) {
+        val wv = webView ?: return
+        // Onto the WebView's own thread, ALWAYS - not merely when this happens
+        // to be called from the main thread already.
+        //
+        // This is reached from the keyboard's `changed` callback, which the
+        // renderer fires on the GL thread, and evaluateJavascript threw there:
+        // "A WebView method was called on thread 'GLThread'". The exception
+        // propagated out of KeyboardControl.type() and out of stepKeyboard, so
+        // the statement AFTER type() - charClaim = null - never ran. The
+        // character claim survived into the next frame and resolved again:
+        // every character typed TWICE and never three times, because the second
+        // pass landed inside the throttle window, did not throw, and finally
+        // cleared the claim.
+        //
+        // Same violation as loadUrl, fixed there and then written again here.
+        // Every WebView call reachable from the renderer goes on the main
+        // thread, unconditionally.
+        wv.post {
+            wv.evaluateJavascript("window.__limpet?__limpet.write(${jsStr(txt)}):'noshim'") { r ->
+            // Writing .value does not touch the DOM, so the page's
+            // MutationObserver never fires and the capture is not invalidated
+            // - the page in front of you would keep showing the pre-edit text
+            // until something else changed.
+            webVersion++
+            // BOTH what was sent and what the field reads back afterwards.
+            // One 'l' arriving as 'll' has two possible sources - the keyboard
+            // sending 'll', or the page turning 'l' into 'll' - and they are
+            // indistinguishable unless both ends are written down.
+                FileLog.i("SweepVR-web",
+                    "field live sent='" + txt.take(40) + "' got='" +
+                        (r ?: "null").take(40) + "'")
+            }
+        }
+    }
+
+    /** Undo the JSON encoding evaluateJavascript applies to its whole result.
+     *  Only ONCE: the payload inside is already raw text, so running it
+     *  through the parser twice mangles anything with quotes or colons in it,
+     *  which is most URLs. */
+    private fun jsUnwrap(res: String?): String? {
+        if (res == null) return null
+        return try {
+            (org.json.JSONTokener(res).nextValue() as? String) ?: res
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     /** Throttled: geometry for the scrollbar thumb + the current title. */
     /** Scroll the page one page-key, for BOTH the PgUp/PgDn buttons and the
      *  scrollbar arrows - they are the same gesture and must behave the same.
@@ -2329,7 +2657,45 @@ try {
                 // A click navigates: re-arm so the next page's links work.
                 renderer.webResetDwell()
                 wv.evaluateJavascript("window.__limpet?__limpet.click(${jsNum(e.px / webDpr)},${jsNum(e.py / webDpr)}):'noshim'") { r ->
-                    FileLog.i("SweepVR-web", "click at ${e.px.toInt()},${e.py.toInt()} -> $r")
+                    val res = r ?: return@evaluateJavascript
+                    // __limpet.click() reports `field:<id>:<value>` and has
+                    // deliberately NOT clicked anything when it does: a dwell
+                    // on a text box means "type here", and clicking one can
+                    // submit the form it sits in. So this opens the keyboard
+                    // against that field instead of activating it.
+                    val un = jsUnwrap(res)
+                    // JSON, not a delimiter-joined string: a field's value is
+                    // arbitrary text and a URL is full of colons, so any
+                    // separator scheme is ambiguous for exactly the content
+                    // that matters most.
+                    if (un != null && un.startsWith("{")) {
+                        try {
+                            val o = org.json.JSONObject(un)
+                            if (o.has("r")) {
+                                val r = o.getJSONArray("r")
+                                val vw = o.getDouble("vw")
+                                val vh = o.getDouble("vh")
+                                // Client coords -> page UV. v runs the other
+                                // way: page UV v=1 is the TOP.
+                                val cu = ((r.getDouble(0) + r.getDouble(2) * 0.5) / vw).toFloat()
+                                val cv = (1.0 - (r.getDouble(1) + r.getDouble(3)) / vh).toFloat()
+                                // The BOTTOM of the rectangle: placeKeyboard
+                                // drops the keyboard by half its own height
+                                // from the anchor, which lands it just below.
+                                renderer.setKeyboardAnchor(cu, cv)
+                                val v = o.optString("val", "")
+                                FileLog.i("SweepVR-web",
+                                    "field dwell -> keyboard at u=$cu v=$cv, " +
+                                    "${v.length} chars")
+                                renderer.openKeyboard(v,
+                                    VrRenderer.KeyboardTarget.PAGE_FIELD)
+                                return@evaluateJavascript
+                            }
+                        } catch (_: Exception) {
+                            FileLog.i("SweepVR-web", "field parse failed: $un")
+                        }
+                    }
+                    FileLog.i("SweepVR-web", "click at ${e.px.toInt()},${e.py.toInt()} -> $res")
                 }
             }
             is VrRenderer.WebEvent.Scroll -> webPageScroll(e.dir)

@@ -408,6 +408,11 @@ private fun side(right: Boolean, zone: Rect, slot: Int): Rect {
         }
 
         fun reset() { engine.reset(); armed = false; coolMs = Long.MAX_VALUE }
+
+        /** Refuse to arm for STANDOFF_MS, without forgetting where the gaze
+         *  is. Used after a character resolves, so jitter cannot walk the
+         *  gaze back into the same key and type it again. */
+        fun cooldown() { coolMs = 0L }
         fun prime(at: Pt) { engine.prime(at) }
     }
 
@@ -636,7 +641,28 @@ private fun side(right: Boolean, zone: Rect, slot: Int): Rect {
                 } else {
                     onTrace?.invoke("row traverse cancelled")
                 }
-                for (k in charKeys[activeRow]) k.reset()
+                // PRIME the row at where the gaze actually is, rather than
+                // only resetting it.
+                //
+                // reset() throws away the engine's history, and the gaze is
+                // OUTSIDE the band at this instant - that is the only reason
+                // this resolve happened. So the next frame every engine sees
+                // its first-ever sample, sitting outside its own rect, reads
+                // that as an entry, finds the gaze still outside the band,
+                // and resolves the very same character again. One press, two
+                // characters, a frame or two apart. Seeding them with the
+                // current point means a new character cannot arm until the
+                // gaze genuinely comes back and crosses into it.
+                val wasVertical = at.y <= band.top || at.y >= band.bottom
+                for (k in charKeys[activeRow]) {
+                    k.reset()
+                    k.prime(at)
+                    // ...and a short refusal on top, because head jitter can
+                    // carry the gaze back out of the band and in again within
+                    // a frame or two of the resolve. Without this, a sweep
+                    // that merely grazes the edge can type twice.
+                    if (wasVertical && allow) k.cooldown()
+                }
                 charClaim = null
             }
         }

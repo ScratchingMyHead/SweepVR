@@ -658,7 +658,13 @@ class VrRenderer(
         if (useWeb) {
             // v = TB_V0 is the toolbar's LOWER edge: the boundary the keyboard
             // hangs from.
-            webPointAt(0.5f, TB_V0, kbPoint)
+            // The address bar keeps its own placement: the toolbar's lower
+            // edge, dead centre. Only a field sets the anchor, and TB_V0 is
+            // declared further down the file so it cannot be used to
+            // initialise a property up here.
+            val fieldEd = kbTarget == KeyboardTarget.PAGE_FIELD
+            webPointAt(if (fieldEd) kbAnchorU else 0.5f,
+                       if (fieldEd) kbAnchorV else TB_V0, kbPoint)
             val dTop = kotlin.math.sqrt(
                 (kbPoint[0] - invHeadWorldM[12]).let { it * it } +
                     (kbPoint[1] - invHeadWorldM[13]).let { it * it } +
@@ -670,8 +676,8 @@ class VrRenderer(
             // way round and labelled downward, which hung the keyboard ABOVE
             // the field it belongs to.
             val ty = FloatArray(3); val by = FloatArray(3)
-            webPointAt(0.5f, 1f, ty)
-            webPointAt(0.5f, 0f, by)
+            webPointAt(if (fieldEd) kbAnchorU else 0.5f, 1f, ty)
+            webPointAt(if (fieldEd) kbAnchorU else 0.5f, 0f, by)
             var dx = by[0] - ty[0]; var dy = by[1] - ty[1]; var dz = by[2] - ty[2]
             val dl = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
             if (dl > 1e-4f) { dx /= dl; dy /= dl; dz /= dl } else { dy = -1f; dz = 0f; dx = 0f }
@@ -2716,7 +2722,39 @@ void main(){
 
     /** Open the keyboard on [value], which the caller then shows live. */
 
-    fun openKeyboard(value: String) {
+    /**
+     * What the keyboard is editing. It changes what a commit MEANS, so it has
+     * to be part of opening the keyboard rather than something inferred later
+     * from whether the address bar happens to be showing: ENTER on an address
+     * navigates, ENTER on a page field writes the value back into the page,
+     * and those two share every key, every gesture and every line of
+     * rendering.
+     */
+    enum class KeyboardTarget { ADDRESS, PAGE_FIELD }
+
+    private var kbTarget = KeyboardTarget.ADDRESS
+
+    /** Where the keyboard hangs, in page UV. Defaults to the top centre,
+     *  which is right for the address bar and wrong for everything else: a
+     *  keyboard editing a field in the middle of the page appeared below the
+     *  address bar, nowhere near what it was editing. Set from the field's
+     *  own rectangle when one is being edited. */
+    private var kbAnchorU = 0.5f
+    private var kbAnchorV = 0f
+
+    /** Hang the keyboard under this point of the page. [v] is page UV, so
+     *  pass the BOTTOM of the field: placeKeyboard drops the keyboard by its
+     *  own half-height from here, which puts it just below. */
+    fun setKeyboardAnchor(u: Float, v: Float) {
+        kbAnchorU = u.coerceIn(0f, 1f)
+        kbAnchorV = v.coerceIn(0f, 1f)
+    }
+
+    /** True when the keyboard is editing a field inside the page. */
+    val keyboardIsField: Boolean get() = kbTarget == KeyboardTarget.PAGE_FIELD
+
+    fun openKeyboard(value: String, target: KeyboardTarget = KeyboardTarget.ADDRESS) {
+        kbTarget = target
         kbd.beginEdit(value)
         kbOpen = true
         onKeyboardOpened?.invoke()
