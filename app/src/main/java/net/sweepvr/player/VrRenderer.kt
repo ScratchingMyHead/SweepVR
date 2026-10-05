@@ -594,6 +594,21 @@ class VrRenderer(
     /** Gaze in the keyboard's own pixels while it owns the frame, else null. */
     private var kbHit: FloatArray? = null
 
+    // ---- hover labels ----------------------------------------------------
+    //
+    // A plain dwell on the key, with NO relation to the sweep rules: it fires
+    // whichever side you came from, including sides the key does not admit.
+    // That is the point. The entry dips only show the sides that work, so a
+    // key reached from any other angle looks completely inert, and naming it
+    // is the only way to find out what it is before trying the right edge.
+    private var kbTipKey: String? = null
+    private var kbTipAt = 0L
+    private var kbTipShown: String? = null
+
+    /** How long a key must be hovered before it is named. Long enough not to
+     *  flash on a sweep that merely crosses a key on its way somewhere else. */
+    private val KBD_TIP_DELAY = 480L
+
     /**
      * Angular half-height of the keyboard, as a fraction of its DISTANCE.
      *
@@ -2320,7 +2335,11 @@ void main(){
         // the drum slides, so this redraws the slide and the settled frame
         // after it.
         val rowTop = kbd.activeRowBand.top.toInt()
-        val key = "$row|$caps|$txt|$held|${w.width.toInt()}|$rowTop"
+        // The hover label belongs in the redraw key. Nothing else about it
+        // reaches the bitmap, so without this the tooltip is computed every
+        // frame and then never painted.
+        val tip = kbTipShown
+        val key = "$row|$caps|$txt|$held|${w.width.toInt()}|$rowTop|$tip"
         if (key == kbKey) return
         kbKey = key
 
@@ -2568,11 +2587,69 @@ void main(){
             }
         }
 
+        if (tip != null) {
+            // Placed on the drum side of the key: below it for the top bar,
+            // which has nothing above it but the edge of the keyboard, and
+            // above it for everything else.
+            val hk = kbd.hoveredKey()
+            if (hk != null) {
+                val r = hk.first
+                val tp = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
+                // The light border colour, matching the pill's own outline.
+                // It was the pill's fill - rgb(15,23,34) on rgb(15,23,34) -
+                // so the label was dark on dark and simply invisible.
+                tp.color = Color.argb(255, 126, 148, 176)
+                tp.textSize = 21f
+                tp.textAlign = Paint.Align.CENTER
+                val tw = tp.measureText(tip)
+                val below = r.top <= kbd.topBar.bottom
+                val cx = (r.left + r.right) * 0.5f
+                val cy = if (below) r.bottom + 19f else r.top - 19f
+                val halfW = tw * 0.5f + 9f
+                val pill = RectF(tx(cx - halfW), ty(cy - 14f),
+                    tx(cx + halfW), ty(cy + 14f))
+                p.style = Paint.Style.FILL
+                p.color = Color.argb(238, 15, 23, 34)
+                c.drawRoundRect(pill, 7f, 7f, p)
+                p.style = Paint.Style.STROKE
+                p.strokeWidth = 1.4f
+                p.color = Color.argb(255, 126, 148, 176)
+                c.drawRoundRect(pill, 7f, 7f, p)
+                p.style = Paint.Style.FILL
+                c.drawText(tip, tx(cx), ty(cy) - (tp.descent() + tp.ascent()) * 0.5f, tp)
+                p.strokeWidth = 1.9f
+            }
+        }
+
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, kbTexId)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
     }
 
-    /**
+        /**
+     * Name whichever non-character key the gaze is resting on, after a delay.
+     *
+     * Independent of every sweep rule on purpose - see kbTipKey. `gaze` is the
+     * keyboard-pixel reading, and null clears it, so a label cannot outlive
+     * the gaze leaving the keyboard.
+     */
+    private fun stepKeyTip(gaze: FloatArray?) {
+        val label = if (gaze == null) null else kbd.labelAt(gaze[0], gaze[1])
+        if (label == null) {
+            kbTipKey = null
+            kbTipShown = null
+            return
+        }
+        if (label != kbTipKey) {
+            kbTipKey = label
+            kbTipAt = now()
+            kbTipShown = null
+            return
+        }
+        if (kbTipShown == null && now() - kbTipAt >= KBD_TIP_DELAY)
+            kbTipShown = label
+    }
+
+/**
      * Gaze -> keyboard pixels, and whether it is over the keyboard.
      *
      * The keyboard is head-locked on the plane z = -panelDistM, dropped by
@@ -2653,7 +2730,10 @@ void main(){
         kbAlphaWant = kbOpen
         kbAlpha = if (kbAlphaWant) minOf(1f, kbAlpha + dtMs / KBD_FADE_MS)
                   else maxOf(0f, kbAlpha - dtMs / KBD_FADE_MS)
-        if (!kbOpen) { kbd.reset(); kbHit = null; return false }
+        if (!kbOpen) {
+            kbd.reset(); kbHit = null; kbTipKey = null; kbTipShown = null
+            return false
+        }
         if (kbTexId <= 0) return false
         val g = keyboardGaze()
         if (g == null) {
@@ -2675,6 +2755,7 @@ void main(){
         // so the line that exists to be read came out as literal `%.0f`
         // placeholders and was no use at all.
         kbHit = if (over) floatArrayOf(g[0], g[1]) else null
+        stepKeyTip(if (over) g else null)
         // The WHOLE surface claims, not just the bits with a key on them.
         // Requiring `owned` left the gaps live - between bar keys, the space
         // bar's blank margins, the margins either side of it - and a link

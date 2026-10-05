@@ -567,6 +567,75 @@ private fun side(right: Boolean, zone: Rect, slot: Int): Rect {
         DISMISS_TOP, DISMISS_BOTTOM, DELWORD_TOP, DELWORD_BOTTOM
     }
 
+    /**
+     * A spoken-word description of the NON-character key under a point, or null
+     * if there is none - including for the characters themselves, whose labels
+     * are the description and which would only be obscured by one.
+     *
+     * Deliberately the action's name rather than the key's printed label: a
+     * glyph needs naming, and the two abbreviations that are not obvious -
+     * "Sym2" and "Aa" - read as jargon on a key face.
+     */
+    fun labelAt(x: Float, y: Float): String? {
+        if (window.isEmpty) return null
+        val at = Pt(x, y)
+        for (i in barLabels.indices) {
+            if (barKeyRect(topBar, i, barLabels.size).contains(at))
+                return describe(barSequence[i].first)
+            if (barKeyRect(bottomBar, i, barLabels.size).contains(at))
+                return describe(barSequence[i].first)
+        }
+        if (enterTop.contains(at)) return "Enter"
+        if (enterBottom.contains(at)) return "Enter"
+        if (clearTop.contains(at)) return "Clear"
+        if (clearKey.contains(at)) return "Clear"
+        if (cancelTop.contains(at)) return "Close"
+        if (cancelBottom.contains(at)) return "Close"
+        if (delWordTop.contains(at)) return "Delete word"
+        if (delWordBottom.contains(at)) return "Delete word"
+        return null
+    }
+
+    /**
+     * The rect of the non-character key the reticle is on, with the name
+     * [labelAt] gave it, for placing a tooltip beside it. Null if none.
+     *
+     * Rect and name are returned TOGETHER and looked up by position rather
+     * than by matching the name back to a rect: these rects are computed
+     * properties that build a fresh instance on every access, so comparing one
+     * against a stored reference by equality never matches.
+     */
+    fun hoveredKey(): Pair<Rect, String>? {
+        if (window.isEmpty) return null
+        val at = Pt(lastX, lastY)
+        for (i in barLabels.indices) {
+            val n = describe(barSequence[i].first)
+            val t = barKeyRect(topBar, i, barLabels.size)
+            if (t.contains(at)) return t to n
+            val b = barKeyRect(bottomBar, i, barLabels.size)
+            if (b.contains(at)) return b to n
+        }
+        for (pair in listOf(
+            enterTop to "Enter", enterBottom to "Enter",
+            clearTop to "Clear", clearKey to "Clear",
+            cancelTop to "Close", cancelBottom to "Close",
+            delWordTop to "Delete word", delWordBottom to "Delete word")) {
+            if (pair.first.contains(at)) return pair
+        }
+        return null
+    }
+
+    private fun describe(a: Action): String = when (a) {
+        Action.ROW_123 -> "Numbers"
+        Action.ROW_ABC -> "Letters"
+        Action.ROW_SYM2 -> "Symbols"
+        // The live state, not the word: the whole point of the key is which of
+        // the three it is on right now.
+        Action.CAPS -> "Caps: " + capsLabel()
+        Action.BKSP -> "Backspace"
+        else -> a.name.lowercase()
+    }
+
     /** What the renderer should light up.
      *
      *  A fired key holds its label for [KBD_HOLD_MS] instead of for the one
