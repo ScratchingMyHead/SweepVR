@@ -95,6 +95,24 @@ class KeyboardControlTest {
         glide(k, x, r.bottom - edgeIn, x, r.top - 40f)
     }
 
+    /** Up through a side key, starting just clear of the live band.
+     *
+     *  The side keys sit IN the dead zones, close to the band, and the 40px
+     *  lead-in the other helpers use lands inside it - which armed a
+     *  character and typed it before the sweep ever reached the key. */
+    private fun upSide(k: KeyboardControl, r: Rect) {
+        val x = r.midX()
+        glide(k, x, r.bottom + 4f, x, r.bottom - edgeIn)
+        glide(k, x, r.bottom - edgeIn, x, r.top - 6f)
+    }
+
+    /** Down through a side key, starting just clear of the live band. */
+    private fun downSide(k: KeyboardControl, r: Rect) {
+        val x = r.midX()
+        glide(k, x, r.top - 4f, x, r.top + edgeIn)
+        glide(k, x, r.top + edgeIn, x, r.bottom + 6f)
+    }
+
     /** Straight down through a key whose entry side is its top. */
     private fun down(k: KeyboardControl, r: Rect) {
         val x = r.midX()
@@ -155,42 +173,99 @@ class KeyboardControlTest {
     }
 
     @Test
-    fun theTailOfASweepCannotFireAModifier() {
-        // The gesture that types a letter and the gesture that reaches a
-        // modifier row are ONE motion. Sweeping up through the letters does
-        // not stop at the letters: carry on and you cross the top bar,
-        // entering it from below, which is exactly the side it admits. The
-        // log showed `type 'T'` then the gaze at 125, 84, 52, 28 then
-        // `fire top 'abc'`.
+    fun onePressTurnsCapsBackOnAfterTheSingleCapIsSpent() {
+        // The exact dead-press: Aaa, type one character so it resets itself
+        // to aaa, then ONE sweep over Aa. It has to come back on first time.
+        // It used to need two, because cycleCaps swallowed the press instead
+        // of cycling - which looked like a timing fault and was not one.
         val k = kb()
-        val t = k.charRect(1, k.rowKeys(1).indexOf("T"))
-        val bar = k.barKeyRect(k.topBar, 1, k.barLabels.size)   // the top abc
-        // One continuous sweep: up through the letter, on through the bar.
-        glide(k, t.midX(), t.bottom + 40f, t.midX(), t.top + edgeIn)
-        glide(k, t.midX(), t.top + edgeIn, bar.midX(), t.top - 60f)
-        glide(k, bar.midX(), t.top - 60f, bar.midX(), k.topBar.top - 40f)
-        assertEquals("the letter typed", "t", k.text)
-        assertEquals("abc", k.activeRowName)   // already abc, so check the bar directly
+        up(k, k.barKeyRect(k.topBar, 3, k.barLabels.size))     // Aa
+        assertEquals("Aaa", k.capsLabel())
+        sweepUp(k, "A")
+        assertEquals("the single cap is spent, upper once", "A", k.text)
+        assertEquals("aaa", k.capsLabel())
+        up(k, k.barKeyRect(k.topBar, 3, k.barLabels.size))     // one press
+        assertEquals("Aaa after a single press", "Aaa", k.capsLabel())
     }
 
     @Test
-    fun aModifierIsStillReachableOnTheNextSweep() {
-        // The guard must deafen the modifiers, not disarm them: the sweep
-        // after the one that typed has to work.
+    fun aFiredBarKeyIsLitWhileTheGazeIsOnItAndBrieflyAfterwards() {
+        // The light follows the finger, not the clock: while the gaze is on
+        // the key the hold is topped up, and it lingers only briefly once the
+        // gaze has gone. 450ms of unconditional linger read as the keyboard
+        // running a timer rather than confirming the touch.
         val k = kb()
-        val t = k.charRect(1, k.rowKeys(1).indexOf("T"))
-        sweepUp(k, "T")
-        // Burn past the guard, then sweep the top bar deliberately.
-        repeat(40) { k.step(-100f, -100f, frame) }
-        up(k, k.barKeyRect(k.topBar, 0, k.barLabels.size))
+        val r = k.barKeyRect(k.topBar, 0, k.barLabels.size)     // 123
+        val x = r.midX()
+        var litDuringSweep = false
+        // Up through the key in small steps, watching the highlight as it goes.
+        glide(k, x, r.bottom + 40f, x, r.top - 40f)
+        for (i in 0..24) {
+            val y = r.bottom + 40f + (r.top - 80f - r.bottom) * i / 24f
+            k.step(x, y, frame)
+            if (k.isBarKeyHeld("123")) litDuringSweep = true
+        }
+        assertTrue("lit while the gaze is on it", litDuringSweep)
+        var after = 0
+        while (k.isBarKeyHeld("123")) { after++; k.step(-500f, -500f, frame) }
+        assertTrue("lingers a little, got $after frames", after <= 12)
+    }
+
+    @Test
+    fun theDrumSlidesOneNotchFromWhereItIs() {
+        val k = kb()
+        assertEquals("abc", k.activeRowName)
+        val centre = k.drum.top + k.drum.height * 0.5f
+        val abcBefore = k.rowRect(1).top
+        // Sampled on the fire frame itself. Measuring after the sweep returns
+        // reads the slide already decayed, which is how the old sign got past
+        // a casual look.
+        var abcAtFire = 0f
+        var incomingAtFire = 0f
+        k.onTrace = { if (it.startsWith("row 123")) {
+            abcAtFire = k.rowRect(1).top
+            incomingAtFire = k.rowRect(0).top
+        } }
+        up(k, k.barKeyRect(k.topBar, 0, k.barLabels.size))     // 123
         assertEquals("123", k.activeRowName)
+        val rowH = k.rowRect(0).height
+        // The outgoing row must still be on the centre line as the switch
+        // happens. The other sign leaves it 2*rowH clear of it, which is the
+        // drum appearing to reset to an end and rotate the long way round.
+        assertEquals("outgoing row stays on the centre line",
+            abcBefore, abcAtFire, 0.6f)
+        // The incoming row starts exactly one notch away, on the side it came
+        // from. 123 is the top row, so making it live slides it DOWN into the
+        // middle slot, and abc drops out through the bottom.
+        assertEquals("incoming row starts one notch above",
+            centre - rowH, incomingAtFire + rowH / 2f, 0.6f)
+        // Then it settles onto the centre line.
+        repeat(60) { k.step(-500f, -500f, frame) }
+        assertEquals("incoming row settles centred",
+            centre, k.rowRect(0).top + rowH / 2f, 0.6f)
     }
 
     @Test
-    fun spaceIsAKeyLikeAnyOther() {
+    fun theDismissXCommits() {
+        val k = kb("hello")
+        var cancelled = false
+        k.cancelled = { cancelled = true }
+        // Down through the letters into the X, which now sits on its top face.
+        downSide(k, k.cancelBottom)
+        assertTrue("X should commit", cancelled)
+        assertEquals("edit abandoned, text restored", "hello", k.text)
+    }
+
+    @Test
+    fun theGapsBetweenKeysStillClaimTheFrame() {
+        // A dwell must not reach the page through the blank margins beside
+        // the space bar, where there is no key to own the frame.
         val k = kb()
-        sweepUp(k, " ")
-        assertEquals(" ", k.text)
+        val band = k.activeRowBand
+        val x = k.charRect(1, 20).right + 4f          // just past the last letter
+        var claimed = false
+        for (i in 0..20) claimed = claimed || k.step(x, band.midY(), frame)
+        assertTrue("gap between keys must still claim", claimed)
     }
 
     @Test
@@ -411,26 +486,14 @@ class KeyboardControlTest {
     // --------------------------------------------------------- edge keys
 
     @Test
-    fun enterCommitsOutwardsFromTheCentre() {
+    fun enterCommitsOutOfTheCentre() {
         var out: String? = null
         val k = kb()
         k.committed = { out = it }
         sweepUp(k, "A")
-        left(k, k.enterKey)
+        // ENTER fires on contact from the edge facing the band, like the bars.
+        upSide(k, k.enterTop)
         assertEquals("a", out)
-    }
-
-    @Test
-    fun enterLeavingUpOrDownCancels() {
-        var out: String? = null
-        val k = kb()
-        k.committed = { out = it }
-        val e = k.enterKey
-        // In through the inner edge, then leave by its END rather than its far
-        // side: that is a cancel, not a commit.
-        glide(k, e.right + 40f, e.midY(), e.right - edgeIn, e.midY())
-        glide(k, e.right - edgeIn, e.midY(), e.midX(), e.bottom + 60f)
-        assertNull("its ends are inert", out)
     }
 
     @Test
@@ -438,29 +501,134 @@ class KeyboardControlTest {
         var out: String? = null
         val k = kb()
         k.committed = { out = it }
-        right(k, k.enterKey)
+        right(k, k.enterTop)
         assertNull("ENTER is entered inwards, from the centre", out)
     }
 
     @Test
     fun delWordRemovesAWholeWord() {
         val k = kb("hello wor")
-        right(k, k.delWordKey)
+        downSide(k, k.delWordBottom)
         assertEquals("hello ", k.text)
     }
 
     @Test
-    fun cancelFiresFromBelowAndIsOnBothEdges() {
+    fun everySideButtonExistsInBothDeadZones() {
+        // The band splits the columns in two and cannot be crossed without
+        // typing, so a button in only one dead zone is unreachable from the
+        // other side. ENTER was bottom-only until it was duplicated; CLEAR
+        // would have had the same fault.
+        val k = kb("hello world")
+        val band = k.activeRowBand
+        val top = listOf(k.enterTop, k.clearTop, k.cancelTop, k.delWordTop)
+        val bot = listOf(k.enterBottom, k.clearKey, k.cancelBottom, k.delWordBottom)
+        (top + bot).forEach { r ->
+            assertTrue("clear of the live band: $r",
+                r.bottom <= band.top + 0.5f || r.top >= band.bottom - 0.5f)
+        }
+        listOf(top, bot).forEach { zs ->
+            assertEquals("four keys down this side", 4, zs.size)
+        }
+        // Right side: enter + clear. Left side: dismiss + delete word.
+        listOf(k.enterTop, k.enterBottom, k.clearTop, k.clearKey).forEach {
+            assertTrue("on the right: $it", it.left >= k.window.right - k.cancelTop.width - 0.5f)
+        }
+        listOf(k.cancelTop, k.cancelBottom, k.delWordTop, k.delWordBottom).forEach {
+            assertTrue("on the left: $it", it.left <= k.window.left + 0.5f)
+        }
+        // And both CLRs really clear.
+        val k2 = kb("hello world")
+        upSide(k2, k2.clearTop); assertEquals("top CLR clears", "", k2.text)
+        val k3 = kb("hello world")
+        downSide(k3, k3.clearKey); assertEquals("bottom CLR clears", "", k3.text)
+    }
+
+    @Test
+    fun thereIsOneDismissTopAndBottomBothOnTheLeft() {
+        val k = kb("http://old")
+        val band = k.activeRowBand
+        listOf(k.cancelTop, k.cancelBottom).forEach { r ->
+            assertTrue("on the left: $r", r.left <= k.window.left + 0.5f)
+            assertTrue("clear of the live band: $r",
+                r.bottom <= band.top + 0.5f || r.top >= band.bottom - 0.5f)
+        }
+        assertTrue("upper is in the top dead zone", k.cancelTop.bottom <= band.top + 0.5f)
+        assertTrue("lower is in the bottom dead zone", k.cancelBottom.top >= band.bottom - 0.5f)
+        // Nothing on the right may be mistaken for a dismiss. CLR used to
+        // fall through iconKey's `else`, which draws an X, so the clear
+        // button rendered as a second dismiss.
+        var fired = false
+        k.cancelled = { fired = true }
+        upSide(k, k.cancelTop)
+        assertTrue("upper dismiss works", fired)
+    }
+
+    @Test
+    fun deleteWordIsInBothDeadZonesOnTheLeft() {
+        val k = kb("hello wor")
+        val band = k.activeRowBand
+        listOf(k.delWordTop, k.delWordBottom).forEach { r ->
+            assertTrue("on the left: $r", r.left <= k.window.left + 0.5f)
+            assertTrue("clear of the live band: $r",
+                r.bottom <= band.top + 0.5f || r.top >= band.bottom - 0.5f)
+        }
+        // The upper one is reachable from under the band, the lower from over.
+        assertTrue("upper is in the top dead zone", k.delWordTop.bottom <= band.top + 0.5f)
+        assertTrue("lower is in the bottom dead zone", k.delWordBottom.bottom >= band.bottom - 0.5f)
+        // ...and both actually work.
+        var k2 = kb("hello wor")
+        upSide(k2, k2.delWordTop)
+        assertEquals("upper deletes", "hello ", k2.text)
+        k2 = kb("hello wor")
+        downSide(k2, k2.delWordBottom)
+        assertEquals("lower deletes", "hello ", k2.text)
+    }
+
+    @Test
+    fun theSideKeysDoNotCloseInOnTheLiveBand() {
+        // A downward sweep through a character must be able to continue
+        // through the bottom dead zone without meeting anything, and ENTER
+        // must be reachable from below the band.
+        val k = kb()
+        val band = k.activeRowBand
+        listOf(k.enterTop, k.enterBottom, k.clearKey, k.cancelLeft, k.delWordKey)
+            .forEach { r ->
+                assertTrue("no side key overlaps the live band: $r",
+                    r.bottom <= band.top + 0.5f || r.top >= band.bottom - 0.5f)
+            }
+        // Each side key is shorter than its dead zone, so the middle of the
+        // zone can be aimed at and the key missed entirely.
+        assertTrue("shorter than the top dead zone",
+            k.enterTop.height < k.topDead.height)
+        assertTrue("shorter than the bottom dead zone",
+            k.enterBottom.height < k.bottomDead.height)
+        assertTrue("clear sits below the lower enter",
+            k.clearKey.top >= k.enterBottom.bottom)
+        assertTrue("dismiss is on the left",
+            k.cancelLeft.left <= k.window.left + 0.5f)
+    }
+
+    @Test
+    fun enterBelowTheBandIsReachableFromUnderIt() {
+        var out: String? = null
+        val k = kb()
+        k.committed = { out = it }
+        sweepUp(k, "A")
+        // Straight down out of the band and into the lower ENTER.
+        val e = k.enterBottom
+        glide(k, e.midX(), e.top - 40f, e.midX(), e.top + 8f)
+        assertEquals("commits", "a", out)
+    }
+
+    @Test
+    fun dismissFiresAndRestoresTheOriginal() {
         var cancelled = false
         val k = kb("http://old")
         k.cancelled = { cancelled = true }
         sweepUp(k, "A")
         assertEquals("typed on top of the original", "http://olda", k.text)
-        up(k, k.cancelLeft)
-        assertTrue("the left X fires", cancelled)
-        cancelled = false
-        up(k, k.cancelRight)
-        assertTrue("the right X fires too", cancelled)
+        downSide(k, k.cancelBottom)
+        assertTrue("the X fires", cancelled)
         assertEquals("the original is kept to put back", "http://old", k.initialText)
     }
 

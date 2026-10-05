@@ -618,7 +618,6 @@ class VrRenderer(
     private val kbUp = FloatArray(3)
     private val kbNormal = FloatArray(3)
     private var kbPlaced = false
-    private var kbDiagT = 0L
     private var kbAliveT = 0L
 
     /**
@@ -2400,6 +2399,16 @@ void main(){
             p.color = if (live || arm) Color.WHITE else Color.argb(80, 200, 210, 225)
             val g = Path()
             when (kind) {
+                // CLR had no case and fell through to `else`, which draws an X.
+                // So the clear button on the right was rendered as a second
+                // dismiss, and the keyboard appeared to have an X over there.
+                "CLR" -> {
+                    val t = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
+                    t.color = if (live || arm) Color.WHITE else Color.argb(80, 200, 210, 225)
+                    t.textSize = h * 0.34f
+                    t.textAlign = Paint.Align.CENTER
+                    c.drawText("CLR", cx, cy - (t.descent() + t.ascent()) * 0.5f, t)
+                }
                 // Return: up the right side, then away to the left.
                 // Return: up the right side, then away to the left. Sized off
                 // the SHORTER axis, because the edge columns are narrow and
@@ -2483,7 +2492,14 @@ void main(){
             }
             val r0 = kbd.barKeyRect(kbd.topBar, i, barLabels.size)
             val r1 = kbd.barKeyRect(kbd.bottomBar, i, barLabels.size)
-            val arm = kbd.isBarKeyHeld(lbl)
+            // Highlight on the key's OWN label, not on `lbl`. `lbl` is what
+            // gets DRAWN, and for Aa that is the live caps state - aaa, Aaa or
+            // AAA - while the control reports the key as "Aa". Comparing the
+            // drawn text against the control's label meant Aa never matched
+            // and never lit, so it was the one bar key with no feedback on its
+            // one non-idempotent action. Every other key draws and tests the
+            // same string, which is why only this one looked broken.
+            val arm = kbd.isBarKeyHeld(barLabels[i])
             if (barLabels[i] == "BKSP") {
                 iconKey(r0, "DEL", true, arm)
                 iconKey(r1, "DEL", true, arm)
@@ -2492,30 +2508,35 @@ void main(){
                 key(r1, lbl, true, arm)
             }
         }
-        iconKey(kbd.enterKey, "ENT", true, held == "ENT")
-        iconKey(kbd.delWordKey, "DEL", true, held == "DEL")
+        iconKey(kbd.enterTop, "ENT", true, held == "ENT")
+        iconKey(kbd.enterBottom, "ENT", true, held == "ENT")
+        iconKey(kbd.clearTop, "CLR", true, held == "CLR")
+        iconKey(kbd.clearKey, "CLR", true, held == "CLR")
+        iconKey(kbd.cancelTop, "X", true, held == "X")
+        iconKey(kbd.cancelBottom, "X", true, held == "X")
+        iconKey(kbd.delWordTop, "DEL", true, held == "DEL")
+        iconKey(kbd.delWordBottom, "DEL", true, held == "DEL")
         iconKey(kbd.cancelLeft, "X", true, held == "X")
-        iconKey(kbd.cancelRight, "X", true, held == "X")
 
         for (r in 0..2) {
             val live = r == kbd.activeRowIndex
             val chars = kbd.rowKeys(r)
             for (i in chars.indices) {
+                // Upper case whenever caps is up at all - SINGLE as well as
+                // LOCK. It used to lower-case anything but LOCK, so Aaa drew
+                // the letters exactly as they would be typed after the first
+                // character, which is the one moment the row should be
+                // announcing that caps is engaged. TYPING resets SINGLE to
+                // LOWER, so the row drops back on its own after one
+                // character, which is the point of the middle mode.
                 val shown = if (live && chars[i].length == 1 && chars[i][0].isLetter() &&
-                    kbd.capsMode != net.sweepvr.player.sweep.KeyboardControl.CapsMode.LOCK)
-                    chars[i].lowercase() else chars[i]
+                    kbd.capsMode != net.sweepvr.player.sweep.KeyboardControl.CapsMode.LOWER)
+                    chars[i] else chars[i].lowercase()
                 if (chars[i] == " ") spaceKey(kbd.charRect(r, i), live, live && held == " ")
                 else key(kbd.charRect(r, i), shown, live,
                     live && i == kbd.heldCharIndex)
             }
         }
-
-        val t = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
-        t.color = Color.argb(225, 226, 232, 240)
-        t.textSize = 24f
-        t.textAlign = Paint.Align.LEFT
-        val shown = if (txt.length > 44) txt.takeLast(43) + "\u2026" else txt
-        c.drawText(shown, tx(kbd.bottomBar.left + 12f), ty(kbd.bottomBar.bottom) + 9f, t)
 
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, kbTexId)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
@@ -2592,7 +2613,14 @@ void main(){
             kbAliveT = now()
             FileLog.i("SweepVR-kbd", "tick open=$kbOpen placed=$kbPlaced alpha=$kbAlpha")
         }
-        kbAlphaWant = kbOpen || kbAlpha > 0.01f
+        // Just kbOpen. The `|| kbAlpha > 0.01f` was meant to soften the close,
+        // but it is self-sustaining: once closed with kbAlpha at 1 the term is
+        // true, so the next line clamps kbAlpha back to 1 and it can never
+        // reach the 0.01 that clears the condition. The keyboard was logically
+        // closed - kbOpen false, controls reset, page live again - while still
+        // drawn at full opacity, so it looked present but swallowed every
+        // gesture. Exactly "it thinks it's hidden but it's still showing".
+        kbAlphaWant = kbOpen
         kbAlpha = if (kbAlphaWant) minOf(1f, kbAlpha + dtMs / KBD_FADE_MS)
                   else maxOf(0f, kbAlpha - dtMs / KBD_FADE_MS)
         if (!kbOpen) { kbd.reset(); kbHit = null; return false }
@@ -2602,20 +2630,6 @@ void main(){
             // Worth saying out loud: a silent null here looks identical to a
             // keyboard that is present but unresponsive, which is precisely
             // the symptom that sent us looking in the wrong place.
-            if (now() - kbDiagT > 150L) {
-                kbDiagT = now()
-                // Built by concatenation, not String.format. Three of these
-                // diagnostics have now been lost to format-string mistakes
-                // (once `.format` binding tighter than `+`, twice to an
-                // IllegalFormatConversionException thrown INSIDE the logging
-                // call, which swallowed the very line that was meant to report
-                // it). A diagnostic that can throw is worse than no diagnostic.
-                val u = webGazeUv(lastEffFwd)
-                FileLog.i("SweepVR-kbd",
-                    "gazeNULL kb=" + f3(kbPoint) + " half=" + kbWorldHalfW + "," + kbWorldHalfH +
-                    " up=" + f3(kbUp) + " nrm=" + f3(kbNormal) + " fwd=" + f3(lastEffFwd) +
-                    " pageUV=" + uvStr(u))
-            }
             kbHit = null; kbd.reset(); return false
         }
         val over = g[2] > 0.5f
@@ -2630,41 +2644,14 @@ void main(){
         // formatted only the second half - `.format` binds tighter than `+` -
         // so the line that exists to be read came out as literal `%.0f`
         // placeholders and was no use at all.
-        if (now() - kbDiagT > 150L) {
-            kbDiagT = now()
-            val b = kbd.activeRowBand
-            val u = webGazeUv(lastEffFwd)
-            val pp = FloatArray(3)
-            if (u != null) webPointAt(u[0], u[1], pp)
-            // Two independent solves at the same instant. The app's own
-            // ray->page solve is the one every other control on the page uses
-            // and is known good, so agreeing or disagreeing with it settles
-            // whether my intersection or my DRAWING is wrong, without either
-            // being deduced.
-            val hx = invHeadWorldM[12] - kbPoint[0]
-            val hy = invHeadWorldM[13] - kbPoint[1]
-            val hz = invHeadWorldM[14] - kbPoint[2]
-            val nd = kbNormal[0] * lastEffFwd[0] + kbNormal[1] * lastEffFwd[1] +
-                kbNormal[2] * lastEffFwd[2]
-            val mine = FloatArray(3)
-            mine[0] = Float.NaN; mine[1] = Float.NaN; mine[2] = Float.NaN
-            if (nd < -1e-4f) {
-                val tt = (hx * kbNormal[0] + hy * kbNormal[1] + hz * kbNormal[2]) / -nd
-                mine[0] = invHeadWorldM[12] + lastEffFwd[0] * tt
-                mine[1] = invHeadWorldM[13] + lastEffFwd[1] * tt
-                mine[2] = invHeadWorldM[14] + lastEffFwd[2] * tt
-            }
-            FileLog.i("SweepVR-kbd",
-                "gaze " + g[0] + "," + g[1] + " over=" + over +
-                " band=" + b.left + "," + b.top + ".." + b.right + "," + b.bottom +
-                " held=" + kbd.heldLabel + " idx=" + kbd.heldCharIndex +
-                " rows=" + kbd.activeRowName +
-                " pageUV=" + uvStr(u) +
-                " mine=" + f3(mine) + " page=" + f3(pp) +
-                " kb=" + f3(kbPoint) + " half=" + kbWorldHalfW + "," + kbWorldHalfH)
-        }
         kbHit = if (over) floatArrayOf(g[0], g[1]) else null
-        return over && owned
+        // The WHOLE surface claims, not just the bits with a key on them.
+        // Requiring `owned` left the gaps live - between bar keys, the space
+        // bar's blank margins, the margins either side of it - and a link
+        // behind the keyboard could be dwelled through one of them. The
+        // keyboard is opaque artwork; nothing behind it is reachable.
+        if (over) return true
+        return owned
     }
 
     /** Sweep the address field to open the keyboard. True on the frame it
@@ -3601,14 +3588,6 @@ void main(){
     }
 
     private fun now() = System.currentTimeMillis()
-
-    /** "x,y,z" for a 3-vector, for log lines. Never throws. */
-    private fun f3(a: FloatArray): String =
-        a[0].toString() + "," + a[1].toString() + "," + a[2].toString()
-
-    /** "u,v" for the page solve, or "none". */
-    private fun uvStr(u: FloatArray?): String =
-        if (u == null) "none" else u[0].toString() + "," + u[1].toString()
 
     /** Angle between two head-forward vectors, degrees. */
     private fun angleDeg(a: FloatArray, b: FloatArray): Float {

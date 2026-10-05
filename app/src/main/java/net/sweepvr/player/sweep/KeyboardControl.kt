@@ -73,7 +73,7 @@ class KeyboardControl {
     enum class CapsMode { LOWER, SINGLE, LOCK }
 
     /** What a key does when it commits. */
-    private enum class Action { CHAR, ROW_123, ROW_ABC, ROW_SYM2, CAPS, BKSP, DELWORD, ENTER, CANCEL }
+    private enum class Action { CHAR, ROW_123, ROW_ABC, ROW_SYM2, CAPS, BKSP, DELWORD, ENTER, CANCEL, CLEAR }
 
     /**
      * One character key: what it types, and how wide it is relative to a
@@ -102,12 +102,10 @@ class KeyboardControl {
         initialText = value
         text = value
         capsMode = CapsMode.LOWER
-        typedSinceCapsChange = false
         activeRow = 1
         for (k in keys) k.reset()
         for (row in charKeys) for (k in row) k.reset()
         charClaim = null
-        guardMs = 0L
         tumble = 0f
         settleT = 0L
         changed?.invoke()
@@ -171,14 +169,67 @@ class KeyboardControl {
     val bottomBar: Rect get() = Rect(window.left, window.bottom - barH, window.right, window.bottom)
     val drum: Rect get() = Rect(window.left, topBar.bottom, window.right, bottomBar.top)
 
-    val enterKey: Rect get() =
-        Rect(window.left, drum.top, window.left + edgeW, drum.top + drum.height * 0.62f)
-    val delWordKey: Rect get() =
-        Rect(window.right - edgeW, drum.top, window.right, drum.top + drum.height * 0.62f)
-    val cancelLeft: Rect get() =
-        Rect(window.left, drum.top + drum.height * 0.62f, window.left + edgeW, drum.bottom)
-    val cancelRight: Rect get() =
-        Rect(window.right - edgeW, drum.top + drum.height * 0.62f, window.right, drum.bottom)
+    /**
+     * The two dead zones: the drum above and below the live band. With a 50px
+     * band in a 316px drum these are ~130px each, which is the room the side
+     * keys are laid out in.
+     *
+     * The side keys are SHORT and sit inside these zones rather than running
+     * the full drum height. At 0.62 of the drum they overlapped the live band,
+     * so they closed in on the sides and a downward sweep through a character
+     * ran straight into one - there was no way down through the text without
+     * meeting a key, and no way to reach ENTER from below the band at all.
+     * Short keys with gaps either side can be gone around.
+     */
+    val topDead: Rect get() = Rect(window.left, drum.top, window.right, bandTop())
+    val bottomDead: Rect get() = Rect(window.left, bandBottom(), window.right, drum.bottom)
+
+    /** The live band's edges with the drum SETTLED. The side keys are laid
+     *  out against these, not against the moving band: a layout that slid
+     *  with the tumble would drag the side keys about during every turn. */
+    private fun bandTop() = drum.top + drum.height * 0.5f - rowH * 0.5f
+    private fun bandBottom() = drum.top + drum.height * 0.5f + rowH * 0.5f
+
+    /** Height of a side key. Deliberately under half a dead zone, so two of
+     *  them stack inside one with padding to spare AND the middle of the zone
+     *  can still be aimed at to miss both. */
+    private val sideH get() = drum.height * 0.15f
+    private val sidePad get() = drum.height * 0.035f
+
+private fun side(right: Boolean, zone: Rect, slot: Int): Rect {
+        val x0 = if (right) window.right - edgeW else window.left
+        val top = zone.top + sidePad + slot * (sideH + sidePad)
+        return Rect(x0, top, x0 + edgeW, top + sideH)
+    }
+
+    /** Every side button exists in BOTH dead zones.
+     *
+     *  The band is between them and cannot be crossed without typing a
+     *  character, so a button present in only one of them is unreachable
+     *  from one side: ENTER was bottom-only until it was duplicated, and
+     *  CLEAR would have had the same fault. Symmetry is the whole point -
+     *  whichever way the gaze leaves the band, the same set of actions is
+     *  there waiting. */
+    /** ENTER, level with the top dead zone. */
+    val enterTop: Rect get() = side(true, topDead, 0)
+    /** CLEAR, in the top dead zone. */
+    val clearTop: Rect get() = side(true, topDead, 1)
+    /** ENTER, level with the bottom dead zone, reachable from under the band. */
+    val enterBottom: Rect get() = side(true, bottomDead, 0)
+    /** CLEAR, in the bottom dead zone. */
+    val clearKey: Rect get() = side(true, bottomDead, 1)
+    /** Delete word, in BOTH dead zones on the left. One at the top, one at
+     *  the bottom, so it is reachable from either side of the live band
+     *  without crossing it - the band is between them and cannot be skipped
+     *  without typing a character. */
+    val delWordTop: Rect get() = side(false, topDead, 1)
+    val delWordBottom: Rect get() = side(false, bottomDead, 1)
+    /** Dismiss in the top half, on the left. */
+    val cancelTop: Rect get() = side(false, topDead, 0)
+    /** Dismiss in the bottom half, also on the left. */
+    val cancelBottom: Rect get() = side(false, bottomDead, 0)
+    val cancelLeft: Rect get() = cancelBottom
+    val delWordKey: Rect get() = delWordBottom
 
     /** Where row [i] sits, given the current drum position.
      *
@@ -257,7 +308,6 @@ class KeyboardControl {
 
     private var tumble = 0f
     private var settleT = 0L
-    private var typedSinceCapsChange = false
 
     // ------------------------------------------------------------- keys
 
@@ -267,7 +317,10 @@ class KeyboardControl {
         val payload: String = "",
         val entry: Set<Side>,
         val commit: Set<Side>,
-        val cornerFraction: Float = 0.16f
+        val cornerFraction: Float = 0.16f,
+        /** Modifier bars fire on contact; the edge keys keep a full traverse
+         *  so ENTER can still cancel by leaving through the top or bottom. */
+        val fireOnContact: Boolean = false
     ) {
         var rect: Rect = Rect(0f, 0f, 0f, 0f)
         var armed: Boolean = false; private set
@@ -294,22 +347,57 @@ class KeyboardControl {
         fun step(at: Pt, dtMs: Long, allow: Boolean): Boolean {
             if (rect.isEmpty) { reset(); return false }
             if (coolMs < STANDOFF_MS) coolMs = minOf(STANDOFF_MS, coolMs + dtMs.coerceAtLeast(0L))
+            // The modifier bars fire on CONTACT, not on the way out.
+            //
+            // Requiring a full traverse to commit meant the gesture had to
+            // carry on past the key and out the far side, which is exactly
+            // what put the bar key underneath into the running: sweeping up
+            // toward the X committed the bottom-bar key before the X could
+            // finish, and `keys` steps the bars first, so the drum turned and
+            // the X lost its traverse. It also made every modifier a two-part
+            // gesture for no gain - you had to move right past the thing you
+            // had already touched. Entry through the nominated sides is still
+            // required and still has no leeway, so this is contact firing, not
+            // a looser rule.
+            //
+            // Only the bars. ENTER and DELWORD deliberately keep a full
+            // traverse, because ENTER is specified to CANCEL when it is left
+            // through the top or bottom, and firing the moment it is touched
+            // would delete that outright.
             return when (val ev = engine.step(at, rect, cfg())) {
                 is SweepEvent.Entered -> {
+                    if (fireOnContact) {
+                        val fire = allow && coolMs >= STANDOFF_MS
+                        if (fire) coolMs = 0L
+                        // NOT armed: it has already fired. Leaving armed=true
+                        // let the same sweep's exit fire it a second time,
+                        // which cycled caps twice per touch and deleted two
+                        // characters per stroke of BKSP.
+                        armed = false
+                        if (fire) {
+                            onTrace?.invoke("fire ${ev.side.name.lowercase()} '$label'")
+                            return true
+                        }
+                        engine.reset()
+                        return false
+                    }
                     if (!allow) { engine.reset(); armed = false }
                     else if (coolMs < STANDOFF_MS) { engine.reset(); armed = false }
                     else armed = true
-                    // Entering is not firing. A momentary's step() returns the
-                    // frame CLAIM here; this returns a COMMIT, and conflating
-                    // them types the character the moment the key is touched.
                     false
                 }
                 is SweepEvent.Engaged -> false
                 is SweepEvent.Released -> {
+                    // The traverse commit, for the keys that still have one.
+                    // Narrowing contact firing back to the bars restored the
+                    // Entered branch but this one was left reading
+                    // `{ armed = false; false }`, so ENTER, DELWORD and the X
+                    // armed and could never fire: they lit up blue and did
+                    // nothing. Which is the whole of what was reported.
                     val fire = armed && ev.side in commit
                     armed = false
-                    if (fire) coolMs = 0L
                     if (fire) {
+                        coolMs = 0L
                         onTrace?.invoke("fire ${ev.side.name.lowercase()} '$label'")
                         return true
                     }
@@ -340,23 +428,57 @@ class KeyboardControl {
     /** Bar labels, in bar order. */
     val barLabels: List<String> = barSequence.map { it.second }
 
+    /** Every bar key fires on contact, Aa and BKSP included.
+     *
+     *  They were briefly held back on the grounds that they are not
+     *  idempotent - Aa cycles, BKSP deletes - which is true, but the reason
+     *  they were actually broken was a separate bug: the contact branch left
+     *  `armed` true, so the same sweep's exit fired them a second time and
+     *  each touch cycled caps twice and deleted two characters. With that
+     *  fixed they behave like the row selectors.
+     *
+     *  The STANDOFF_MS cooldown is what guards the destructive ones, so a
+     *  brush across BKSP deletes one character rather than a handful.
+     *
+     *  ENTER and DELWORD keep the full traverse: ENTER is specified to cancel
+     *  when left through the top or bottom, and DELWORD is entered laterally.
+     *  Neither is a bar key. */
     private val topKeys = barSequence.map {
-        Key(it.second, it.first, entry = setOf(Side.Bottom), commit = setOf(Side.Top))
+        Key(it.second, it.first, entry = setOf(Side.Bottom), commit = setOf(Side.Top),
+            fireOnContact = true)
     }
     private val bottomKeys = barSequence.map {
-        Key(it.second, it.first, entry = setOf(Side.Top), commit = setOf(Side.Bottom))
+        Key(it.second, it.first, entry = setOf(Side.Top), commit = setOf(Side.Bottom),
+            fireOnContact = true)
     }
-    private val enterKeyCtl = Key("ENT", Action.ENTER,
-        entry = setOf(Side.Right), commit = setOf(Side.Left))
-    private val delWordCtl = Key("DEL", Action.DELWORD,
-        entry = setOf(Side.Left), commit = setOf(Side.Right))
-    private val cancelLeftCtl = Key("X", Action.CANCEL,
-        entry = setOf(Side.Bottom), commit = setOf(Side.Top))
-    private val cancelRightCtl = Key("X", Action.CANCEL,
-        entry = setOf(Side.Bottom), commit = setOf(Side.Top))
+    private val enterTopCtl = Key("ENT", Action.ENTER,
+        entry = setOf(Side.Bottom), commit = setOf(Side.Top), fireOnContact = true)
+    private val enterBottomCtl = Key("ENT", Action.ENTER,
+        entry = setOf(Side.Top), commit = setOf(Side.Bottom), fireOnContact = true)
+    private val clearTopCtl = Key("CLR", Action.CLEAR,
+        entry = setOf(Side.Bottom), commit = setOf(Side.Top), fireOnContact = true)
+    private val clearBottomCtl = Key("CLR", Action.CLEAR,
+        entry = setOf(Side.Top), commit = setOf(Side.Bottom), fireOnContact = true)
+    private val delWordTopCtl = Key("DEL", Action.DELWORD,
+        entry = setOf(Side.Bottom), commit = setOf(Side.Top), fireOnContact = true)
+    private val delWordBottomCtl = Key("DEL", Action.DELWORD,
+        entry = setOf(Side.Top), commit = setOf(Side.Bottom), fireOnContact = true)
+    // Entry through the TOP, not the bottom.
+    //
+    // The X rects end at drum.bottom, directly above the bottom bar, so an
+    // entry through their bottom edge can only begin in that bar - which now
+    // fires the instant it is touched, and turned the drum before the X could
+    // ever commit. That made the key unreachable rather than merely awkward:
+    // it would light up and never fire. Approaching down through the letters
+    // reaches its top face instead, which nothing else competes for.
+    private val cancelTopCtl = Key("X", Action.CANCEL,
+        entry = setOf(Side.Bottom), commit = setOf(Side.Top), fireOnContact = true)
+    private val cancelBottomCtl = Key("X", Action.CANCEL,
+        entry = setOf(Side.Top), commit = setOf(Side.Bottom), fireOnContact = true)
 
     private val keys: List<Key> = topKeys + bottomKeys +
-        listOf(enterKeyCtl, delWordCtl, cancelLeftCtl, cancelRightCtl)
+        listOf(enterTopCtl, enterBottomCtl, clearTopCtl, clearBottomCtl,
+            delWordTopCtl, delWordBottomCtl, cancelTopCtl, cancelBottomCtl)
 
     /** Every row's characters, built once. Only the live row is ever stepped;
      *  the others are here so the renderer can draw the inert rows from the
@@ -392,8 +514,25 @@ class KeyboardControl {
         private set
 
     /** The key currently held, for the owner to draw. Empty when none. */
-    var heldLabel: String = ""
-        private set
+    private var heldCharLabel: String = ""
+    private var heldKeyLabel: String = ""
+    private var heldKeyMs: Long = 0L
+    private var heldKeyAge: Long = 0L
+    private var heldKeyRect: Rect? = null
+
+    /** What the renderer should light up.
+     *
+     *  A fired key holds its label for [KBD_HOLD_MS] instead of for the one
+     *  frame it fired on. `heldLabel` was cleared at the top of every step, so
+     *  a bar key went blue for a single frame - about 14ms - which read as no
+     *  feedback at all. Aa appeared to flash only because firing it changes
+     *  its own label (aaa/Aaa/AAA), so the redraw landed while it was
+     *  highlighted; the row selectors redraw nothing and so were invisible.
+     *
+     *  A character still reports continuously while it is armed: that is a
+     *  sustained state, not an event. */
+    val heldLabel: String
+        get() = if (heldKeyMs > 0L) heldKeyLabel else heldCharLabel
 
     /**
      * Index into the active row of the character currently claimed, or -1.
@@ -412,31 +551,14 @@ class KeyboardControl {
         }
 
     /** True when the held key is the bar key carrying [label]. */
-    fun isBarKeyHeld(label: String): Boolean =
-        heldLabel == label || (heldLabel == "BKSP" && label == "BKSP")
+    /** Is the bar key called [label] the one currently lit? Matched on the
+     *  key's own name, which for the caps key is "Aa" however it is drawn. */
+    fun isBarKeyHeld(label: String): Boolean = heldLabel == label
 
     private var lastX = 0f
     private var lastY = 0f
 
-    /**
-     * Milliseconds left during which the NON-character keys refuse to arm.
-     *
-     * The gesture that types a letter and the gesture that reaches a modifier
-     * row are the same motion. Sweeping UP through the letters to type T does
-     * not stop at the letters: carry on and you cross the top bar, entering
-     * it from below, which is precisely the side it admits — so the tail of
-     * every sweep fired whatever sat up there. The log showed it exactly:
-     * `type 'T'`, then the gaze walking 125, 84, 52, 28, then
-     * `fire top 'abc'`.
-     *
-     * There is no geometric fix: any path from the letters out of the band
-     * passes through a bar whose entry side faces the band. So one sweep does
-     * one thing, and the modifiers wait for the next one.
-     *
-     * A countdown of frame time rather than a clock, so it is testable and so
-     * it is measured in the same units the rest of the gesture is.
-     */
-    private var guardMs = 0L
+
 
     /** Advance one frame. Returns true while the keyboard owns the gaze. */
     fun step(x: Float, y: Float, dtMs: Long, still: Boolean = true): Boolean {
@@ -457,12 +579,22 @@ class KeyboardControl {
         val allow = !tumbling
 
         var owned = false
-        heldLabel = ""
+        heldCharLabel = ""
+        val dt = dtMs.coerceAtLeast(0L)
+        heldKeyMs = maxOf(0L, heldKeyMs - dt)
+        heldKeyAge += dt
+        // A fixed hold is not long enough. The sweep that fires a bar key
+        // does not stop when the key fires: it carries on across it, so a
+        // 140ms hold was spent before the gaze had finished arriving and the
+        // key was dark again by the time the user looked at it. Top the hold
+        // up for as long as the gaze is still on the key, with a ceiling so a
+        // parked reticle does not leave it lit for ever.
+        if (heldKeyMs > 0L && heldKeyRect?.contains(at) == true &&
+            heldKeyAge < KBD_HOLD_MAX_MS) heldKeyMs = KBD_HOLD_MS
 
         // The live row's characters. First to arm takes the traverse; any
         // other that arms while the claim is held is discarded, which is what
         // stops a lateral drag spelling a word.
-        guardMs = maxOf(0L, guardMs - dtMs.coerceAtLeast(0L))
         val band = activeRowBand
         for (k in charKeys[activeRow]) {
             // Re-read charClaim EVERY key, not once before the loop: capturing
@@ -494,7 +626,7 @@ class KeyboardControl {
         // row is what the user aimed at, so the row decides.
         val claim = charClaim
         if (claim != null) {
-            heldLabel = claim.label
+            heldCharLabel = claim.label
             owned = true
             if (!band.contains(at)) {
                 val vertical = at.y <= band.top || at.y >= band.bottom
@@ -509,11 +641,15 @@ class KeyboardControl {
             }
         }
 
-        // Guarded: see guardMs.
-        val keyOk = allow && guardMs <= 0L
         for (k in keys) {
-            val fired = k.step(at, dtMs, keyOk)
-            if (fired) { run(k.action); heldLabel = k.label }
+            val fired = k.step(at, dtMs, allow)
+            if (fired) {
+                run(k.action)
+                heldKeyLabel = k.label
+                heldKeyMs = KBD_HOLD_MS
+                heldKeyAge = 0L
+                heldKeyRect = k.rect
+            }
             if (k.armed || k.rect.contains(at) || fired) owned = true
         }
         if (band.contains(at)) owned = true
@@ -526,7 +662,6 @@ class KeyboardControl {
     private fun type(c: String) {
         if (c.isEmpty()) return
         text += alpha(c)
-        guardMs = CHAR_GUARD_MS
         changed?.invoke()
     }
 
@@ -544,7 +679,12 @@ class KeyboardControl {
                 changed?.invoke()
             }
             Action.ENTER -> committed?.invoke(text)
-            Action.CANCEL -> cancelled?.invoke()
+            // Restore here rather than leaving it entirely to the owner. The
+            // viewer's close handler does put the text back, but a control
+            // whose own state survives its own CANCEL is not testable, and
+            // the two could drift apart.
+            Action.CANCEL -> { text = initialText; cancelled?.invoke() }
+            Action.CLEAR -> { text = ""; changed?.invoke() }
             Action.CHAR -> Unit
         }
     }
@@ -554,7 +694,6 @@ class KeyboardControl {
     private fun alpha(base: String): String {
         if (base.length != 1) return base
         if (!base[0].isLetter()) return base
-        typedSinceCapsChange = true
         return when (capsMode) {
             CapsMode.LOCK -> base.uppercase()
             CapsMode.SINGLE -> { capsMode = CapsMode.LOWER; base.uppercase() }
@@ -563,12 +702,19 @@ class KeyboardControl {
     }
 
     private fun cycleCaps() {
-        capsMode = if (typedSinceCapsChange) CapsMode.LOWER else when (capsMode) {
+        // Always cycle. This used to short-circuit to LOWER when a character
+        // had been typed since the last caps change, on the theory that the
+        // first press should just tidy up. But alpha() has ALREADY reset
+        // SINGLE to LOWER as it spends the single cap, so the branch assigned
+        // the mode it was already in and did nothing visible while clearing
+        // the flag. The press was swallowed: after Aaa reset itself by typing,
+        // the first sweep over Aa appeared dead and the second one turned it
+        // on. Nothing about this was to do with timing.
+        capsMode = when (capsMode) {
             CapsMode.LOWER -> CapsMode.SINGLE
             CapsMode.SINGLE -> CapsMode.LOCK
             CapsMode.LOCK -> CapsMode.LOWER
         }
-        typedSinceCapsChange = false
         onTrace?.invoke("caps ${capsMode.name.lowercase()}")
         changed?.invoke()
     }
@@ -577,7 +723,16 @@ class KeyboardControl {
         if (i == activeRow) return
         // Start the slide from where the drum already is, so the row the user
         // was looking at does not jump on the frame the button fires.
-        tumble = (activeRow - i) * rowH
+        //
+        // Sign matters. Assigning activeRow = i has ALREADY re-centred row i,
+        // because rowY is measured from activeRow. So tumble only has to
+        // account for where row `activeRow` USED to sit, and it does that by
+        // putting the outgoing row back on the centre line on the first
+        // frame: (A - i)*rowH + tumble == 0, hence tumble = (i - A)*rowH.
+        // The other sign leaves the outgoing row at 2*(A-i)*rowH - clear
+        // across the drum - which is the slide that looked like it was
+        // scrolling the wrong way before settling in the right place.
+        tumble = (i - activeRow) * rowH
         settleT = 0L
         activeRow = i
         charClaim = null
@@ -588,6 +743,16 @@ class KeyboardControl {
         for (k in charKeys[i]) k.prime(at)
         for (k in topKeys) k.prime(at)
         for (k in bottomKeys) k.prime(at)
+        // The edge keys too. They are in `keys`, so they are stepped every
+        // frame, but nothing ever seeded their engines on a row change and
+        // their history was left over from before the previous switch.
+        // Only the ones NOT mid-gesture. Seeding an engine that has already
+        // entered rewrites its reference point mid-traverse, so the exit it
+        // was about to see never arrives - the X would light up and then
+        // silently fail to commit, which is precisely how it presented.
+        for (k in listOf(enterTopCtl, enterBottomCtl, clearTopCtl, clearBottomCtl,
+            delWordTopCtl, delWordBottomCtl, cancelTopCtl, cancelBottomCtl))
+            if (!k.armed) k.prime(at)
         onTrace?.invoke("row ${ROW_NAMES[i]}")
         changed?.invoke()
     }
@@ -599,10 +764,14 @@ class KeyboardControl {
         val n = barLabels.size
         for (i in topKeys.indices) topKeys[i].rect = barKeyRect(topBar, i, n)
         for (i in bottomKeys.indices) bottomKeys[i].rect = barKeyRect(bottomBar, i, n)
-        enterKeyCtl.rect = enterKey
-        delWordCtl.rect = delWordKey
-        cancelLeftCtl.rect = cancelLeft
-        cancelRightCtl.rect = cancelRight
+        enterTopCtl.rect = enterTop
+        enterBottomCtl.rect = enterBottom
+        clearTopCtl.rect = clearTop
+        clearBottomCtl.rect = clearKey
+        delWordTopCtl.rect = delWordTop
+        delWordBottomCtl.rect = delWordBottom
+        cancelTopCtl.rect = cancelTop
+        cancelBottomCtl.rect = cancelBottom
         for (r in charKeys.indices)
             for (i in charKeys[r].indices)
                 charKeys[r][i].rect = charRect(r, i)
@@ -631,10 +800,20 @@ class KeyboardControl {
          *  because it left no effect to duplicate. */
         const val STANDOFF_MS = 220L
 
-        /** How long after a character the modifiers are deaf. Long enough to
-         *  cover the tail of the sweep that typed it, short enough that the
-         *  next deliberate sweep is not refused. */
-        const val CHAR_GUARD_MS = 340L
+        /** How long a fired key stays lit.
+         *
+         *  This has to outlast the REST of the sweep, not just be perceptible.
+         *  The keys fire on contact, but the gaze does not stop on contact: it
+         *  carries on outwards across the key and off it, taking a couple of
+         *  hundred milliseconds. At 140ms the highlight had already gone by
+         *  the time the gaze arrived, so the keys looked dead. 450ms covers
+         *  the sweep; the row state changes immediately regardless, and
+         *  STANDOFF_MS is what gates a repeat touch, not this. */
+        const val KBD_HOLD_MS = 150L
+
+        /** Ceiling on how long a key stays lit while the gaze rests on it, so
+         *  a parked reticle does not pin the highlight on indefinitely. */
+        const val KBD_HOLD_MAX_MS = 400L
 
         private val ROW_NAMES = listOf("123", "abc", "Sym2")
 

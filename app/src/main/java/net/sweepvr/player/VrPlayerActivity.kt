@@ -1338,13 +1338,29 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.onKeyboardOpened = { keyboardEditing = true }
         renderer.onKeyboardClose = { navigate, text ->
             keyboardEditing = false
-            renderer.webBarUrl = webUrl
+            // Show what was COMMITTED, not what the page is currently on.
+            //
+            // This unconditionally restored `webUrl`, which discarded every
+            // committed edit: the control hands back the typed text, and it
+            // was being overwritten with the pre-edit URL before anything
+            // looked at it. So ENTER appeared to dismiss and leave the field
+            // exactly as it had been. The control already restores the
+            // original text itself on cancel, so `text` is correct on both
+            // paths and nothing needs to choose between them here.
+            renderer.webBarUrl = text
             if (navigate && text.isNotBlank()) {
                 val u = if (text.contains("://") || text.startsWith("localhost")) text
                         else "http://$text"
                 FileLog.i(TAG, "keyboard navigate $u")
                 webUrl = u
-                webView?.loadUrl(u)
+                // Onto the WebView's own thread. This callback fires from the
+                // renderer, which is the GL thread, and Android permits
+                // WebView methods only on the thread that created it:
+                // loadUrl threw `A WebView method was called on thread
+                // 'GLThread'`, inside onNewFrame, so the navigation silently
+                // never happened while the log cheerfully printed the URL it
+                // was about to load. It also cost a frame on every press.
+                runOnUiThread { webView?.loadUrl(u) }
             }
         }
     }
