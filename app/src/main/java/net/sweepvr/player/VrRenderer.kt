@@ -578,12 +578,30 @@ class VrRenderer(
     // mid-gesture on. Here the whole surface is gesture.
     private val kbd = net.sweepvr.player.sweep.KeyboardControl()
 
+    /** The dwell keyboard, used when sweep controls are off.
+     *
+     *  A separate instance and a separate draw path, not a mode of [kbd]: the
+     *  drum's whole shape - a tumbler of rows with one live row, entry sides
+     *  on every key, a band you traverse - IS the sweep gesture, and none of
+     *  it survives without it.
+     *
+     *  Everything around the keyboard is shared: the placement is renderer
+     *  state, the texture is one texture, and the text plumbing and the
+     *  page-field write path are the same callbacks. */
+    private val kbdw = net.sweepvr.player.sweep.DwellKeyboardControl()
+
     /** The address field opens the keyboard when it is swept through the same
      *  way every key is: in through its top or bottom, out through the far
      *  one. It is deliberately NOT a dwell - under sweep, nothing on a panel
      *  dwells, and the keyboard is the one surface where that rule has to be
      *  suspended because there is no dwell to lose. */
     private val addrOpen = net.sweepvr.player.sweep.SweepEngine()
+    /** The address field as a dwell target, for when sweep is off.
+     *
+     *  Without this the keyboard is UNREACHABLE with sweep disabled: the field
+     *  is the only thing that opens it, and its only gesture was a sweep. A
+     *  setting that turns sweep off must not also remove the only way in. */
+    private val addrDwell = net.sweepvr.player.sweep.DwellButton()
     private var addrArmed = false
     private var kbTexId = 0
     private var kbBitmap: Bitmap? = null
@@ -1918,6 +1936,7 @@ void main(){
         // page is doing. Ratio matches KBD_TEX_W:KBD_TEX_H so nothing is
         // stretched when the quad is placed.
         kbd.window = Rect(0f, 0f, KBD_TEX_W.toFloat(), KBD_TEX_H.toFloat())
+        kbdw.window = Rect(0f, 0f, KBD_TEX_W.toFloat(), KBD_TEX_H.toFloat())
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, kbTexId)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
@@ -2323,6 +2342,166 @@ void main(){
      *  type them. The gaze-to-key mapping was correct the whole time - the
      *  log showed every armed sample inside the band, at the right index.
      */
+    /** True when the dwell keyboard is the live one. Sweep off means sweep
+     *  gestures are rejected wholesale, so a sweep keyboard would be dead
+     *  weight on screen. */
+    private val dwellKeyboard get() = !sweepEnabled
+
+    private fun maybeUploadDwellKeyboard() {
+        if (kbTexId <= 0) return
+        val w = kbdw.window
+        if (w.isEmpty) return
+        val active = kbdw.activeKey
+        // The charged key's progress, quantised: it climbs every frame while a
+        // key fills, and without this in the key the fill would never be drawn.
+        val prog = ((active?.dwell?.progress ?: 0f) * 24f).toInt()
+        val key = "D|" + kbdw.capsLabel() + "|" + kbdw.text + "|" +
+            (active?.spec?.label ?: "") + "|" + prog + "|" + kbTipShown
+        if (key == kbKey) return
+        kbKey = key
+
+        val bmp = kbBitmap ?: Bitmap.createBitmap(KBD_TEX_W, KBD_TEX_H, Bitmap.Config.ARGB_8888)
+            .also { kbBitmap = it }
+        val c = Canvas(bmp)
+        c.drawColor(Color.TRANSPARENT)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        val sx = KBD_TEX_W / w.width
+        val sy = KBD_TEX_H / w.height
+        fun tx(x: Float) = (x - w.left) * sx
+        fun ty(y: Float) = (y - w.top) * sy
+
+        p.style = Paint.Style.FILL
+        p.color = Color.argb(238, 10, 14, 22)
+        c.drawRoundRect(RectF(0f, 0f, KBD_TEX_W.toFloat(), KBD_TEX_H.toFloat()), 10f, 10f, p)
+
+        for (k in kbdw.currentKeys) {
+            val r = k.rect
+            if (r.isEmpty) continue
+            val x0 = tx(r.left); val y0 = ty(r.top)
+            val x1 = tx(r.right); val y1 = ty(r.bottom)
+            val on = active === k
+            val progF = if (on) (k.dwell.progress.coerceIn(0f, 1f)) else 0f
+            p.style = Paint.Style.FILL
+            p.color = Color.argb(255, 26, 36, 52)
+            c.drawRoundRect(x0, y0, x1, y1, 6f, 6f, p)
+            // The fill CLIMBS the key as the dwell charges. This is the whole
+            // feedback for a dwell key: there is no sweep to feel, so if the
+            // progress is not visible there is nothing between "not yet" and
+            // "already fired".
+            if (progF > 0f) {
+                p.color = Color.argb(255, 56, 189, 248)
+                c.drawRoundRect(x0, y0, x0 + (x1 - x0) * progF, y1, 6f, 6f, p)
+            }
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 1.9f
+            p.color = if (on) Color.argb(255, 240, 246, 252) else Color.argb(255, 126, 148, 176)
+            c.drawRoundRect(x0, y0, x1, y1, 6f, 6f, p)
+            p.style = Paint.Style.FILL
+
+            val cx = (x0 + x1) * 0.5f
+            val cy = (y0 + y1) * 0.5f
+            val t = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
+            t.textAlign = Paint.Align.CENTER
+            t.color = Color.argb(255, 226, 232, 240)
+            when (k.spec.kind) {
+                net.sweepvr.player.sweep.DwellKeyboardControl.Kind.SHIFT -> {
+                    // An up arrow, and it fills when caps is engaged - the
+                    // state is the only thing that key really communicates.
+                    val u = kotlin.math.min(x1 - x0, y1 - y0) * 0.26f
+                    val g = android.graphics.Path()
+                    g.moveTo(cx, cy - u); g.lineTo(cx + u, cy + u * 0.7f)
+                    g.lineTo(cx - u, cy + u * 0.7f); g.close()
+                    p.color = if (kbdw.capsMode !=
+                        net.sweepvr.player.sweep.DwellKeyboardControl.CapsMode.LOWER)
+                        Color.argb(255, 56, 189, 248) else Color.argb(255, 226, 232, 240)
+                    p.style = Paint.Style.FILL
+                    c.drawPath(g, p)
+                    p.style = Paint.Style.STROKE
+                    p.strokeWidth = 3f
+                    p.strokeCap = Paint.Cap.ROUND
+                    p.strokeJoin = Paint.Join.ROUND
+                    c.drawPath(g, p)
+                    p.strokeCap = Paint.Cap.BUTT
+                    p.style = Paint.Style.FILL
+                }
+                net.sweepvr.player.sweep.DwellKeyboardControl.Kind.BKSP -> {
+                    val u = kotlin.math.min(x1 - x0, y1 - y0) * 0.22f
+                    val g = android.graphics.Path()
+                    g.moveTo(cx + u, cy - u * 0.7f); g.lineTo(cx + u, cy + u * 0.7f)
+                    g.lineTo(cx - u * 0.2f, cy + u * 0.7f)
+                    g.lineTo(cx - u, cy); g.lineTo(cx - u * 0.2f, cy - u * 0.7f)
+                    g.close()
+                    p.color = Color.argb(255, 226, 232, 240)
+                    p.style = Paint.Style.FILL
+                    c.drawPath(g, p)
+                    p.style = Paint.Style.STROKE
+                    p.strokeWidth = 3f
+                    p.strokeCap = Paint.Cap.ROUND
+                    p.strokeJoin = Paint.Join.ROUND
+                    c.drawPath(g, p)
+                    p.strokeCap = Paint.Cap.BUTT
+                    p.style = Paint.Style.FILL
+                }
+                net.sweepvr.player.sweep.DwellKeyboardControl.Kind.ENTER -> {
+                    val u = kotlin.math.min(x1 - x0, y1 - y0) * 0.20f
+                    val g = android.graphics.Path()
+                    g.moveTo(cx - u, cy - u); g.lineTo(cx + u, cy - u)
+                    g.lineTo(cx + u, cy + u * 0.4f)
+                    g.moveTo(cx + u * 0.3f, cy)
+                    g.lineTo(cx + u, cy + u * 0.4f)
+                    g.lineTo(cx + u * 0.3f, cy + u)
+                    p.color = Color.argb(255, 226, 232, 240)
+                    p.style = Paint.Style.STROKE
+                    p.strokeWidth = 3f
+                    p.strokeCap = Paint.Cap.ROUND
+                    p.strokeJoin = Paint.Join.ROUND
+                    c.drawPath(g, p)
+                    p.strokeCap = Paint.Cap.BUTT
+                    p.style = Paint.Style.FILL
+                }
+                else -> {
+                    t.textSize = kotlin.math.min(x1 - x0, y1 - y0) * 0.42f
+                    c.drawText(k.spec.label, cx, cy - (t.descent() + t.ascent()) * 0.5f, t)
+                }
+            }
+        }
+
+        val tip = kbTipShown
+        if (tip != null) {
+            val hk = kbdw.keyLabelAt(kbHitX(), kbHitY())
+            if (hk != null) {
+                val r = hk.rect
+                val tp = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
+                tp.color = Color.argb(255, 126, 148, 176)
+                tp.textSize = 21f
+                tp.textAlign = Paint.Align.CENTER
+                val tw = tp.measureText(tip)
+                val cx = (r.left + r.right) * 0.5f
+                // Above the key, unless it is in the top row where that would
+                // be off the top of the keyboard.
+                val cy = if (r.top < w.height * 0.25f) r.bottom + 19f else r.top - 19f
+                val halfW = tw * 0.5f + 9f
+                val pill = RectF(tx(cx - halfW), ty(cy - 14f), tx(cx + halfW), ty(cy + 14f))
+                p.style = Paint.Style.FILL
+                p.color = Color.argb(238, 15, 23, 34)
+                c.drawRoundRect(pill, 7f, 7f, p)
+                p.style = Paint.Style.STROKE
+                p.strokeWidth = 1.4f
+                p.color = Color.argb(255, 126, 148, 176)
+                c.drawRoundRect(pill, 7f, 7f, p)
+                p.style = Paint.Style.FILL
+                c.drawText(tip, tx(cx), ty(cy) - (tp.descent() + tp.ascent()) * 0.5f, tp)
+                p.strokeWidth = 1.9f
+            }
+        }
+
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, kbTexId)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+    }
+
+    private fun kbHitX(): Float = kbHit?.get(0) ?: -9999f
+    private fun kbHitY(): Float = kbHit?.get(1) ?: -9999f
+
     private fun maybeUploadKeyboard() {
         if (kbTexId <= 0) return
         val w = kbd.window
@@ -2633,7 +2812,9 @@ void main(){
      * the gaze leaving the keyboard.
      */
     private fun stepKeyTip(gaze: FloatArray?) {
-        val label = if (gaze == null) null else kbd.labelAt(gaze[0], gaze[1])
+        val label = if (gaze == null) null
+            else if (dwellKeyboard) kbdw.labelAt(gaze[0], gaze[1])
+            else kbd.labelAt(gaze[0], gaze[1])
         if (label == null) {
             kbTipKey = null
             kbTipShown = null
@@ -2709,7 +2890,10 @@ void main(){
     }
 
     /** Step the keyboard for this frame. True when it owns the gaze. */
-    private fun stepKeyboard(dtMs: Long): Boolean {
+    /** [still] is the gaze-is-holding-still answer, needed by the dwell
+     *  keyboard (a moving reticle must never charge a key). The sweep
+     *  keyboard ignores it. Defaults true so the panel path need not know. */
+    private fun stepKeyboard(dtMs: Long, still: Boolean = true): Boolean {
         // Placement has to happen here, every frame: it reads the surface
         // behind the keyboard, which MOVES with the head and with the page.
         // Without it kbPlaced stayed false for ever, and a false kbPlaced makes
@@ -2731,21 +2915,18 @@ void main(){
         kbAlpha = if (kbAlphaWant) minOf(1f, kbAlpha + dtMs / KBD_FADE_MS)
                   else maxOf(0f, kbAlpha - dtMs / KBD_FADE_MS)
         if (!kbOpen) {
-            kbd.reset(); kbHit = null; kbTipKey = null; kbTipShown = null
+            kbd.reset(); kbdw.reset(); kbHit = null
+            kbTipKey = null; kbTipShown = null
             return false
         }
         if (kbTexId <= 0) return false
         val g = keyboardGaze()
-        if (g == null) {
-            // Worth saying out loud: a silent null here looks identical to a
-            // keyboard that is present but unresponsive, which is precisely
-            // the symptom that sent us looking in the wrong place.
-            kbHit = null; kbd.reset(); return false
-        }
+        if (g == null) { kbHit = null; kbd.reset(); kbdw.reset(); return false }
         val over = g[2] > 0.5f
         // Stepped either way: leaving the keyboard has to reach the controls so
         // a key in hand can resolve, and the geometry decides how.
-        val owned = kbd.step(g[0], g[1], dtMs)
+        val owned = if (dwellKeyboard) kbdw.step(g[0], g[1], dtMs, still)
+                    else kbd.step(g[0], g[1], dtMs)
         // What the control was actually handed, against what it believes the
         // live row is. Two rounds of reasoning about this mapping were both
         // wrong, so it is measured rather than deduced.
@@ -2767,11 +2948,26 @@ void main(){
 
     /** Sweep the address field to open the keyboard. True on the frame it
      *  fires, so the toolbar's own buttons do not also fire underneath. */
-    private fun stepAddrField(u: Float, v: Float, dtMs: Long): Boolean {
-        if (kbOpen) { addrArmed = false; addrOpen.reset(); return false }
+    private fun stepAddrField(u: Float, v: Float, dtMs: Long, still: Boolean = true): Boolean {
+        if (kbOpen) {
+            addrArmed = false
+            addrOpen.reset()
+            addrDwell.reset()
+            return false
+        }
         // Bar space is y-up and v-up; the control is y-down, so flip.
         val r = net.sweepvr.player.sweep.Rect(TB_ADDR_U0, 1f - TB_V1, TB_ADDR_U1, 1f - TB_V0)
         if (r.isEmpty) return false
+        if (!sweepEnabled) {
+            addrOpen.reset()
+            addrArmed = false
+            addrDwell.rect = r
+            addrDwell.onFire = { openKeyboard(webBarUrl) }
+            val p = addrDwell.step(u, 1f - v, still, dtMs)
+            toolbarAddrFocused = p > 0f
+            return p > 0f
+        }
+        addrDwell.reset()
         val cfg = net.sweepvr.player.sweep.SweepConfig(
             entrySides = setOf(net.sweepvr.player.sweep.Side.Top,
                 net.sweepvr.player.sweep.Side.Bottom),
@@ -2799,7 +2995,9 @@ void main(){
 
     private fun drawKeyboard() {
         if (kbAlpha <= 0.01f || kbTexId <= 0) return
-        maybeUploadKeyboard()
+        // Everything below is control-agnostic - it draws whatever is in
+        // kbTexId on the basis the hit test uses - so only the upload differs.
+        if (dwellKeyboard) maybeUploadDwellKeyboard() else maybeUploadKeyboard()
         if (!kbPlaced) return
         // Built from the same orthonormal basis the hit test uses, so the drawn
         // quad and the tested plane cannot drift apart. A yaw-only rotation
@@ -2860,9 +3058,19 @@ void main(){
 
     fun openKeyboard(value: String, target: KeyboardTarget = KeyboardTarget.ADDRESS) {
         kbTarget = target
-        kbd.beginEdit(value)
         kbOpen = true
         onKeyboardOpened?.invoke()
+        if (dwellKeyboard) {
+            val w = kbdw
+            w.beginEdit(value)
+            w.changed = { onKeyboardText?.invoke(w.text) }
+            w.committed = { closeKeyboard(true, it) }
+            w.cancelled = { closeKeyboard(false, w.initialText) }
+            w.onTrace = { FileLog.i("SweepVR-kbd", "dwell $it") }
+            onKeyboardText?.invoke(w.text)
+            return
+        }
+        kbd.beginEdit(value)
         kbd.changed = {
             onKeyboardText?.invoke(kbd.text)
             val g = kbHit
@@ -2894,7 +3102,10 @@ void main(){
     fun closeKeyboard(navigate: Boolean, text: String) {
         kbOpen = false
         kbd.reset()
+        kbdw.reset()
         kbHit = null
+        kbTipKey = null
+        kbTipShown = null
         onKeyboardClose?.invoke(navigate, text)
     }
 
@@ -5159,7 +5370,7 @@ void main(){
         // The keyboard owns the frame outright while it is up: every key is a
         // sweep, and a page dwell firing underneath one would be the exact
         // accident sweep exists to prevent. Same rule as barSweep below.
-        if (stepKeyboard(dtMs)) { webProgF = 0f; return }
+        if (stepKeyboard(dtMs, still)) { webProgF = 0f; return }
         // The scrollbar THUMB before the arrows, as it always was. This line
         // was deleted outright by an edit meant to insert the keyboard claim
         // above it, so the thumb's entry test stopped being evaluated at all
@@ -5775,7 +5986,7 @@ void main(){
         // The address field is hover, not sweep: gaze inside = focused.
         toolbarAddrFocused =
             u >= TB_ADDR_U0 && u <= TB_ADDR_U1 && v >= TB_V0 && v <= TB_V1
-        if (stepAddrField(u, v, dtMs)) return true
+        if (stepAddrField(u, v, dtMs, still)) return true
         return b0 || b1 || b2 || b3 || b4 || z0 || z1
     }
 
