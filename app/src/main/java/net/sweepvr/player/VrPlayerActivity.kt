@@ -1900,6 +1900,70 @@ try {
                 webVersion++
         renderer.webBarForgetSize()
             }
+            /**
+             * Both failure callbacks, and a document of our own in place of the
+             * WebView's.
+             *
+             * Neither was implemented, so a 404 got Chromium's built-in error
+             * page, which is a near-empty document. It was copied through
+             * PixelCopy like any other page and arrived as a white line. The
+             * callbacks are what let us know that happened at all - without
+             * them the load simply fails quietly.
+             *
+             * Both are gated on the MAIN FRAME: they also fire for every
+             * failed image, stylesheet and favicon, and a page with one broken
+             * image must not replace itself with an error document.
+             *
+             * baseUrl is the URL that failed, so relative links and styling in
+             * the document resolve against it and the back button still means
+             * something. The renderer reads this exactly as it reads any other
+             * page, through the same PixelCopy path.
+             */
+            private fun errorPage(view: WebView, failed: String, status: String, detail: String) {
+                val esc = { s: String -> s.replace("&", "&amp;").replace("<", "&lt;")
+                    .replace(">", "&gt;") }
+                val html = """
+                    <!DOCTYPE html><html><head><meta charset="utf-8">
+                    <meta name="viewport" content="width=device-width,initial-scale=1">
+                    <style>
+                      html,body{margin:0;height:100%;background:#0d1420;color:#e2e8f0;
+                        font-family:monospace;overflow:hidden}
+                      .b{padding:12vh 8vw 0}
+                      h1{font-size:8vw;margin:0 0 2vh;color:#f87171}
+                      p{font-size:3.4vw;line-height:1.6;margin:0 0 2vh;opacity:.9}
+                      code{font-size:3vw;opacity:.75;word-break:break-all}
+                      a{color:#38bdf8}
+                    </style></head><body><div class="b">
+                    <h1>${esc(status)}</h1>
+                    <p>${esc(detail)}</p>
+                    <p><code>${esc(failed)}</code></p>
+                    </div></body></html>
+                """.trimIndent()
+                FileLog.i(TAG, "keyboard web error $status $failed")
+                view.loadDataWithBaseURL(failed, html, "text/html", "UTF-8", null)
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView, req: android.webkit.WebResourceRequest,
+                err: android.webkit.WebResourceResponse
+            ) {
+                if (!req.isForMainFrame) return
+                val code = err.statusCode
+                val why = if (code in 400..499) "Not found, or refused."
+                          else if (code in 500..599) "The server failed."
+                          else "The server declined to serve this."
+                errorPage(view, req.url?.toString() ?: webUrl, "$code", why)
+            }
+
+            override fun onReceivedError(
+                view: WebView, req: android.webkit.WebResourceRequest,
+                err: android.webkit.WebResourceError
+            ) {
+                if (!req.isForMainFrame) return
+                errorPage(view, req.url?.toString() ?: webUrl,
+                    "Network", "Could not reach the page.")
+            }
+
             override fun onPageFinished(view: WebView, url: String) {
                 // What the site actually sees, not what the arithmetic says.
                 view.evaluateJavascript(
